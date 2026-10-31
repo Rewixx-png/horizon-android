@@ -1124,14 +1124,17 @@ impl Launcher {
             if self.catalog.local.is_empty() {
                 let text = translate(language, "No items installed yet");
                 let text_w = ui.measure(Face::Regular, 15.0, text);
-                ui.text(
-                    Face::Regular,
-                    15.0,
-                    margin + (content_w - text_w) / 2.0,
-                    (viewport_top + bottom) / 2.0,
-                    color::MUTED,
-                    text,
-                );
+                let y = content_top + 3.0 * section_h + 12.0;
+                if y >= viewport_top && y + 20.0 <= bottom {
+                    ui.text(
+                        Face::Regular,
+                        15.0,
+                        margin + (content_w - text_w) / 2.0,
+                        y,
+                        color::MUTED,
+                        text,
+                    );
+                }
             }
         } else {
             let c = &self.catalog.config;

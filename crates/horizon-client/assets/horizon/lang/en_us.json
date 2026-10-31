@@ -236,5 +236,7 @@
   "horizon.command.pregen.done": "Done. ",
   "horizon.command.extra.not_profiling": "Not currently profiling",
   "horizon.test_instances.export_disabled": "Test structure exporting is disabled",
-  "test_instance_block.invalid_test": "Invalid test"
+  "test_instance_block.invalid_test": "Invalid test",
+  "horizon.shaders.reloaded": "Shader pack %s reloaded",
+  "horizon.shaders.refused": "Shader pack %s refused:"
 }

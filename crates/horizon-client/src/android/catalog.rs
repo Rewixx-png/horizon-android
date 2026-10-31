@@ -153,14 +153,6 @@ pub enum Page {
     Settings,
 }
 impl Page {
-    pub const ALL: [Self; 6] = [
-        Self::Play,
-        Self::Mods,
-        Self::Packs,
-        Self::Shaders,
-        Self::Installed,
-        Self::Settings,
-    ];
     pub fn name(self) -> &'static str {
         match self {
             Self::Play => "Play",

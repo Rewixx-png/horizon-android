@@ -481,6 +481,8 @@ const RU: &[(&str, &str)] = &[
     ("Display", "Экран"),
     ("Performance", "Производительность"),
     ("Support", "Поддержка"),
+    ("GitHub repository", "Репозиторий GitHub"),
+    ("Open in browser", "Открыть в браузере"),
     ("Network", "Сеть"),
     ("Account", "Аккаунт"),
     (

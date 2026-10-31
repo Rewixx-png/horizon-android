@@ -1,4 +1,6 @@
 //! Explicit, scrollable selections. Values never cycle on repeated button taps.
+use super::md3;
+use super::md3 as color;
 use super::{
     Launcher,
     pages::{Action, button, gutter, page_header, rule},
@@ -7,7 +9,7 @@ use crate::catalog::RendererMode;
 use horizon_client::{
     launcher_i18n::{Language, tr as translate},
     tr,
-    ui_theme::{Face, Ui, color},
+    ui_theme::{Face, Ui},
 };
 
 const LIST_TOP: f32 = 128.0;
@@ -332,7 +334,7 @@ impl Chooser {
         let (w, h) = (ui.w, ui.h);
         let margin = gutter(w);
         targets.clear();
-        ui.rounded(0.0, 0.0, w, h, 0.0, color::BG);
+        ui.rounded(0.0, 0.0, w, h, 0.0, color::SURFACE);
         let top = page_header(ui, self.title, self.help, margin, 24.0, w - 2.0 * margin);
         if let Some(device) = &self.device {
             ui.text(
@@ -361,32 +363,52 @@ impl Chooser {
                     y,
                     w - 2.0 * margin,
                     ROW_HEIGHT - 8.0,
-                    8.0,
-                    color::RAISED,
+                    md3::SHAPE_M,
+                    color::SECONDARY_CONTAINER,
                 );
             }
-            let radio_y = y + (ROW_HEIGHT - 24.0) / 2.0;
-            ui.rounded(margin + 2.0, radio_y, 20.0, 20.0, 10.0, color::TEXT);
-            ui.rounded(margin + 4.0, radio_y + 2.0, 16.0, 16.0, 8.0, color::BG);
+            let radio_y = y + (ROW_HEIGHT - 20.0) / 2.0;
+            let radio = if *selected {
+                color::PRIMARY
+            } else {
+                color::OUTLINE
+            };
+            ui.border(margin + 2.0, radio_y, 20.0, 20.0, 10.0, radio);
             if *selected {
-                ui.rounded(margin + 8.0, radio_y + 6.0, 8.0, 8.0, 4.0, color::TEXT);
+                ui.rounded(margin + 7.0, radio_y + 5.0, 10.0, 10.0, 5.0, radio);
             }
-            let label = ui.fit_text(Face::Medium, 16.0, label, w - 2.0 * margin - 48.0);
-            ui.text(
+            let label = ui.fit_text(
                 Face::Medium,
-                16.0,
+                md3::TITLE_MEDIUM,
+                label,
+                w - 2.0 * margin - 48.0,
+            );
+            ui.text_line(
+                Face::Medium,
+                md3::TITLE_MEDIUM,
+                md3::TITLE_MEDIUM_LINE,
                 margin + 32.0,
-                y + (if detail.is_empty() { 14.0 } else { 8.0 }),
-                color::TEXT,
+                y + if detail.is_empty() { 24.0 } else { 12.0 },
+                if *selected {
+                    color::ON_SECONDARY_CONTAINER
+                } else {
+                    color::TEXT
+                },
                 &label,
             );
             if !detail.is_empty() {
-                let detail = ui.fit_text(Face::Regular, 13.0, detail, w - 2.0 * margin - 48.0);
-                ui.text(
+                let detail = ui.fit_text(
                     Face::Regular,
-                    13.0,
+                    md3::BODY_MEDIUM,
+                    detail,
+                    w - 2.0 * margin - 48.0,
+                );
+                ui.text_line(
+                    Face::Regular,
+                    md3::BODY_MEDIUM,
+                    md3::BODY_MEDIUM_LINE,
                     margin + 32.0,
-                    y + 31.0,
+                    y + 38.0,
                     color::MUTED,
                     &detail,
                 );

@@ -1,10 +1,12 @@
+use super::md3;
+use super::md3 as color;
 use super::*;
 use horizon_client::{
     launcher_i18n::{Language, tr as translate},
     osk::Output,
     tr,
-    ui_theme::color,
 };
+use std::time::Instant;
 use winit::{
     event::{KeyEvent, Touch},
     keyboard::{KeyCode, PhysicalKey},
@@ -83,40 +85,41 @@ pub(super) fn button(
     accent: bool,
 ) {
     let [x, y, w, h] = rect;
-    let radius = (h / 2.0).min(24.0);
+    let radius = h / 2.0;
     ui.rounded(
         x,
         y,
         w,
         h,
         radius,
-        if accent { color::ACCENT } else { color::RAISED },
+        if accent {
+            color::PRIMARY
+        } else {
+            color::SECONDARY_CONTAINER
+        },
     );
     let padding = 14.0_f32.min(w * 0.12);
-    let mut size = if h >= 48.0 { 16.0 } else { 15.0 };
-    let mut label = ui.fit_text(Face::Medium, size, label, w - 2.0 * padding);
-    while size > 11.0 && ui.measure(Face::Medium, size, &label) > w - 2.0 * padding {
-        size -= 1.0;
-        label = ui.fit_text(Face::Medium, size, &label, w - 2.0 * padding);
-    }
+    let size = md3::LABEL;
+    let line = md3::LABEL_LINE;
+    let label = ui.fit_text(Face::Medium, size, label, w - 2.0 * padding);
     let text_w = ui.measure(Face::Medium, size, &label);
-    ui.text(
+    ui.text_line(
         Face::Medium,
         size,
+        line,
         x + (w - text_w) / 2.0,
-        y + (h - size * 1.45) / 2.0,
+        y + (h - line) / 2.0,
         if accent {
-            color::ON_ACCENT
+            color::ON_PRIMARY
         } else {
-            color::TEXT
+            color::ON_SECONDARY_CONTAINER
         },
         &label,
     );
     targets.push((rect, action));
 }
 
-/// A text field: left-aligned, sunk into a soft plate, with an accent focus
-/// ring instead of a permanent border.
+/// A filled text field. The focused state uses the 2 dp primary indicator.
 pub(super) fn field(
     ui: &mut Ui,
     targets: &mut Vec<([f32; 4], Action)>,
@@ -126,16 +129,29 @@ pub(super) fn field(
     focused: bool,
 ) {
     let [x, y, w, h] = rect;
-    ui.rounded(x, y, w, h, 8.0, color::RAISED);
+    ui.rounded(x, y, w, h, md3::SHAPE_XS, color::SURFACE_HIGHEST);
+    ui.rounded(
+        x,
+        y + h - 1.0,
+        w,
+        1.0,
+        0.0,
+        if focused {
+            color::PRIMARY
+        } else {
+            color::OUTLINE
+        },
+    );
     if focused {
-        ui.border(x, y, w, h, 8.0, color::ACCENT);
+        ui.rounded(x, y + h - 2.0, w, 2.0, 1.0, color::PRIMARY);
     }
-    let text = ui.fit_text(Face::Medium, 15.0, text, w - 24.0);
-    ui.text(
+    let text = ui.fit_text(Face::Medium, md3::BODY, text, w - 24.0);
+    ui.text_line(
         Face::Medium,
-        15.0,
+        md3::BODY,
+        md3::BODY_LINE,
         x + 12.0,
-        y + (h - 15.0 * 1.45) / 2.0,
+        y + (h - md3::BODY_LINE) / 2.0,
         color::TEXT,
         &text,
     );
@@ -152,32 +168,47 @@ fn toggle(
 ) {
     let [x, y, w, h] = rect;
     if w >= 80.0 {
-        ui.text(
+        ui.text_line(
             Face::Regular,
-            14.0,
+            md3::LABEL,
+            md3::LABEL_LINE,
             x,
-            y + (h - 14.0 * 1.45) / 2.0,
+            y + (h - md3::LABEL_LINE) / 2.0,
             color::MUTED,
             translate(language, if on { "On" } else { "Off" }),
         );
     }
-    let track = 44.0_f32.min(w);
-    let knob = 18.0;
+    let track = 52.0_f32.min(w);
+    let track_x = x + w - track;
+    let track_y = y + (h - 32.0) / 2.0;
     ui.rounded(
-        x + w - track,
-        y + (h - 24.0) / 2.0,
+        track_x,
+        track_y,
         track,
-        24.0,
-        12.0,
-        if on { color::ACCENT } else { color::HOVER },
+        32.0,
+        16.0,
+        if on {
+            color::PRIMARY
+        } else {
+            color::SURFACE_HIGH
+        },
     );
+    if !on {
+        ui.border(track_x, track_y, track, 32.0, 16.0, color::OUTLINE);
+    }
+    let knob = if on { 24.0 } else { 16.0 };
+    let knob_x = track_x + if on { track - knob - 4.0 } else { 8.0 };
     ui.rounded(
-        x + w - track + if on { track - knob - 3.0 } else { 3.0 },
-        y + (h - knob) / 2.0,
+        knob_x,
+        track_y + (32.0 - knob) / 2.0,
         knob,
         knob,
         knob / 2.0,
-        if on { color::ON_ACCENT } else { color::TEXT },
+        if on {
+            color::ON_PRIMARY
+        } else {
+            color::OUTLINE
+        },
     );
     targets.push((rect, action));
 }
@@ -188,35 +219,43 @@ pub(super) fn rule(ui: &mut Ui, x: f32, y: f32, w: f32) {
 
 /// A page's display title and one-line description. Returns the content top.
 pub(super) fn page_header_height(w: f32) -> f32 {
-    let size = if w < 420.0 { 24.0 } else { 28.0 };
-    size * 1.45 + 2.0 + 14.0 * 1.45 + 14.0
+    if w < 420.0 {
+        32.0 + 4.0 + md3::BODY_MEDIUM_LINE + 16.0
+    } else {
+        md3::HEADLINE_LINE + 4.0 + md3::BODY_MEDIUM_LINE + 16.0
+    }
 }
 
 pub(super) fn page_header(ui: &mut Ui, title: &str, caption: &str, x: f32, y: f32, w: f32) -> f32 {
-    let size = if w < 420.0 { 24.0 } else { 28.0 };
+    let (size, line) = if w < 420.0 {
+        (24.0, 32.0)
+    } else {
+        (md3::HEADLINE, md3::HEADLINE_LINE)
+    };
     let title = ui.fit_text(Face::Medium, size, title, w);
     let mut title_size = size;
     while title_size > 20.0 && ui.measure(Face::Medium, title_size, &title) > w {
         title_size -= 1.0;
     }
-    ui.text(Face::Medium, title_size, x, y, color::TEXT, &title);
-    let caption = ui.fit_text(Face::Regular, 14.0, caption, w);
-    ui.text(
+    ui.text_line(Face::Medium, title_size, line, x, y, color::TEXT, &title);
+    let caption = ui.fit_text(Face::Regular, md3::BODY_MEDIUM, caption, w);
+    ui.text_line(
         Face::Regular,
-        14.0,
+        md3::BODY_MEDIUM,
+        md3::BODY_MEDIUM_LINE,
         x,
-        y + title_size * 1.45 + 2.0,
+        y + line + 4.0,
         color::MUTED,
         &caption,
     );
-    y + title_size * 1.45 + 2.0 + 14.0 * 1.45 + 14.0
+    y + line + 4.0 + md3::BODY_MEDIUM_LINE + 16.0
 }
 
 pub(super) fn progress_bar(ui: &mut Ui, x: f32, y: f32, w: f32, fraction: f32) {
-    ui.rounded(x, y, w, 4.0, 2.0, color::RAISED);
+    ui.rounded(x, y, w, 4.0, 2.0, color::SURFACE_HIGH);
     let fraction = fraction.clamp(0.0, 1.0);
     if fraction > 0.0 {
-        ui.rounded(x, y, w * fraction, 4.0, 2.0, color::ACCENT);
+        ui.rounded(x, y, w * fraction, 4.0, 2.0, color::PRIMARY);
     }
 }
 impl Launcher {
@@ -279,88 +318,175 @@ impl Launcher {
         true
     }
 
-    /// The fixed app bar and navigation, drawn after the page so a scrolled
-    /// page header slides under an opaque mask instead of over the tabs.
+    /// MD3 top app bar, primary tabs and the settings icon button. Drawn after
+    /// the page so a scrolled page header slides under an opaque surface.
     fn draw_chrome(
         ui: &mut Ui,
         targets: &mut Vec<([f32; 4], Action)>,
-        account_label: &str,
+        account_initial: &str,
+        status: &str,
+        status_error: bool,
         language: Language,
-        compact: bool,
         margin: f32,
         content_w: f32,
         nav_bottom: f32,
         current_page: Page,
+        motion: &md3::Motion,
     ) {
         let w = ui.w;
-        ui.rounded(0.0, 0.0, w, nav_bottom + 12.0, 0.0, color::BG);
-        ui.text(
+        ui.rounded(0.0, 0.0, w, nav_bottom, 0.0, color::BG);
+
+        // Small top app bar: title, quiet version, account avatar and the
+        // settings (tune) icon button.
+        let title_size = md3::TITLE;
+        let title_line = md3::TITLE_LINE;
+        ui.text_line(
             Face::Medium,
-            if compact { 20.0 } else { 22.0 },
+            title_size,
+            title_line,
             margin,
-            12.0,
+            8.0,
             color::TEXT,
             "Horizon",
         );
-        let brand_w = ui.measure(Face::Medium, if compact { 20.0 } else { 22.0 }, "Horizon");
-        ui.text(
+        let title_w = ui.measure(Face::Medium, title_size, "Horizon");
+        ui.text_line(
             Face::Regular,
-            11.0,
-            margin + brand_w + 8.0,
-            19.0,
+            md3::LABEL_SMALL,
+            md3::LABEL_SMALL_LINE,
+            margin + title_w + 10.0,
+            16.0,
             color::MUTED,
             crate::backend::VERSION,
         );
-        let account_w = (content_w * 0.46).clamp(140.0, 260.0);
-        button(
-            ui,
-            targets,
-            [w - margin - account_w, 8.0, account_w, 36.0],
-            account_label,
-            Action::Account,
-            false,
+
+        let icon = 40.0;
+        let settings_x = w - margin - icon;
+        let settings_y = 12.0;
+        let settings = current_page == Page::Settings;
+        if settings {
+            ui.rounded(
+                settings_x,
+                settings_y,
+                icon,
+                icon,
+                icon / 2.0,
+                color::SECONDARY_CONTAINER,
+            );
+        }
+        let tune = if settings {
+            color::PRIMARY
+        } else {
+            color::ON_SURFACE_VARIANT
+        };
+        let tune_x = settings_x + 12.0;
+        for (i, knob) in [6.0, -3.0, 4.0].into_iter().enumerate() {
+            let y = settings_y + 14.0 + i as f32 * 6.0;
+            ui.rounded(tune_x, y, 16.0, 2.0, 1.0, tune);
+            ui.rounded(tune_x + 8.0 + knob, y - 3.0, 4.0, 8.0, 2.0, tune);
+        }
+        targets.push((
+            [settings_x, settings_y, icon, icon],
+            Action::Page(Page::Settings),
+        ));
+
+        let avatar = 32.0;
+        let avatar_x = settings_x - 8.0 - avatar;
+        let avatar_y = 16.0;
+        ui.rounded(
+            avatar_x,
+            avatar_y,
+            avatar,
+            avatar,
+            avatar / 2.0,
+            color::PRIMARY_CONTAINER,
+        );
+        let initial = account_initial
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| "?".into());
+        let initial_w = ui.measure(Face::Medium, md3::LABEL, &initial);
+        ui.text_line(
+            Face::Medium,
+            md3::LABEL,
+            md3::LABEL_LINE,
+            avatar_x + (avatar - initial_w) / 2.0,
+            avatar_y + (avatar - md3::LABEL_LINE) / 2.0,
+            color::ON_PRIMARY_CONTAINER,
+            &initial,
+        );
+        targets.push(([avatar_x, avatar_y, avatar, avatar], Action::Account));
+        let status = ui.fit_text(
+            Face::Regular,
+            md3::LABEL_SMALL,
+            status,
+            (avatar_x - margin - 8.0).max(80.0),
+        );
+        ui.text_line(
+            Face::Regular,
+            md3::LABEL_SMALL,
+            md3::LABEL_SMALL_LINE,
+            margin,
+            38.0,
+            if status_error {
+                color::ERROR
+            } else {
+                color::MUTED
+            },
+            &status,
         );
 
-        let nav_top = 56.0;
-        let columns = if compact && content_w < 560.0 { 3 } else { 6 };
-        let rows = Page::ALL.len().div_ceil(columns);
-        let gap = 6.0;
-        let tab_h = if rows == 2 { 44.0 } else { 46.0 };
-        let tab_w = (content_w - gap * (columns as f32 - 1.0)) / columns as f32;
-        for (i, page) in Page::ALL.iter().enumerate() {
-            let column = i % columns;
-            let row = i / columns;
-            let rect = [
-                margin + column as f32 * (tab_w + gap),
-                nav_top + row as f32 * (tab_h + gap),
-                tab_w,
-                tab_h,
-            ];
-            let selected = *page == current_page;
-            let label = translate(language, page.name());
-            let [x, y, tw, th] = rect;
+        // Primary tabs. Five destinations; Settings is the app-bar action.
+        let tabs = [
+            Page::Play,
+            Page::Mods,
+            Page::Packs,
+            Page::Shaders,
+            Page::Installed,
+        ];
+        let tab_y = md3::APP_BAR;
+        let tab_w = content_w / tabs.len() as f32;
+        let indicator_w = (tab_w - 24.0).max(20.0);
+        let position = motion.tab().clamp(0.0, (tabs.len() - 1) as f32);
+        let indicator_x = margin + position * tab_w + (tab_w - indicator_w) / 2.0;
+        let alpha = motion.tab_alpha();
+        if alpha > 0.0 {
             ui.rounded(
-                x,
-                y,
-                tw,
-                th,
-                (th / 2.0).min(24.0),
-                if selected { color::TEXT } else { color::RAISED },
+                indicator_x,
+                tab_y + md3::TABS - 3.0,
+                indicator_w,
+                3.0,
+                1.5,
+                color::with_alpha(color::PRIMARY, alpha),
             );
-            let size = if compact { 13.0 } else { 15.0 };
-            let label = ui.fit_text(Face::Medium, size, label, tw - 16.0);
-            let text_w = ui.measure(Face::Medium, size, &label);
-            ui.text(
+        }
+        for (i, page) in tabs.iter().enumerate() {
+            let selected = *page == current_page;
+            let raw = if *page == Page::Installed {
+                translate(language, "Files")
+            } else {
+                translate(language, page.name())
+            };
+            let label = ui.fit_text(Face::Medium, md3::TITLE_SMALL, raw, tab_w - 8.0);
+            let tw = ui.measure(Face::Medium, md3::TITLE_SMALL, &label);
+            let x = margin + i as f32 * tab_w;
+            ui.text_line(
                 Face::Medium,
-                size,
-                x + (tw - text_w) / 2.0,
-                y + (th - size * 1.45) / 2.0,
-                if selected { color::BG } else { color::TEXT },
+                md3::TITLE_SMALL,
+                md3::TITLE_SMALL_LINE,
+                x + (tab_w - tw) / 2.0,
+                tab_y + (md3::TABS - md3::TITLE_SMALL_LINE) / 2.0,
+                if selected {
+                    color::PRIMARY
+                } else {
+                    color::ON_SURFACE_VARIANT
+                },
                 &label,
             );
-            targets.push((rect, Action::Page(*page)));
+            targets.push(([x, tab_y, tab_w, md3::TABS], Action::Page(*page)));
         }
-        rule(ui, margin, nav_bottom + 10.0, content_w);
+        rule(ui, 0.0, nav_bottom, w);
     }
 
     pub(super) fn draw_pages(&mut self) -> Result<()> {
@@ -400,14 +526,9 @@ impl Launcher {
         let margin = gutter(w);
         let content_w = w - 2.0 * margin;
 
-        let nav_top = 56.0;
-        let columns = if compact && content_w < 560.0 { 3 } else { 6 };
-        let rows = Page::ALL.len().div_ceil(columns);
-        let gap = 6.0;
-        let tab_h = if rows == 2 { 44.0 } else { 46.0 };
-        let nav_bottom = nav_top + rows as f32 * tab_h + (rows as f32 - 1.0) * gap;
-        let page_top = nav_bottom + 18.0;
-        let content_bottom = h - 64.0;
+        let nav_bottom = md3::APP_BAR + md3::TABS;
+        let page_top = nav_bottom + 16.0;
+        let content_bottom = h - 16.0;
         let page = self.catalog.page;
         if page == Page::Play {
             use horizon_client::official_install::InstallStage;
@@ -444,11 +565,11 @@ impl Launcher {
                 let card_h = if tight {
                     52.0
                 } else if compact {
-                    100.0
+                    116.0
                 } else {
-                    92.0
+                    112.0
                 };
-                ui.rounded(margin, top, content_w, card_h, 10.0, color::RAISED);
+                ui.rounded(margin, top, content_w, card_h, md3::SHAPE_M, color::RAISED);
                 let dot_color = if error.is_some() {
                     color::DANGER
                 } else {
@@ -477,7 +598,7 @@ impl Launcher {
                     button(
                         &mut ui,
                         &mut self.targets,
-                        [w - margin - 152.0, top + 8.0, 138.0, 36.0],
+                        [w - margin - 152.0, top + 6.0, 138.0, 40.0],
                         if error.is_some() {
                             translate(language, "Retry")
                         } else {
@@ -487,12 +608,14 @@ impl Launcher {
                         false,
                     );
                 } else {
-                    let title = ui.fit_text(Face::Medium, 16.0, &title, content_w - 56.0);
-                    ui.text(
+                    let title =
+                        ui.fit_text(Face::Medium, md3::TITLE_MEDIUM, &title, content_w - 56.0);
+                    ui.text_line(
                         Face::Medium,
-                        16.0,
+                        md3::TITLE_MEDIUM,
+                        md3::TITLE_MEDIUM_LINE,
                         margin + 30.0,
-                        top + 10.0,
+                        top + 12.0,
                         color::TEXT,
                         &title,
                     );
@@ -501,19 +624,21 @@ impl Launcher {
                     } else {
                         translate(language, "Tap to download and install").to_owned()
                     };
-                    let caption = ui.fit_text(Face::Regular, 13.0, &caption, content_w - 56.0);
-                    ui.text(
+                    let caption =
+                        ui.fit_text(Face::Regular, md3::BODY_MEDIUM, &caption, content_w - 56.0);
+                    ui.text_line(
                         Face::Regular,
-                        13.0,
+                        md3::BODY_MEDIUM,
+                        md3::BODY_MEDIUM_LINE,
                         margin + 30.0,
-                        top + 34.0,
+                        top + 38.0,
                         color::MUTED,
                         &caption,
                     );
                     button(
                         &mut ui,
                         &mut self.targets,
-                        [margin + 20.0, top + card_h - 46.0, content_w - 40.0, 36.0],
+                        [margin + 20.0, top + card_h - 52.0, content_w - 40.0, 40.0],
                         if error.is_some() {
                             translate(language, "Retry")
                         } else {
@@ -528,11 +653,11 @@ impl Launcher {
                 let card_h = if tight {
                     52.0
                 } else if compact {
-                    100.0
+                    116.0
                 } else {
-                    92.0
+                    112.0
                 };
-                ui.rounded(margin, top, content_w, card_h, 10.0, color::RAISED);
+                ui.rounded(margin, top, content_w, card_h, md3::SHAPE_M, color::RAISED);
                 ui.rounded(
                     margin + 14.0,
                     top + 16.0,
@@ -559,18 +684,20 @@ impl Launcher {
                     button(
                         &mut ui,
                         &mut self.targets,
-                        [w - margin - 152.0, top + 8.0, 138.0, 36.0],
+                        [w - margin - 152.0, top + 6.0, 138.0, 40.0],
                         translate(language, "Install"),
                         Action::RetryInstall,
                         false,
                     );
                 } else {
-                    let title = ui.fit_text(Face::Medium, 16.0, title, content_w - 56.0);
-                    ui.text(
+                    let title =
+                        ui.fit_text(Face::Medium, md3::TITLE_MEDIUM, title, content_w - 56.0);
+                    ui.text_line(
                         Face::Medium,
-                        16.0,
+                        md3::TITLE_MEDIUM,
+                        md3::TITLE_MEDIUM_LINE,
                         margin + 30.0,
-                        top + 10.0,
+                        top + 12.0,
                         color::TEXT,
                         &title,
                     );
@@ -580,19 +707,21 @@ impl Launcher {
                         }
                         None => translate(language, "Ready to install").to_owned(),
                     };
-                    let caption = ui.fit_text(Face::Regular, 13.0, &caption, content_w - 56.0);
-                    ui.text(
+                    let caption =
+                        ui.fit_text(Face::Regular, md3::BODY_MEDIUM, &caption, content_w - 56.0);
+                    ui.text_line(
                         Face::Regular,
-                        13.0,
+                        md3::BODY_MEDIUM,
+                        md3::BODY_MEDIUM_LINE,
                         margin + 30.0,
-                        top + 34.0,
+                        top + 38.0,
                         color::MUTED,
                         &caption,
                     );
                     button(
                         &mut ui,
                         &mut self.targets,
-                        [margin + 20.0, top + card_h - 46.0, content_w - 40.0, 36.0],
+                        [margin + 20.0, top + card_h - 52.0, content_w - 40.0, 40.0],
                         translate(language, "Install"),
                         Action::RetryInstall,
                         false,
@@ -607,7 +736,7 @@ impl Launcher {
                 } else {
                     80.0
                 };
-                ui.rounded(margin, top, content_w, card_h, 10.0, color::RAISED);
+                ui.rounded(margin, top, content_w, card_h, md3::SHAPE_M, color::RAISED);
                 let title = tr!(language, "Downloading update... {percent}%", {
                     percent = (progress * 100.0).round() as u32
                 });
@@ -756,7 +885,7 @@ impl Launcher {
                         content_bottom - 118.0,
                         content_w,
                         44.0,
-                        8.0,
+                        md3::SHAPE_M,
                         color::RAISED,
                     );
                     ui.rounded(
@@ -826,7 +955,7 @@ impl Launcher {
                 use crate::shader_catalog::Origin;
                 let width = ((content_w - 8.0) / 2.0).min(180.0);
                 for (i, origin) in [Origin::Horizon, Origin::Modrinth].into_iter().enumerate() {
-                    let rect = [margin + i as f32 * (width + 8.0), top, width, 38.0];
+                    let rect = [margin + i as f32 * (width + 8.0), top, width, 40.0];
                     let selected = (if page == Page::Mods {
                         self.catalog.config.mod_source
                     } else {
@@ -837,9 +966,23 @@ impl Launcher {
                         rect[1],
                         rect[2],
                         rect[3],
-                        19.0,
-                        if selected { color::TEXT } else { color::RAISED },
+                        rect[3] / 2.0,
+                        if selected {
+                            color::SECONDARY_CONTAINER
+                        } else {
+                            color::SURFACE_LOW
+                        },
                     );
+                    if !selected {
+                        ui.border(
+                            rect[0],
+                            rect[1],
+                            rect[2],
+                            rect[3],
+                            rect[3] / 2.0,
+                            color::OUTLINE,
+                        );
+                    }
                     let label =
                         ui.fit_text(Face::Medium, 14.0, origin.source().label(), rect[2] - 24.0);
                     let text_w = ui.measure(Face::Medium, 14.0, &label);
@@ -848,7 +991,11 @@ impl Launcher {
                         14.0,
                         rect[0] + (rect[2] - text_w) / 2.0,
                         rect[1] + (rect[3] - 14.0 * 1.45) / 2.0,
-                        if selected { color::BG } else { color::TEXT },
+                        if selected {
+                            color::ON_SECONDARY_CONTAINER
+                        } else {
+                            color::TEXT
+                        },
                         &label,
                     );
                     self.targets.push((
@@ -860,7 +1007,7 @@ impl Launcher {
                         },
                     ));
                 }
-                top += 46.0;
+                top += 48.0;
             }
             let search_button_w = 104.0;
             let search_w = (content_w - search_button_w - 8.0).max(80.0);
@@ -934,14 +1081,29 @@ impl Launcher {
                 if y < top || y + 64.0 > bottom {
                     continue;
                 }
-                let title = ui.fit_text(Face::Medium, 17.0, &p.title, content_w - 120.0);
-                let summary = ui.fit_text(Face::Regular, 13.0, &p.summary, content_w - 120.0);
-                ui.text(Face::Medium, 17.0, margin, y + 4.0, color::TEXT, &title);
-                ui.text(
+                let title =
+                    ui.fit_text(Face::Medium, md3::TITLE_MEDIUM, &p.title, content_w - 120.0);
+                let summary = ui.fit_text(
                     Face::Regular,
-                    13.0,
+                    md3::BODY_MEDIUM,
+                    &p.summary,
+                    content_w - 120.0,
+                );
+                ui.text_line(
+                    Face::Medium,
+                    md3::TITLE_MEDIUM,
+                    md3::TITLE_MEDIUM_LINE,
                     margin,
-                    y + 31.0,
+                    y + 6.0,
+                    color::TEXT,
+                    &title,
+                );
+                ui.text_line(
+                    Face::Regular,
+                    md3::BODY_MEDIUM,
+                    md3::BODY_MEDIUM_LINE,
+                    margin,
+                    y + 32.0,
                     color::MUTED,
                     &summary,
                 );
@@ -952,11 +1114,12 @@ impl Launcher {
                     } else {
                         state
                     };
-                    ui.text(
+                    ui.text_line(
                         Face::Medium,
-                        14.0,
+                        md3::BODY_MEDIUM,
+                        md3::BODY_MEDIUM_LINE,
                         w - margin - 108.0,
-                        y + 12.0,
+                        y + 14.0,
                         color::MUTED,
                         &state,
                     );
@@ -994,7 +1157,7 @@ impl Launcher {
                     button(
                         &mut ui,
                         &mut self.targets,
-                        [w - margin - 108.0, y + 10.0, 108.0, 38.0],
+                        [w - margin - 108.0, y + 12.0, 108.0, 40.0],
                         translate(language, self.catalog.install_button(p)),
                         Action::Install(i),
                         false,
@@ -1011,7 +1174,7 @@ impl Launcher {
             button(
                 &mut ui,
                 &mut self.targets,
-                [margin, action_y, action_w, 36.0],
+                [margin, action_y, action_w, 40.0],
                 translate(language, "Previous"),
                 Action::Previous,
                 false,
@@ -1019,7 +1182,7 @@ impl Launcher {
             button(
                 &mut ui,
                 &mut self.targets,
-                [margin + action_w + action_gap, action_y, action_w, 36.0],
+                [margin + action_w + action_gap, action_y, action_w, 40.0],
                 translate(language, "Next"),
                 Action::Next,
                 false,
@@ -1031,7 +1194,7 @@ impl Launcher {
                     w - margin - 2.0 * action_w - action_gap,
                     action_y,
                     action_w,
-                    36.0,
+                    40.0,
                 ],
                 translate(language, "Folder"),
                 Action::OpenFolder(kind),
@@ -1040,7 +1203,7 @@ impl Launcher {
             button(
                 &mut ui,
                 &mut self.targets,
-                [w - margin - action_w, action_y, action_w, 36.0],
+                [w - margin - action_w, action_y, action_w, 40.0],
                 translate(language, "Import"),
                 Action::Import(kind),
                 false,
@@ -1097,7 +1260,6 @@ impl Launcher {
                     .push(([margin, y, label_w, 44.0], Action::ToggleSection(section)));
                 self.list_targets.push((import_rect, Action::Import(kind)));
                 if y >= viewport_top && y + 44.0 <= bottom {
-                    ui.rounded(margin, y, label_w, 44.0, 22.0, color::RAISED);
                     let label = format!(
                         "{}  {} ({count})",
                         if self.catalog.sections[section] {
@@ -1107,12 +1269,13 @@ impl Launcher {
                         },
                         translate(language, kind.label())
                     );
-                    let label = ui.fit_text(Face::Medium, 15.0, &label, label_w - 28.0);
-                    ui.text(
+                    let label = ui.fit_text(Face::Medium, md3::TITLE_MEDIUM, &label, label_w - 8.0);
+                    ui.text_line(
                         Face::Medium,
-                        15.0,
-                        margin + 14.0,
-                        y + (44.0 - 15.0 * 1.45) / 2.0,
+                        md3::TITLE_MEDIUM,
+                        md3::TITLE_MEDIUM_LINE,
+                        margin,
+                        y + (44.0 - md3::TITLE_MEDIUM_LINE) / 2.0,
                         color::TEXT,
                         &label,
                     );
@@ -1141,14 +1304,14 @@ impl Launcher {
                     let switch_x = if narrow {
                         margin
                     } else {
-                        w - margin - 80.0 - 8.0 - 44.0
+                        w - margin - 80.0 - 8.0 - 52.0
                     };
                     let remove_x = w - margin - 80.0;
                     let controls_y = if narrow { y + 52.0 } else { y + 14.0 };
                     self.list_targets
-                        .push(([switch_x, controls_y, 44.0, 40.0], Action::ToggleLocal(i)));
+                        .push(([switch_x, controls_y, 52.0, 40.0], Action::ToggleLocal(i)));
                     self.list_targets
-                        .push(([remove_x, controls_y, 80.0, 36.0], Action::DeleteLocal(i)));
+                        .push(([remove_x, controls_y, 80.0, 40.0], Action::DeleteLocal(i)));
                     if y < viewport_top || y + item_h > bottom {
                         continue;
                     }
@@ -1157,11 +1320,20 @@ impl Launcher {
                     } else {
                         (content_w - 148.0).max(80.0)
                     };
-                    let title = ui.fit_text(Face::Medium, 16.0, &item.title, title_w);
-                    ui.text(Face::Medium, 16.0, margin, y + 4.0, color::TEXT, &title);
-                    ui.text(
+                    let title = ui.fit_text(Face::Medium, md3::TITLE_MEDIUM, &item.title, title_w);
+                    ui.text_line(
+                        Face::Medium,
+                        md3::TITLE_MEDIUM,
+                        md3::TITLE_MEDIUM_LINE,
+                        margin,
+                        y + 4.0,
+                        color::TEXT,
+                        &title,
+                    );
+                    ui.text_line(
                         Face::Regular,
-                        13.0,
+                        md3::BODY_MEDIUM,
+                        md3::BODY_MEDIUM_LINE,
                         margin,
                         y + 29.0,
                         color::MUTED,
@@ -1180,7 +1352,7 @@ impl Launcher {
                         toggle(
                             &mut ui,
                             &mut self.targets,
-                            [switch_x, controls_y, 44.0, 40.0],
+                            [switch_x, controls_y, 52.0, 40.0],
                             item.enabled,
                             Action::ToggleLocal(i),
                             language,
@@ -1189,7 +1361,7 @@ impl Launcher {
                     button(
                         &mut ui,
                         &mut self.targets,
-                        [remove_x, controls_y, 80.0, 36.0],
+                        [remove_x, controls_y, 80.0, 40.0],
                         translate(language, "Remove"),
                         Action::DeleteLocal(i),
                         false,
@@ -1317,6 +1489,11 @@ impl Launcher {
                 ),
                 Entry::Section("Support"),
                 Entry::Row(
+                    "GitHub repository",
+                    Action::Repository,
+                    Kind::Action(translate(language, "Open in browser").to_owned()),
+                ),
+                Entry::Row(
                     "Diagnostic report",
                     Action::ExportDiagnostics,
                     Kind::Action(
@@ -1368,77 +1545,72 @@ impl Launcher {
                         self.list_targets.push((rect, action));
                         if y >= viewport_top && y + row_h <= bottom {
                             let name = translate(language, name);
-                            let choice = matches!(kind, Kind::Choice(_));
                             match kind {
                                 Kind::Toggle(on) => {
                                     let state = translate(language, if on { "On" } else { "Off" });
-                                    let state_w = ui.measure(Face::Regular, 13.0, state);
-                                    let title_w = (content_w - state_w - 64.0).max(80.0);
-                                    let title = ui.fit_text(Face::Medium, 15.0, name, title_w);
-                                    ui.text(
+                                    let state_w =
+                                        ui.measure(Face::Regular, md3::BODY_MEDIUM, state);
+                                    let switch_x = w - margin - 52.0;
+                                    let title_w = (switch_x - margin - state_w - 16.0).max(80.0);
+                                    let title =
+                                        ui.fit_text(Face::Medium, md3::TITLE_MEDIUM, name, title_w);
+                                    ui.text_line(
                                         Face::Medium,
-                                        15.0,
+                                        md3::TITLE_MEDIUM,
+                                        md3::TITLE_MEDIUM_LINE,
                                         margin,
-                                        y + (row_h - 15.0 * 1.45) / 2.0,
+                                        y + (row_h - md3::TITLE_MEDIUM_LINE) / 2.0,
                                         color::TEXT,
                                         &title,
                                     );
-                                    ui.text(
+                                    ui.text_line(
                                         Face::Regular,
-                                        13.0,
-                                        w - margin - 52.0 - state_w,
-                                        y + (row_h - 13.0 * 1.45) / 2.0,
+                                        md3::BODY_MEDIUM,
+                                        md3::BODY_MEDIUM_LINE,
+                                        switch_x - 8.0 - state_w,
+                                        y + (row_h - md3::BODY_MEDIUM_LINE) / 2.0,
                                         color::MUTED,
                                         state,
                                     );
                                     toggle(
                                         &mut ui,
                                         &mut self.targets,
-                                        [w - margin - 44.0, y + (row_h - 40.0) / 2.0, 44.0, 40.0],
+                                        [switch_x, y + (row_h - 40.0) / 2.0, 52.0, 40.0],
                                         on,
                                         action,
                                         language,
                                     );
                                 }
                                 Kind::Choice(value) | Kind::Action(value) => {
-                                    let ends_with_chevron = choice;
-                                    let right_pad = if ends_with_chevron { 18.0 } else { 0.0 };
                                     let value = ui.fit_text(
                                         Face::Regular,
-                                        14.0,
+                                        md3::BODY_MEDIUM,
                                         &value,
                                         (content_w * 0.52).max(80.0),
                                     );
-                                    let value_w = ui.measure(Face::Regular, 14.0, &value);
-                                    let title_w =
-                                        (content_w - value_w - right_pad - 24.0).max(80.0);
-                                    let title = ui.fit_text(Face::Medium, 15.0, name, title_w);
-                                    ui.text(
+                                    let value_w =
+                                        ui.measure(Face::Regular, md3::BODY_MEDIUM, &value);
+                                    let title_w = (content_w - value_w - 32.0).max(80.0);
+                                    let title =
+                                        ui.fit_text(Face::Medium, md3::TITLE_MEDIUM, name, title_w);
+                                    ui.text_line(
                                         Face::Medium,
-                                        15.0,
+                                        md3::TITLE_MEDIUM,
+                                        md3::TITLE_MEDIUM_LINE,
                                         margin,
-                                        y + (row_h - 15.0 * 1.45) / 2.0,
+                                        y + (row_h - md3::TITLE_MEDIUM_LINE) / 2.0,
                                         color::TEXT,
                                         &title,
                                     );
-                                    ui.text(
+                                    ui.text_line(
                                         Face::Regular,
-                                        14.0,
-                                        w - margin - right_pad - value_w,
-                                        y + (row_h - 14.0 * 1.45) / 2.0,
+                                        md3::BODY_MEDIUM,
+                                        md3::BODY_MEDIUM_LINE,
+                                        w - margin - value_w,
+                                        y + (row_h - md3::BODY_MEDIUM_LINE) / 2.0,
                                         color::MUTED,
                                         &value,
                                     );
-                                    if ends_with_chevron {
-                                        ui.text(
-                                            Face::Medium,
-                                            18.0,
-                                            w - margin - 10.0,
-                                            y + (row_h - 18.0 * 1.45) / 2.0,
-                                            color::MUTED,
-                                            ">",
-                                        );
-                                    }
                                     self.targets.push((rect, action));
                                 }
                             }
@@ -1466,44 +1638,50 @@ impl Launcher {
                 true,
             );
         }
-        let account_label = self.login.status(&self.catalog.config.name, language);
+        let now = Instant::now();
+        let fade = self.motion.page_alpha(now);
+        if fade > 0.0 {
+            ui.rounded(
+                0.0,
+                nav_bottom,
+                w,
+                h - nav_bottom,
+                0.0,
+                color::with_alpha(color::BG, fade),
+            );
+        }
+        let account_initial = self
+            .login
+            .profile
+            .as_deref()
+            .unwrap_or(&self.catalog.config.name)
+            .to_owned();
+        let _ = self.login.status(&self.catalog.config.name, language);
+        let status = self.error.as_deref().unwrap_or(&self.catalog.status);
+        let status_error = self.error.is_some();
         Self::draw_chrome(
             &mut ui,
             &mut self.targets,
-            &account_label,
+            &account_initial,
+            status,
+            status_error,
             language,
-            compact,
             margin,
             content_w,
             nav_bottom,
             page,
+            &self.motion,
         );
-        ui.rounded(0.0, h - 64.0, w, 64.0, 0.0, color::BG);
-        rule(&mut ui, margin, h - 64.0, content_w);
-        let bar_y = h - 52.0;
-        rule(&mut ui, margin, bar_y, content_w);
-        let status = self.error.as_deref().unwrap_or(&self.catalog.status);
-        let status = ui.fit_text(Face::Regular, 12.0, status, content_w - 92.0);
-        ui.text(
-            Face::Regular,
-            12.0,
-            margin,
-            bar_y + 13.0,
-            if self.error.is_some() {
-                color::DANGER
-            } else {
-                color::MUTED
-            },
-            &status,
-        );
-        button(
-            &mut ui,
-            &mut self.targets,
-            [w - margin - 72.0, bar_y + 9.0, 72.0, 30.0],
-            "GitHub",
-            Action::Repository,
-            false,
-        );
+        if let Some((rect, alpha)) = self.motion.ripple_alpha(now) {
+            ui.rounded(
+                rect[0],
+                rect[1],
+                rect[2],
+                rect[3],
+                12.0,
+                color::with_alpha(color::ON_SURFACE, alpha),
+            );
+        }
         if self.login.visible {
             self.list_targets.clear();
             self.list_view = None;
@@ -1565,7 +1743,14 @@ impl Launcher {
         if let Some(index) = self.focus
             && let Some(([x, y, w, h], _)) = self.targets.get(index)
         {
-            ui.border(*x - 2.0, *y - 2.0, *w + 4.0, *h + 4.0, 2.0, color::TEXT);
+            ui.border(
+                *x - 2.0,
+                *y - 2.0,
+                *w + 4.0,
+                *h + 4.0,
+                md3::SHAPE_M,
+                color::PRIMARY,
+            );
             self.cursor = (
                 f64::from((x + w / 2.0) * ui.density),
                 f64::from((y + h / 2.0) * ui.density),
@@ -1587,8 +1772,8 @@ impl Launcher {
                     *y,
                     *w,
                     *h,
-                    2.0,
-                    horizon_client::hud::rgba(255, 255, 255, 48),
+                    md3::SHAPE_M,
+                    color::with_alpha(color::ON_SURFACE, 0.10),
                 );
             }
         }
@@ -1603,8 +1788,8 @@ impl Launcher {
                 *y,
                 *w,
                 *h,
-                2.0,
-                horizon_client::hud::rgba(255, 255, 255, 48),
+                md3::SHAPE_M,
+                color::with_alpha(color::ON_SURFACE, 0.10),
             );
         }
         crate::documents::draw_ui(&mut ui);
@@ -1642,6 +1827,11 @@ impl Launcher {
             .map(|(_, a)| *a);
         if self.catalog.busy() || crate::documents::busy() {
             return Ok(());
+        }
+        if let Some(action) = action
+            && let Some(([x, y, w, h], _)) = self.targets.iter().find(|(_, a)| *a == action)
+        {
+            self.motion.press([*x, *y, *w, *h]);
         }
         self.feedback = action.map(|action| (action, std::time::Instant::now()));
         self.focus = None;
@@ -1780,6 +1970,15 @@ impl Launcher {
             Some(Action::SignOut) => self.login.sign_out(),
             Some(Action::LoginLink) => self.login.open_link(),
             Some(Action::Page(page)) => {
+                let tab = match page {
+                    Page::Play => Some(0),
+                    Page::Mods => Some(1),
+                    Page::Packs => Some(2),
+                    Page::Shaders => Some(3),
+                    Page::Installed => Some(4),
+                    Page::Settings => None,
+                };
+                self.motion.page_changed(tab);
                 self.catalog.editing = None;
                 if crate::platform::active() {
                     crate::platform::hide();

@@ -481,7 +481,7 @@ impl<'a> Ui<'a> {
     /// Draw a line of text in a `line`-tall box whose top is `y` (the
     /// launcher's line heights: about 1.45 × size for the interface);
     /// returns its width in dp.
-    pub(crate) fn text_line(
+    pub fn text_line(
         &mut self,
         face: Face,
         size: f32,

@@ -11,6 +11,8 @@ pub(crate) fn session_argument() -> Option<PathBuf> {
 mod chooser;
 #[path = "launcher_gesture.rs"]
 mod gesture;
+#[path = "md3.rs"]
+mod md3;
 #[path = "launcher_pages.rs"]
 mod pages;
 #[path = "update.rs"]
@@ -59,6 +61,7 @@ pub(super) struct Launcher {
     chooser: Option<chooser::Chooser>,
     login: login::Login,
     update: update::Update,
+    motion: md3::Motion,
     session_worker: Option<mpsc::Receiver<std::result::Result<Option<PathBuf>, String>>>,
     session_ready: bool,
     focus: Option<usize>,
@@ -84,6 +87,14 @@ impl Launcher {
         crate::device_runtime::configure(catalog.config.device);
         let mut update = update::Update::new();
         update.check();
+        let initial_tab = match catalog.page {
+            Page::Play => Some(0),
+            Page::Mods => Some(1),
+            Page::Packs => Some(2),
+            Page::Shaders => Some(3),
+            Page::Installed => Some(4),
+            Page::Settings => None,
+        };
         Self {
             home,
             controller_edges: Default::default(),
@@ -107,6 +118,7 @@ impl Launcher {
             chooser: None,
             login: login::Login::new(),
             update,
+            motion: md3::Motion::new(initial_tab),
             session_worker: None,
             session_ready: false,
             focus: None,
@@ -498,6 +510,7 @@ impl ApplicationHandler for Launcher {
             return;
         }
         crate::diagnostics::heartbeat("launcher", || serde_json::json!({}));
+        let animating = self.motion.tick(Instant::now());
         let busy = self.worker.is_some()
             || self.session_worker.is_some()
             || self.diagnostic_export.is_some()
@@ -506,7 +519,7 @@ impl ApplicationHandler for Launcher {
             || self.update.busy()
             || crate::documents::busy()
             || self.controller_repeat.is_some();
-        let mut changed = false;
+        let mut changed = animating;
         if let Some(result) = self
             .diagnostic_export
             .as_ref()
@@ -591,7 +604,7 @@ impl ApplicationHandler for Launcher {
                 window.request_redraw();
             }
             events.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(100),
+                Instant::now() + Duration::from_millis(if animating { 16 } else { 100 }),
             ));
         } else if self.catalog.editing.is_some() {
             if let Some(window) = &self.window {

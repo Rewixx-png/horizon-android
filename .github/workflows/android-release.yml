@@ -85,6 +85,11 @@ jobs:
       - name: Download official Mojang inputs and prepare engine tables
         run: python3 tools/android_prepare.py
 
+      - name: Drop raw Mojang inputs before the Rust build
+        run: |
+          rm -rf .local/android/minecraft .local/android/jdk .local/android/serve .local/android/prepare-*
+          df -h /
+
       - name: Build the public APK
         run: |
           python3 tools/android_build.py \
@@ -95,17 +100,18 @@ jobs:
             --java-home "$JAVA_HOME_17_X64" \
             --gradle "$GRADLE"
 
-      - name: Write checksums
+      - name: Name the release APK and write checksums
         run: |
           cd ".local/android/apk/${{ inputs.abi }}"
-          sha256sum horizon-android-public.apk > SHA256SUMS.txt
+          mv horizon-android-public.apk "horizon-android-${{ inputs.abi }}.apk"
+          sha256sum "horizon-android-${{ inputs.abi }}.apk" > SHA256SUMS.txt
 
       - name: Upload the build artifact
         uses: actions/upload-artifact@v4
         with:
           name: horizon-android-${{ inputs.abi }}
           path: |
-            .local/android/apk/${{ inputs.abi }}/horizon-android-public.apk
+            .local/android/apk/${{ inputs.abi }}/horizon-android-${{ inputs.abi }}.apk
             .local/android/apk/${{ inputs.abi }}/SHA256SUMS.txt
 
       - name: Publish the GitHub release
@@ -113,7 +119,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${{ inputs.tag }}"
-          apk=".local/android/apk/${{ inputs.abi }}/horizon-android-public.apk"
+          apk=".local/android/apk/${{ inputs.abi }}/horizon-android-${{ inputs.abi }}.apk"
           sums=".local/android/apk/${{ inputs.abi }}/SHA256SUMS.txt"
           notes="Public APK built from $GITHUB_SHA for ${{ inputs.abi }} with the optimized fast profile. The first run downloads original Minecraft resources from Mojang on the device. Signing uses ANDROID_KEYSTORE_BASE64 when configured, otherwise the build's development key; installing over a build with a different key requires uninstalling first."
           if gh release view "$tag" >/dev/null 2>&1; then

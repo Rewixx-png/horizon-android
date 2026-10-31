@@ -63,6 +63,7 @@ pub(super) enum Action {
     GpuProfile,
     Language,
     ChooseLanguage(Language),
+    DownloadUpdate,
 }
 
 /// The phone gutter from the design system: 16 dp, 32 dp on tablets.
@@ -185,6 +186,11 @@ pub(super) fn rule(ui: &mut Ui, x: f32, y: f32, w: f32) {
 }
 
 /// A page's display title and one-line description. Returns the content top.
+pub(super) fn page_header_height(w: f32) -> f32 {
+    let size = if w < 420.0 { 24.0 } else { 28.0 };
+    size * 1.45 + 2.0 + 14.0 * 1.45 + 14.0
+}
+
 pub(super) fn page_header(ui: &mut Ui, title: &str, caption: &str, x: f32, y: f32, w: f32) -> f32 {
     let size = if w < 420.0 { 24.0 } else { 28.0 };
     let title = ui.fit_text(Face::Medium, size, title, w);
@@ -268,7 +274,92 @@ impl Launcher {
                 0
             },
         );
+        self.redraw();
         true
+    }
+
+    /// The fixed app bar and navigation, drawn after the page so a scrolled
+    /// page header slides under an opaque mask instead of over the tabs.
+    fn draw_chrome(
+        ui: &mut Ui,
+        targets: &mut Vec<([f32; 4], Action)>,
+        account_label: &str,
+        language: Language,
+        compact: bool,
+        margin: f32,
+        content_w: f32,
+        nav_bottom: f32,
+        current_page: Page,
+    ) {
+        let w = ui.w;
+        ui.rounded(0.0, 0.0, w, nav_bottom + 12.0, 0.0, color::BG);
+        ui.text(
+            Face::Medium,
+            if compact { 20.0 } else { 22.0 },
+            margin,
+            12.0,
+            color::TEXT,
+            "Horizon",
+        );
+        let brand_w = ui.measure(Face::Medium, if compact { 20.0 } else { 22.0 }, "Horizon");
+        ui.text(
+            Face::Regular,
+            11.0,
+            margin + brand_w + 8.0,
+            19.0,
+            color::MUTED,
+            crate::backend::VERSION,
+        );
+        let account_w = (content_w * 0.46).clamp(140.0, 260.0);
+        button(
+            ui,
+            targets,
+            [w - margin - account_w, 8.0, account_w, 36.0],
+            account_label,
+            Action::Account,
+            false,
+        );
+
+        let nav_top = 56.0;
+        let columns = if compact && content_w < 560.0 { 3 } else { 6 };
+        let rows = Page::ALL.len().div_ceil(columns);
+        let gap = 6.0;
+        let tab_h = if rows == 2 { 44.0 } else { 46.0 };
+        let tab_w = (content_w - gap * (columns as f32 - 1.0)) / columns as f32;
+        for (i, page) in Page::ALL.iter().enumerate() {
+            let column = i % columns;
+            let row = i / columns;
+            let rect = [
+                margin + column as f32 * (tab_w + gap),
+                nav_top + row as f32 * (tab_h + gap),
+                tab_w,
+                tab_h,
+            ];
+            let selected = *page == current_page;
+            let label = translate(language, page.name());
+            let [x, y, tw, th] = rect;
+            ui.rounded(
+                x,
+                y,
+                tw,
+                th,
+                (th / 2.0).min(24.0),
+                if selected { color::TEXT } else { color::RAISED },
+            );
+            let size = if compact { 13.0 } else { 15.0 };
+            let label = ui.fit_text(Face::Medium, size, label, tw - 16.0);
+            let text_w = ui.measure(Face::Medium, size, &label);
+            ui.text(
+                Face::Medium,
+                size,
+                x + (tw - text_w) / 2.0,
+                y + (th - size * 1.45) / 2.0,
+                if selected { color::BG } else { color::TEXT },
+                &label,
+            );
+            targets.push((rect, Action::Page(*page)));
+        }
+        rule(ui, margin, nav_bottom + 10.0, content_w);
     }
 
     pub(super) fn draw_pages(&mut self) -> Result<()> {
@@ -308,77 +399,11 @@ impl Launcher {
         let margin = gutter(w);
         let content_w = w - 2.0 * margin;
 
-        // App bar: the wordmark names the app, the version is a quiet detail,
-        // and the account chip is the only control on the row.
-        ui.text(
-            Face::Medium,
-            if compact { 20.0 } else { 22.0 },
-            margin,
-            12.0,
-            color::TEXT,
-            "Horizon",
-        );
-        let brand_w = ui.measure(Face::Medium, if compact { 20.0 } else { 22.0 }, "Horizon");
-        ui.text(
-            Face::Regular,
-            11.0,
-            margin + brand_w + 8.0,
-            19.0,
-            color::MUTED,
-            crate::backend::VERSION,
-        );
-        let account_w = (content_w * 0.46).clamp(140.0, 260.0);
-        button(
-            &mut ui,
-            &mut self.targets,
-            [w - margin - account_w, 8.0, account_w, 36.0],
-            &self.login.status(&self.catalog.config.name, language),
-            Action::Account,
-            false,
-        );
-
-        // Navigation: one row of six on tablets, three by two on phones. A
-        // selected page is ink, not the action accent; the accent stays for
-        // the one main action on the page.
         let nav_top = 56.0;
         let columns = if compact && content_w < 560.0 { 3 } else { 6 };
         let rows = Page::ALL.len().div_ceil(columns);
         let gap = 6.0;
         let tab_h = if rows == 2 { 44.0 } else { 46.0 };
-        let tab_w = (content_w - gap * (columns as f32 - 1.0)) / columns as f32;
-        for (i, page) in Page::ALL.iter().enumerate() {
-            let column = i % columns;
-            let row = i / columns;
-            let rect = [
-                margin + column as f32 * (tab_w + gap),
-                nav_top + row as f32 * (tab_h + gap),
-                tab_w,
-                tab_h,
-            ];
-            let selected = *page == self.catalog.page;
-            let label = translate(language, page.name());
-            let [x, y, tw, th] = rect;
-            ui.rounded(
-                x,
-                y,
-                tw,
-                th,
-                (th / 2.0).min(24.0),
-                if selected { color::TEXT } else { color::RAISED },
-            );
-            let size = if compact { 13.0 } else { 15.0 };
-            let label = ui.fit_text(Face::Medium, size, label, tw - 16.0);
-            let text_w = ui.measure(Face::Medium, size, &label);
-            ui.text(
-                Face::Medium,
-                size,
-                x + (tw - text_w) / 2.0,
-                y + (th - size * 1.45) / 2.0,
-                if selected { color::BG } else { color::TEXT },
-                &label,
-            );
-            self.targets.push((rect, Action::Page(*page)));
-        }
         let nav_bottom = nav_top + rows as f32 * tab_h + (rows as f32 - 1.0) * gap;
         let page_top = nav_bottom + 18.0;
         let content_bottom = h - 64.0;
@@ -400,7 +425,139 @@ impl Launcher {
             let caption = tr!(language, "Minecraft 26.3  /  Profile {profile}", {
                 profile = self.catalog.config.profile
             });
-            let top = page_header(&mut ui, title, &caption, margin, page_top, content_w);
+            let mut top = page_header(&mut ui, title, &caption, margin, page_top, content_w);
+            let tight = h < 560.0;
+            let error = self.update.error().map(|error| {
+                if error
+                    == "The installer could not be opened. Allow installs from Horizon and try again."
+                {
+                    translate(
+                        language,
+                        "The installer could not be opened. Allow installs from Horizon and try again.",
+                    )
+                } else {
+                    error
+                }
+            });
+            if let Some(release) = self.update.available() {
+                let card_h = if tight {
+                    52.0
+                } else if compact {
+                    100.0
+                } else {
+                    92.0
+                };
+                ui.rounded(margin, top, content_w, card_h, 10.0, color::RAISED);
+                let dot_color = if error.is_some() {
+                    color::DANGER
+                } else {
+                    color::ACCENT
+                };
+                ui.rounded(margin + 14.0, top + 16.0, 6.0, 6.0, 3.0, dot_color);
+                let title = if error.is_some() {
+                    translate(language, "Update failed").to_owned()
+                } else if tight {
+                    translate(language, "New version available").to_owned()
+                } else {
+                    tr!(language, "New version {version} is available", {
+                        version = release.version
+                    })
+                };
+                if tight {
+                    let title = ui.fit_text(Face::Medium, 13.0, &title, content_w - 190.0);
+                    ui.text(
+                        Face::Medium,
+                        13.0,
+                        margin + 30.0,
+                        top + (card_h - 13.0 * 1.45) / 2.0,
+                        color::TEXT,
+                        &title,
+                    );
+                    button(
+                        &mut ui,
+                        &mut self.targets,
+                        [w - margin - 152.0, top + 8.0, 138.0, 36.0],
+                        if error.is_some() {
+                            translate(language, "Retry")
+                        } else {
+                            translate(language, "Download")
+                        },
+                        Action::DownloadUpdate,
+                        false,
+                    );
+                } else {
+                    let title = ui.fit_text(Face::Medium, 16.0, &title, content_w - 56.0);
+                    ui.text(
+                        Face::Medium,
+                        16.0,
+                        margin + 30.0,
+                        top + 10.0,
+                        color::TEXT,
+                        &title,
+                    );
+                    let caption = if let Some(error) = error {
+                        tr!(language, "Update failed: {error}", { error = error })
+                    } else {
+                        translate(language, "Tap to download and install").to_owned()
+                    };
+                    let caption = ui.fit_text(Face::Regular, 13.0, &caption, content_w - 56.0);
+                    ui.text(
+                        Face::Regular,
+                        13.0,
+                        margin + 30.0,
+                        top + 34.0,
+                        color::MUTED,
+                        &caption,
+                    );
+                    button(
+                        &mut ui,
+                        &mut self.targets,
+                        [margin + 20.0, top + card_h - 46.0, content_w - 40.0, 36.0],
+                        if error.is_some() {
+                            translate(language, "Retry")
+                        } else {
+                            translate(language, "Download and install")
+                        },
+                        Action::DownloadUpdate,
+                        false,
+                    );
+                }
+                top += card_h + 10.0;
+            } else if let Some(progress) = self.update.downloading() {
+                let card_h = if tight {
+                    52.0
+                } else if compact {
+                    88.0
+                } else {
+                    80.0
+                };
+                ui.rounded(margin, top, content_w, card_h, 10.0, color::RAISED);
+                let title = tr!(language, "Downloading update... {percent}%", {
+                    percent = (progress * 100.0).round() as u32
+                });
+                let title = ui.fit_text(
+                    Face::Medium,
+                    if tight { 13.0 } else { 16.0 },
+                    &title,
+                    content_w - 40.0,
+                );
+                ui.text(
+                    Face::Medium,
+                    if tight { 13.0 } else { 16.0 },
+                    margin + 20.0,
+                    top + if tight { 8.0 } else { 10.0 },
+                    color::TEXT,
+                    &title,
+                );
+                progress_bar(
+                    &mut ui,
+                    margin + 20.0,
+                    top + if tight { 34.0 } else { 40.0 },
+                    content_w - 40.0,
+                    progress,
+                );
+                top += card_h + 10.0;
+            }
             if installing {
                 let current = InstallStage::ALL
                     .iter()
@@ -498,14 +655,25 @@ impl Launcher {
                         "03  Play offline or sign in for servers",
                     ]
                 };
+                let button_top = content_bottom - 52.0;
+                let rows_bottom = if self.error.is_some() {
+                    content_bottom - 126.0
+                } else {
+                    button_top - 8.0
+                };
                 for (index, line) in rows.iter().enumerate() {
                     let y = top + index as f32 * 46.0;
+                    if y + 38.0 > rows_bottom {
+                        break;
+                    }
                     let line = translate(language, line);
                     let line = ui.fit_text(Face::Regular, 16.0, line, content_w);
                     ui.text(Face::Regular, 16.0, margin, y + 4.0, color::TEXT, &line);
                     rule(&mut ui, margin, y + 38.0, content_w);
                 }
-                if let Some(error) = &self.error {
+                if let Some(error) = &self.error
+                    && top < content_bottom - 126.0
+                {
                     let text = ui.fit_text(Face::Regular, 13.0, error, content_w - 24.0);
                     ui.rounded(
                         margin,
@@ -687,7 +855,7 @@ impl Launcher {
                     self.list_targets
                         .push(([w - margin - 108.0, y, 108.0, 64.0], Action::Install(i)));
                 }
-                if y < top - row_height || y + 64.0 > bottom {
+                if y < top || y + 64.0 > bottom {
                     continue;
                 }
                 let title = ui.fit_text(Face::Medium, 17.0, &p.title, content_w - 120.0);
@@ -808,12 +976,13 @@ impl Launcher {
                 language,
                 "Mods, resource packs and shaders for this profile",
             );
-            let top = page_header(&mut ui, title, caption, margin, page_top, content_w);
+            let header_h = page_header_height(content_w);
             let bottom = content_bottom;
+            let viewport_top = nav_bottom + 8.0;
             let narrow = content_w < 340.0;
             let section_h = 52.0;
             let item_h = if narrow { 100.0 } else { 68.0 };
-            let total = Kind::ALL
+            let entries_total = Kind::ALL
                 .iter()
                 .enumerate()
                 .map(|(i, kind)| {
@@ -830,19 +999,28 @@ impl Launcher {
                         }
                 })
                 .sum::<f32>();
-            let maximum = (total - (bottom - top)).max(0.0);
+            let total = header_h + entries_total;
+            let maximum = (total - (bottom - viewport_top)).max(0.0);
             self.catalog.scroll = self.catalog.scroll.clamp(0.0, maximum);
-            self.list_view = Some([top, bottom, maximum]);
+            self.list_view = Some([viewport_top, bottom, maximum]);
+            let content_top = page_header(
+                &mut ui,
+                title,
+                caption,
+                margin,
+                page_top - self.catalog.scroll,
+                content_w,
+            );
             let mut offset = 0.0;
             for (section, kind) in Kind::ALL.into_iter().enumerate() {
                 let count = self.catalog.local.iter().filter(|e| e.kind == kind).count();
-                let y = top + offset - self.catalog.scroll;
+                let y = content_top + offset;
                 let label_w = (content_w - 88.0).max(80.0);
                 let import_rect = [w - margin - 80.0, y, 80.0, 40.0];
                 self.list_targets
                     .push(([margin, y, label_w, 44.0], Action::ToggleSection(section)));
                 self.list_targets.push((import_rect, Action::Import(kind)));
-                if y >= top - 44.0 && y + 44.0 <= bottom {
+                if y >= viewport_top && y + 44.0 <= bottom {
                     ui.rounded(margin, y, label_w, 44.0, 22.0, color::RAISED);
                     let label = format!(
                         "{}  {} ({count})",
@@ -882,7 +1060,7 @@ impl Launcher {
                     .enumerate()
                     .filter(|(_, e)| e.kind == kind)
                 {
-                    let y = top + offset - self.catalog.scroll;
+                    let y = content_top + offset;
                     offset += item_h;
                     let switch_x = if narrow {
                         margin
@@ -895,7 +1073,7 @@ impl Launcher {
                         .push(([switch_x, controls_y, 44.0, 40.0], Action::ToggleLocal(i)));
                     self.list_targets
                         .push(([remove_x, controls_y, 80.0, 36.0], Action::DeleteLocal(i)));
-                    if y < top - item_h || y + item_h > bottom {
+                    if y < viewport_top || y + item_h > bottom {
                         continue;
                     }
                     let title_w = if narrow {
@@ -943,14 +1121,14 @@ impl Launcher {
                     rule(&mut ui, margin, y + item_h - 6.0, content_w);
                 }
             }
-            if total == 0.0 {
+            if self.catalog.local.is_empty() {
                 let text = translate(language, "No items installed yet");
                 let text_w = ui.measure(Face::Regular, 15.0, text);
                 ui.text(
                     Face::Regular,
                     15.0,
                     margin + (content_w - text_w) / 2.0,
-                    (top + bottom) / 2.0,
+                    (viewport_top + bottom) / 2.0,
                     color::MUTED,
                     text,
                 );
@@ -960,7 +1138,7 @@ impl Launcher {
             let language = c.language;
             let title = translate(language, "Settings");
             let caption = translate(language, "Display, input and performance");
-            let top = page_header(&mut ui, title, caption, margin, page_top, content_w);
+            let header_h = page_header_height(content_w);
 
             enum Entry {
                 Section(&'static str),
@@ -1074,24 +1252,33 @@ impl Launcher {
             ];
             let row_h = if compact { 56.0 } else { 54.0 };
             let section_h = 30.0;
-            let total = entries
+            let entries_total = entries
                 .iter()
                 .map(|entry| match entry {
                     Entry::Section(_) => section_h,
                     Entry::Row(..) => row_h,
                 })
                 .sum::<f32>();
+            let viewport_top = nav_bottom + 8.0;
             let action_y = content_bottom - 44.0;
             let bottom = action_y - 12.0;
-            let maximum = (total - (bottom - top)).max(0.0);
+            let total = header_h + entries_total;
+            let maximum = (total - (bottom - viewport_top)).max(0.0);
             self.catalog.scroll = self.catalog.scroll.clamp(0.0, maximum);
-            self.list_view = Some([top, bottom, maximum]);
-            let mut y = top - self.catalog.scroll;
+            self.list_view = Some([viewport_top, bottom, maximum]);
+            let mut y = page_header(
+                &mut ui,
+                title,
+                caption,
+                margin,
+                page_top - self.catalog.scroll,
+                content_w,
+            );
             for entry in entries {
                 match entry {
                     Entry::Section(name) => {
                         let name = translate(language, name);
-                        if y + section_h > top - section_h && y < bottom {
+                        if y >= viewport_top && y + section_h <= bottom {
                             ui.text(Face::Medium, 12.0, margin, y + 8.0, color::MUTED, name);
                             rule(&mut ui, margin, y + section_h - 8.0, content_w);
                         }
@@ -1100,7 +1287,7 @@ impl Launcher {
                     Entry::Row(name, action, kind) => {
                         let rect = [margin, y, content_w, row_h];
                         self.list_targets.push((rect, action));
-                        if y + row_h > top - row_h && y < bottom {
+                        if y >= viewport_top && y + row_h <= bottom {
                             let name = translate(language, name);
                             let choice = matches!(kind, Kind::Choice(_));
                             match kind {
@@ -1200,6 +1387,20 @@ impl Launcher {
                 true,
             );
         }
+        let account_label = self.login.status(&self.catalog.config.name, language);
+        Self::draw_chrome(
+            &mut ui,
+            &mut self.targets,
+            &account_label,
+            language,
+            compact,
+            margin,
+            content_w,
+            nav_bottom,
+            page,
+        );
+        ui.rounded(0.0, h - 64.0, w, 64.0, 0.0, color::BG);
+        rule(&mut ui, margin, h - 64.0, content_w);
         let bar_y = h - 52.0;
         rule(&mut ui, margin, bar_y, content_w);
         let status = self.error.as_deref().unwrap_or(&self.catalog.status);
@@ -1566,6 +1767,7 @@ impl Launcher {
                 self.catalog.offset = self.catalog.offset.saturating_sub(12);
                 self.catalog.search(&self.home);
             }
+            Some(Action::DownloadUpdate) => self.update.start_download(&self.home),
             Some(Action::Language) => self.open_chooser(chooser::Kind::Language),
             Some(Action::ChooseLanguage(language)) => {
                 self.catalog.config.language = language;
@@ -1673,6 +1875,7 @@ impl Launcher {
             }
             None => {}
         }
+        self.redraw();
         Ok(())
     }
     pub(super) fn ui_density(&self) -> f32 {

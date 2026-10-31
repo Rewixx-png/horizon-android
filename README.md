@@ -15,6 +15,8 @@ Rust engine for Minecraft Java 26.3. Unofficial and in active development.
   360-degree movement, Auto Sprint and Sprint-button visibility.
 - English and Russian launcher UI from **Settings > Language**; the game keeps
   its own Options > Language setting.
+- In-app update check: a newer GitHub release appears on the home screen,
+  downloads with a SHA-256 check and opens the system installer.
 - Java multiplayer, including the Hypixel Arcade lobby shown below.
 - Native launcher, verified resource downloads, resource packs and `.hmod` import.
 - Vulkan rendering modes and resolution scaling; Android keyboard, clipboard,

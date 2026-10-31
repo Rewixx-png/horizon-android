@@ -489,6 +489,27 @@ const RU: &[(&str, &str)] = &[
     ),
     ("{hz} Hz (request)", "{hz} Гц (запрос)"),
     ("Native", "Нативно"),
+    (
+        "New version {version} is available",
+        "Доступна новая версия {version}",
+    ),
+    ("New version available", "Доступно обновление"),
+    ("Download", "Скачать"),
+    ("Download and install", "Скачать и установить"),
+    (
+        "Tap to download and install",
+        "Нажмите, чтобы скачать и установить",
+    ),
+    (
+        "Downloading update... {percent}%",
+        "Загрузка обновления… {percent}%",
+    ),
+    ("Update failed", "Ошибка обновления"),
+    ("Update failed: {error}", "Ошибка обновления: {error}"),
+    (
+        "The installer could not be opened. Allow installs from Horizon and try again.",
+        "Не удалось открыть установщик. Разрешите установку из Horizon и попробуйте снова.",
+    ),
 ];
 
 /// Translate one fixed English launcher string.

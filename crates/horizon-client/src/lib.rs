@@ -127,6 +127,7 @@ pub mod title;
 pub mod toasts;
 pub mod ui_text;
 pub mod ui_theme;
+pub mod update_check;
 pub mod vanillagen;
 pub mod win_screen;
 pub mod world_spawn;

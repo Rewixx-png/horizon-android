@@ -371,6 +371,82 @@ pub fn open_url(url: &str) -> bool {
     })
     .is_some()
 }
+/// Open the system package installer for the verified APK in app storage.
+pub fn install_update() -> bool {
+    with_context(|env, activity| {
+        let package = env
+            .call_method(activity, "getPackageName", "()Ljava/lang/String;", &[])?
+            .l()?;
+        let package: String = env.get_string((&package).into())?.into();
+        let address = JObject::from(env.new_string(format!(
+            "content://{package}.updates/update.apk"
+        ))?);
+        let uri = env
+            .call_static_method(
+                "android/net/Uri",
+                "parse",
+                "(Ljava/lang/String;)Landroid/net/Uri;",
+                &[JValue::Object(&address)],
+            )?
+            .l()?;
+        let action = JObject::from(env.new_string("android.intent.action.VIEW")?);
+        let intent = env.new_object(
+            "android/content/Intent",
+            "(Ljava/lang/String;)V",
+            &[JValue::Object(&action)],
+        )?;
+        let mime = JObject::from(env.new_string("application/vnd.android.package-archive")?);
+        env.call_method(
+            &intent,
+            "setDataAndType",
+            "(Landroid/net/Uri;Ljava/lang/String;)Landroid/content/Intent;",
+            &[JValue::Object(&uri), JValue::Object(&mime)],
+        )?;
+        let resolver = env
+            .call_method(
+                activity,
+                "getContentResolver",
+                "()Landroid/content/ContentResolver;",
+                &[],
+            )?
+            .l()?;
+        let label = JObject::from(env.new_string("Horizon update")?);
+        let clip = env
+            .call_static_method(
+                "android/content/ClipData",
+                "newUri",
+                "(Landroid/content/ContentResolver;Ljava/lang/CharSequence;Landroid/net/Uri;)Landroid/content/ClipData;",
+                &[
+                    JValue::Object(&resolver),
+                    JValue::Object(&label),
+                    JValue::Object(&uri),
+                ],
+            )?
+            .l()?;
+        env.call_method(
+            &intent,
+            "setClipData",
+            "(Landroid/content/ClipData;)Landroid/content/Intent;",
+            &[JValue::Object(&clip)],
+        )?;
+        // FLAG_GRANT_READ_URI_PERMISSION | FLAG_ACTIVITY_NEW_TASK
+        env.call_method(
+            &intent,
+            "addFlags",
+            "(I)Landroid/content/Intent;",
+            &[JValue::Int(0x1000_0001)],
+        )?;
+        env.call_method(
+            activity,
+            "startActivity",
+            "(Landroid/content/Intent;)V",
+            &[JValue::Object(&intent)],
+        )?;
+        Ok(())
+    })
+    .is_some()
+}
+
 /// Public Android power/thermal status; no device identifiers or sysfs access.
 pub fn performance_power() -> serde_json::Value {
     with_context(|env, activity| {

@@ -13,6 +13,8 @@ mod chooser;
 mod gesture;
 #[path = "launcher_pages.rs"]
 mod pages;
+#[path = "update.rs"]
+mod update;
 use horizon_client::{
     Result,
     gfx::Renderer,
@@ -57,6 +59,7 @@ pub(super) struct Launcher {
     drag: Option<gesture::Drag>,
     chooser: Option<chooser::Chooser>,
     login: login::Login,
+    update: update::Update,
     session_worker: Option<mpsc::Receiver<std::result::Result<Option<PathBuf>, String>>>,
     session_ready: bool,
     focus: Option<usize>,
@@ -80,6 +83,8 @@ impl Launcher {
         }
         crate::configure_input_mode(catalog.config.input_host);
         crate::device_runtime::configure(catalog.config.device);
+        let mut update = update::Update::new();
+        update.check();
         Self {
             home,
             controller_edges: Default::default(),
@@ -103,6 +108,7 @@ impl Launcher {
             drag: None,
             chooser: None,
             login: login::Login::new(),
+            update,
             session_worker: None,
             session_ready: false,
             focus: None,
@@ -158,6 +164,12 @@ impl Launcher {
             self.catalog.config.screen.aspect.ratio(),
         );
     }
+    fn redraw(&self) {
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
     fn fail(&mut self, error: impl std::fmt::Display) {
         log::error!("{error}");
         crate::diagnostics::record_error(&error.to_string());
@@ -199,6 +211,7 @@ impl Launcher {
         )?);
         self.window = Some(window);
         self.gui = Some(gui);
+        self.redraw();
         Ok(())
     }
 
@@ -393,12 +406,14 @@ impl ApplicationHandler for Launcher {
                 if let Some(r) = &mut self.renderer {
                     r.resize(size.width, size.height);
                 }
+                self.redraw();
                 Ok(())
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.focus = None;
                 self.pending_focus = None;
                 self.cursor = (position.x, position.y);
+                self.redraw();
                 Ok(())
             }
             WindowEvent::Touch(touch) => self.touch_event(events, touch),
@@ -417,6 +432,7 @@ impl ApplicationHandler for Launcher {
             } => {
                 if state == ElementState::Pressed {
                     self.mouse_down = true;
+                    self.redraw();
                     Ok(())
                 } else if std::mem::take(&mut self.mouse_down) {
                     self.activate(events)
@@ -434,11 +450,13 @@ impl ApplicationHandler for Launcher {
                 } else {
                     self.catalog.scroll = (self.catalog.scroll - y).max(0.0);
                 }
+                self.redraw();
                 Ok(())
             }
             WindowEvent::RedrawRequested => self.draw_pages(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if self.navigate(&event) {
+                    self.redraw();
                     Ok(())
                 } else if self.catalog.editing.is_none()
                     && !event.repeat
@@ -450,12 +468,14 @@ impl ApplicationHandler for Launcher {
                     self.activate(events)
                 } else {
                     self.type_key(event);
+                    self.redraw();
                     Ok(())
                 }
             }
             WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
                 self.catalog
                     .edit(horizon_client::osk::Output::Text(text), &self.home);
+                self.redraw();
                 Ok(())
             }
             _ => Ok(()),
@@ -481,12 +501,22 @@ impl ApplicationHandler for Launcher {
             return;
         }
         crate::diagnostics::heartbeat("launcher", || serde_json::json!({}));
+        let busy = self.worker.is_some()
+            || self.session_worker.is_some()
+            || self.diagnostic_export.is_some()
+            || self.login.pending()
+            || self.catalog.busy()
+            || self.update.busy()
+            || crate::documents::busy()
+            || self.controller_repeat.is_some();
+        let mut changed = false;
         if let Some(result) = self
             .diagnostic_export
             .as_ref()
             .and_then(|r| r.try_recv().ok())
         {
             self.diagnostic_export = None;
+            changed = true;
             let language = self.catalog.config.language;
             self.catalog.status = match result {
                 Ok(name) => {
@@ -514,6 +544,7 @@ impl ApplicationHandler for Launcher {
         }
         if let Some(result) = self.worker.as_ref().and_then(|w| w.try_recv().ok()) {
             self.worker = None;
+            changed = true;
             if let Err(error) = result {
                 self.fail(error);
             }
@@ -530,6 +561,7 @@ impl ApplicationHandler for Launcher {
         self.catalog.poll(&self.home);
         if let Some(notice) = crate::documents::poll() {
             self.catalog.status = notice.text;
+            changed = true;
             if notice.changed {
                 self.catalog.refresh(&self.home);
                 self.catalog.show_installed(notice.kind);
@@ -537,12 +569,14 @@ impl ApplicationHandler for Launcher {
         }
         let language = self.catalog.config.language;
         for result in crate::gallery::poll() {
+            changed = true;
             self.catalog.status = result
                 .unwrap_or_else(|e| tr!(language, "File export failed: {error}", { error = e }));
         }
         self.login.poll();
         if let Some(result) = self.session_worker.as_ref().and_then(|w| w.try_recv().ok()) {
             self.session_worker = None;
+            changed = true;
             match result {
                 Ok(file) => {
                     SESSION.with(|s| *s.borrow_mut() = file);
@@ -554,13 +588,35 @@ impl ApplicationHandler for Launcher {
                 Err(e) => self.fail(e),
             }
         }
-
-        if let Some(window) = &self.window {
-            window.request_redraw();
+        if self.update.poll() {
+            changed = true;
         }
-        events.set_control_flow(ControlFlow::WaitUntil(
-            Instant::now() + Duration::from_millis(100),
-        ));
+
+        if busy || changed {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+            events.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(100),
+            ));
+        } else if self.catalog.editing.is_some() {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+            events.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(500),
+            ));
+        } else if self.update.checking() {
+            events.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(250),
+            ));
+        } else if self.audio.is_some() {
+            events.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(50),
+            ));
+        } else {
+            events.set_control_flow(ControlFlow::Wait);
+        }
     }
     fn exiting(&mut self, events: &ActiveEventLoop) {
         if let Some(game) = &mut self.game {

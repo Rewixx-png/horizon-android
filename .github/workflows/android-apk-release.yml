@@ -121,10 +121,10 @@ jobs:
           sums=".local/android/apk/${{ inputs.abi }}/SHA256SUMS.txt"
           notes="Public APK built from $GITHUB_SHA for ${{ inputs.abi }} with the optimized fast profile. The first run downloads original Minecraft resources from Mojang on the device. Signing uses ANDROID_KEYSTORE_BASE64 when configured, otherwise the build's development key; installing over a build with a different key requires uninstalling first."
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" "$apk" "$sums" --clobber
-          else
-            gh release create "$tag" "$apk" "$sums" LICENSE THIRD_PARTY_NOTICES.md \
-              --target "$GITHUB_SHA" \
-              --title "Horizon Android $tag" \
-              --notes "$notes"
+            echo "Release $tag already exists. Bump versionCode/versionName and use a new tag." >&2
+            exit 1
           fi
+          gh release create "$tag" "$apk" "$sums" LICENSE THIRD_PARTY_NOTICES.md \
+            --target "$GITHUB_SHA" \
+            --title "Horizon Android $tag" \
+            --notes "$notes"

@@ -77,7 +77,8 @@ performance guarantee; list the architectures and device checks actually complet
 
 **Actions → Android release → Run workflow** builds one public APK for the
 chosen ABI, downloads the pinned official Mojang inputs on the runner, and
-creates or updates the release for the given tag. It runs only on manual
+creates the release for the given tag; an existing tag is rejected rather
+than overwritten. It runs only on manual
 dispatch; a push never publishes an APK. Add an `ANDROID_KEYSTORE_BASE64`
 repository secret to keep a stable signing identity across releases, otherwise
 the workflow signs with the generated development key and a later build with a

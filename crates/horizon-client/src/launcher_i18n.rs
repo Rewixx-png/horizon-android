@@ -496,6 +496,12 @@ const RU: &[(&str, &str)] = &[
     ("New version available", "Доступно обновление"),
     ("Download", "Скачать"),
     ("Download and install", "Скачать и установить"),
+    ("Update downloaded", "Обновление скачано"),
+    ("Ready to install", "Можно устанавливать"),
+    (
+        "Allow installs from Horizon in Android settings, then tap Retry installation.",
+        "Разрешите установку из Horizon в настройках Android и нажмите «Повторить установку».",
+    ),
     (
         "Tap to download and install",
         "Нажмите, чтобы скачать и установить",

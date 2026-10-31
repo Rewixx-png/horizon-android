@@ -543,7 +543,7 @@ impl Opt {
             _ => None,
         };
         if let Some(value) = touch_value {
-            return Text::literal(format!("{c}: {value}"));
+            return Text::literal(format!("{}: {}", lang::get(c), lang::get(&value)));
         }
         match self {
             Opt::ChatDelay => tr("options.chat.delay_none"),

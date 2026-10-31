@@ -79,12 +79,18 @@ impl Game<'_> {
                     now.elapsed().as_millis()
                 );
                 if reload {
-                    self.system_message(Text::literal(format!("Shader pack {} reloaded", m.name)));
+                    self.system_message(Text::translate(
+                        "horizon.shaders.reloaded",
+                        &[Text::literal(m.name)],
+                    ));
                 }
             }
             Err(problems) => {
                 log::warn!("shader pack {name} refused: {}", problems.join("; "));
-                self.system_message(Text::colored(format!("Shader pack {name} refused:"), RED));
+                self.system_message(
+                    Text::translate("horizon.shaders.refused", &[Text::literal(name)])
+                        .with_color(RED),
+                );
                 for p in problems {
                     self.system_message(Text::colored(p, RED));
                 }

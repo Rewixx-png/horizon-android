@@ -236,5 +236,7 @@
   "horizon.command.pregen.done": "Готово. ",
   "horizon.command.extra.not_profiling": "Профилирование не идёт",
   "horizon.test_instances.export_disabled": "Экспорт тестовых структур отключён",
-  "test_instance_block.invalid_test": "Недопустимый тест"
+  "test_instance_block.invalid_test": "Недопустимый тест",
+  "horizon.shaders.reloaded": "Шейдерпак %s перезагружен",
+  "horizon.shaders.refused": "Шейдерпак %s отклонён:"
 }

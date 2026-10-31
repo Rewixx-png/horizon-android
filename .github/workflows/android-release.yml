@@ -53,8 +53,14 @@ jobs:
 
       - name: Install Android SDK, build tools and NDK
         run: |
-          yes | sdkmanager --licenses >/dev/null
-          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;28.2.13676358"
+          sdk="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          manager="$sdk/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$manager" ]; then
+            manager="$(command -v sdkmanager)"
+          fi
+          yes | "$manager" --licenses >/dev/null
+          "$manager" --sdk_root="$sdk" "platforms;android-35" "build-tools;35.0.0" "ndk;28.2.13676358"
+          echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
 
       - name: Install the pinned Rust toolchain and Android target
         run: |

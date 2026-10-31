@@ -216,8 +216,8 @@ impl Login {
         let message_lines = if compact { 2 } else { 5 };
         let message_size = if compact { 13.0 } else { 14.0 };
         let message_line = if compact { 18.0 } else { 20.0 };
-        let offline_label_y = if compact { y + 150.0 } else { y + h - 247.0 };
-        let offline_field_y = if compact { y + 168.0 } else { y + h - 226.0 };
+        let offline_label_y = if compact { y + 150.0 } else { y + h - 259.0 };
+        let offline_field_y = if compact { y + 168.0 } else { y + h - 238.0 };
         let primary_y = if compact {
             y + h - 104.0
         } else {

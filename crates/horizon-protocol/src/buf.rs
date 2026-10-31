@@ -20,6 +20,11 @@ impl<'a> Reader<'a> {
     pub fn remaining(&self) -> usize {
         self.data.len() - self.pos
     }
+    /// The bytes not read yet, without advancing. Version-specific parsers
+    /// hand this to a nested decoder and advance by the bytes it reports.
+    pub fn remaining_slice(&self) -> &'a [u8] {
+        &self.data[self.pos..]
+    }
     pub fn position(&self) -> usize {
         self.pos
     }

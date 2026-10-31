@@ -12,6 +12,8 @@ use crate::{
     connection::Connection,
 };
 use serde_json::Value;
+use std::collections::HashMap;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 pub const PROTOCOL_VERSION: i32 = 754;
@@ -36,6 +38,8 @@ pub const LOGIN_START: i32 = 0x00;
 pub const LOGIN_PLUGIN_RESPONSE: i32 = 0x02;
 /// Play/packet ids used by this slice. 1.16.5 does not have the 26.3
 /// packet set; these ids come from the 1.16 protocol family.
+pub const PLAY_JOIN_GAME: i32 = 0x24;
+pub const PLAY_CHUNK_DATA: i32 = 0x20;
 pub const PLAY_KEEP_ALIVE: i32 = 0x1F;
 pub const PLAY_KEEP_ALIVE_RESPONSE: i32 = 0x10;
 pub const PLAY_DISCONNECT: i32 = 0x19;
@@ -73,6 +77,20 @@ fn read_string(payload: &[u8], max: usize) -> Result<(String, &[u8])> {
     let mut reader = Reader::new(payload);
     let value = reader.string(max)?;
     Ok((value, reader.rest()))
+}
+
+/// 1.16.5 packets carry named NBT (type, name, payload), unlike the unnamed
+/// network NBT of 26.3. Reading it with the modern helper would stop at the
+/// first EMPTY name, so this slice has its own cursor advance.
+fn read_nbt(reader: &mut Reader<'_>) -> Result<horizon_world::nbt::Tag> {
+    let limits = horizon_world::nbt::Limits {
+        max_bytes: 2_097_152,
+        ..horizon_world::nbt::Limits::default()
+    };
+    let (named, used) = horizon_world::nbt::read_named(reader.remaining_slice(), limits)
+        .map_err(|error| Error::new(format!("1.16.5 NBT: {error}")))?;
+    reader.bytes(used)?;
+    Ok(named.tag)
 }
 
 fn connect(host: &str, port: u16, timeout: Duration) -> Result<Connection> {
@@ -145,6 +163,362 @@ pub fn status(host: &str, port: u16, timeout: Duration) -> Result<Status> {
         return Err(Error::new("1.16.5 status: invalid pong"));
     }
     Ok(status)
+}
+
+/// The clientbound Join Game packet, reduced to the fields the first world
+/// slice needs. The dimension codec and dimension NBT are kept as parsed tags
+/// for the later registry and dimension work.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JoinGame {
+    pub entity_id: i32,
+    pub hardcore: bool,
+    pub game_mode: u8,
+    pub previous_game_mode: u8,
+    pub world_names: Vec<String>,
+    pub dimension_codec: horizon_world::nbt::Tag,
+    pub dimension: horizon_world::nbt::Tag,
+    pub world_name: String,
+    pub hashed_seed: i64,
+    pub max_players: i32,
+    pub view_distance: i32,
+    pub reduced_debug_info: bool,
+    pub enable_respawn_screen: bool,
+    pub debug: bool,
+    pub flat: bool,
+}
+
+pub fn parse_join_game(payload: &[u8]) -> Result<JoinGame> {
+    let mut reader = Reader::new(payload);
+    let entity_id = reader.i32()?;
+    let hardcore = reader.bool()?;
+    let game_mode = reader.u8()?;
+    let previous_game_mode = reader.u8()?;
+    let count = reader.count(128)?;
+    let mut world_names = Vec::with_capacity(count);
+    for _ in 0..count {
+        world_names.push(reader.string(32_767)?);
+    }
+    let dimension_codec = read_nbt(&mut reader)?;
+    let dimension = read_nbt(&mut reader)?;
+    let world_name = reader.string(32_767)?;
+    let hashed_seed = reader.i64()?;
+    let max_players = reader.varint()?;
+    let view_distance = reader.varint()?;
+    let join = JoinGame {
+        entity_id,
+        hardcore,
+        game_mode,
+        previous_game_mode,
+        world_names,
+        dimension_codec,
+        dimension,
+        world_name,
+        hashed_seed,
+        max_players,
+        view_distance,
+        reduced_debug_info: reader.bool()?,
+        enable_respawn_screen: reader.bool()?,
+        debug: reader.bool()?,
+        flat: reader.bool()?,
+    };
+    if reader.remaining() != 0 {
+        return Err(Error::new(format!(
+            "1.16.5 Join Game has {} trailing bytes",
+            reader.remaining()
+        )));
+    }
+    Ok(join)
+}
+
+/// One 16×16×16 chunk section after the network palette is decoded. State ids
+/// are the 1.16.5 global block-state ids from `tables.json`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChunkSection {
+    pub block_count: u16,
+    pub bits: u8,
+    pub palette: Vec<i32>,
+    pub data: Vec<i64>,
+}
+
+/// The clientbound Chunk Data packet. `sections` keeps each present section
+/// with its index (0 is the bottom 16 blocks, 15 the top in 1.16.5).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChunkData {
+    pub x: i32,
+    pub z: i32,
+    pub full: bool,
+    pub bitmask: u32,
+    pub heightmaps: horizon_world::nbt::Tag,
+    pub biomes: Vec<i32>,
+    pub sections: Vec<(usize, ChunkSection)>,
+    pub block_entities: Vec<horizon_world::nbt::Tag>,
+}
+
+pub fn parse_chunk_data(payload: &[u8]) -> Result<ChunkData> {
+    let mut reader = Reader::new(payload);
+    let x = reader.i32()?;
+    let z = reader.i32()?;
+    let full = reader.bool()?;
+    let bitmask = u32::try_from(reader.varint()?)
+        .map_err(|_| Error::new("1.16.5 Chunk Data has a negative section mask"))?;
+    if bitmask & !0xffff != 0 {
+        return Err(Error::new(
+            "1.16.5 Chunk Data section mask exceeds 16 sections",
+        ));
+    }
+    let heightmaps = read_nbt(&mut reader)?;
+    let mut biomes = Vec::new();
+    if full {
+        let count = reader.count(65_536)?;
+        biomes.reserve(count);
+        for _ in 0..count {
+            biomes.push(reader.varint()?);
+        }
+    }
+    let data = reader.byte_array(16 * 1024 * 1024)?;
+    let mut data = Reader::new(&data);
+    let mut sections = Vec::new();
+    for index in 0..16 {
+        if bitmask & (1 << index) == 0 {
+            continue;
+        }
+        let block_count = data.u16()?;
+        let bits = data.u8()?;
+        if bits > 15 {
+            return Err(Error::new(format!(
+                "1.16.5 chunk section {index} has {bits} bits per block"
+            )));
+        }
+        let mut palette = Vec::new();
+        if bits <= 8 {
+            let count = data.count(256)?;
+            palette.reserve(count);
+            for _ in 0..count {
+                palette.push(data.varint()?);
+            }
+        }
+        let long_count = data.count(16 * 1024 * 1024)?;
+        let expected = if bits == 0 {
+            0
+        } else {
+            (4096usize * usize::from(bits)).div_ceil(64)
+        };
+        if long_count != expected {
+            return Err(Error::new(format!(
+                "1.16.5 chunk section {index}: {long_count} longs, expected {expected}"
+            )));
+        }
+        let mut longs = Vec::with_capacity(long_count);
+        for _ in 0..long_count {
+            longs.push(data.i64()?);
+        }
+        sections.push((
+            index,
+            ChunkSection {
+                block_count,
+                bits,
+                palette,
+                data: longs,
+            },
+        ));
+    }
+    if data.remaining() != 0 {
+        return Err(Error::new(format!(
+            "1.16.5 Chunk Data has {} trailing section bytes",
+            data.remaining()
+        )));
+    }
+    let count = reader.count(1_048_576)?;
+    let mut block_entities = Vec::with_capacity(count);
+    for _ in 0..count {
+        block_entities.push(read_nbt(&mut reader)?);
+    }
+    if reader.remaining() != 0 {
+        return Err(Error::new(format!(
+            "1.16.5 Chunk Data has {} trailing bytes after block entities",
+            reader.remaining()
+        )));
+    }
+    Ok(ChunkData {
+        x,
+        z,
+        full,
+        bitmask,
+        heightmaps,
+        biomes,
+        sections,
+        block_entities,
+    })
+}
+
+impl ChunkSection {
+    /// The 1.16.5 global block-state id at section-local `x/y/z` (0..15).
+    /// Paletted storage packs (y, z, x) in that order, least significant
+    /// bits first; sections above the palette threshold hold raw state ids.
+    pub fn block_state(&self, x: u8, y: u8, z: u8) -> Result<i32> {
+        if x > 15 || y > 15 || z > 15 {
+            return Err(Error::new("chunk section coordinates must be 0..15"));
+        }
+        if self.bits == 0 {
+            return Ok(self.palette.first().copied().unwrap_or(0));
+        }
+        let index = usize::from(y) * 256 + usize::from(z) * 16 + usize::from(x);
+        let per_long = 64 / usize::from(self.bits);
+        let long = *self
+            .data
+            .get(index / per_long)
+            .ok_or_else(|| Error::new("chunk section data is too short"))?;
+        let shift = (index % per_long) * usize::from(self.bits);
+        let mask = (1u64 << self.bits) - 1;
+        let value = ((long as u64 >> shift) & mask) as usize;
+        if self.bits <= 8 {
+            self.palette
+                .get(value)
+                .copied()
+                .ok_or_else(|| Error::new(format!("chunk palette index {value} is out of range")))
+        } else {
+            Ok(value as i32)
+        }
+    }
+}
+
+impl ChunkData {
+    /// A block-state id at world-section coordinates; absent sections are air.
+    pub fn block_state(&self, x: i32, y: i32, z: i32) -> Result<i32> {
+        if !(0..256).contains(&y) {
+            return Ok(0);
+        }
+        let lx = x.rem_euclid(16) as u8;
+        let ly = (y & 15) as u8;
+        let lz = z.rem_euclid(16) as u8;
+        let index = (y >> 4) as usize;
+        match self.sections.iter().find(|(section, _)| *section == index) {
+            Some((_, section)) => section.block_state(lx, ly, lz),
+            None => Ok(0),
+        }
+    }
+
+    /// The biome id at a block position. 1.16.5 sends 4×4×4 biome cells:
+    /// index = (y >> 2) * 16 + (z >> 2) * 4 + (x >> 2).
+    pub fn biome(&self, x: i32, y: i32, z: i32) -> Option<i32> {
+        if !(0..256).contains(&y) {
+            return None;
+        }
+        let index = ((y >> 2) as usize) * 16
+            + ((z.rem_euclid(16) >> 2) as usize) * 4
+            + ((x.rem_euclid(16) >> 2) as usize);
+        self.biomes.get(index).copied()
+    }
+}
+
+/// The M0 block table, indexed by 1.16.5 global block-state id.
+pub struct Tables {
+    blocks: Vec<String>,
+}
+
+impl Tables {
+    /// Load the private `tables.json` produced by `tools/prepare_1165.py`.
+    pub fn load(path: &Path) -> Result<Self> {
+        let bytes = std::fs::read(path)
+            .map_err(|error| Error::new(format!("{}: {error}", path.display())))?;
+        let json: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| Error::new(format!("{}: {error}", path.display())))?;
+        if json.get("version").and_then(Value::as_str) != Some(GAME_VERSION) {
+            return Err(Error::new("block table is not for Minecraft 1.16.5"));
+        }
+        let entries = json
+            .get("blocks")
+            .and_then(|blocks| blocks.get("entries"))
+            .and_then(Value::as_object)
+            .ok_or_else(|| Error::new("block table has no blocks.entries"))?;
+        let mut blocks: Vec<String> = Vec::new();
+        for (name, block) in entries {
+            let states = block
+                .get("states")
+                .and_then(Value::as_array)
+                .ok_or_else(|| Error::new(format!("block {name} has no states")))?;
+            for state in states {
+                let id = state
+                    .get("id")
+                    .and_then(Value::as_i64)
+                    .and_then(|id| usize::try_from(id).ok())
+                    .ok_or_else(|| Error::new(format!("block {name} has an invalid state id")))?;
+                if id > 10_000_000 {
+                    return Err(Error::new("block state id is unreasonably large"));
+                }
+                if blocks.len() <= id {
+                    blocks.resize(id + 1, String::new());
+                }
+                if !blocks[id].is_empty() {
+                    return Err(Error::new(format!("duplicate block state id {id}")));
+                }
+                blocks[id] = name.clone();
+            }
+        }
+        if blocks.is_empty() {
+            return Err(Error::new("block table is empty"));
+        }
+        Ok(Self { blocks })
+    }
+
+    /// The namespaced block name for a 1.16.5 global state id.
+    pub fn block(&self, state: i32) -> Option<&str> {
+        usize::try_from(state)
+            .ok()
+            .and_then(|state| self.blocks.get(state))
+            .map(String::as_str)
+            .filter(|name| !name.is_empty())
+    }
+
+    /// Number of state ids the table can resolve.
+    pub fn state_count(&self) -> usize {
+        self.blocks.len()
+    }
+}
+
+/// A loaded set of 1.16.5 chunk columns, keyed by their chunk coordinates.
+pub struct World {
+    tables: Tables,
+    chunks: HashMap<(i32, i32), ChunkData>,
+}
+
+impl World {
+    pub fn new(tables: Tables) -> Self {
+        Self {
+            tables,
+            chunks: HashMap::new(),
+        }
+    }
+
+    pub fn load(path: &Path) -> Result<Self> {
+        Ok(Self::new(Tables::load(path)?))
+    }
+
+    pub fn apply_chunk(&mut self, chunk: ChunkData) {
+        self.chunks.insert((chunk.x, chunk.z), chunk);
+    }
+
+    pub fn chunk(&self, x: i32, z: i32) -> Option<&ChunkData> {
+        self.chunks.get(&(x, z))
+    }
+
+    /// The block name at a world position, or `None` when the chunk is not
+    /// loaded. Missing sections inside a loaded 1.16.5 chunk are air.
+    pub fn block(&self, x: i32, y: i32, z: i32) -> Option<&str> {
+        if !(0..256).contains(&y) {
+            return None;
+        }
+        let state = self.chunk(x >> 4, z >> 4)?.block_state(x, y, z).ok()?;
+        self.tables.block(state)
+    }
+
+    pub fn biome(&self, x: i32, y: i32, z: i32) -> Option<i32> {
+        self.chunk(x >> 4, z >> 4)?.biome(x, y, z)
+    }
+
+    pub fn tables(&self) -> &Tables {
+        &self.tables
+    }
 }
 
 /// The profile the server assigned to an offline login.
@@ -383,9 +757,178 @@ mod tests {
         assert_eq!(status.version_name.as_deref(), Some(GAME_VERSION));
         let mut client = login_offline(host, port, "HorizonBot", Duration::from_secs(5)).unwrap();
         assert_eq!(client.profile.name, "HorizonBot");
+        let mut join = None;
+        let mut chunk = None;
+        for _ in 0..1000 {
+            let (id, payload) = client.recv().unwrap();
+            match id {
+                PLAY_JOIN_GAME if join.is_none() => join = Some(parse_join_game(&payload).unwrap()),
+                PLAY_CHUNK_DATA if chunk.is_none() => {
+                    chunk = Some(parse_chunk_data(&payload).unwrap())
+                }
+                PLAY_DISCONNECT => panic!("server disconnected before the first chunk"),
+                _ => {}
+            }
+            if join.is_some() && chunk.is_some() {
+                break;
+            }
+        }
+        let join = join.expect("no Join Game");
+        let chunk = chunk.expect("no Chunk Data");
+        assert!(
+            join.world_names
+                .iter()
+                .any(|name| name == "minecraft:overworld"),
+            "missing overworld in {:?}",
+            join.world_names
+        );
+        assert!(chunk.full, "first chunk was not ground-up");
+        assert!(!chunk.sections.is_empty(), "first chunk had no sections");
+        assert_eq!(chunk.biomes.len(), 1024);
+        if let Ok(path) = std::env::var("HORIZON_1165_TABLES") {
+            let mut world = World::load(Path::new(&path)).unwrap();
+            world.apply_chunk(chunk.clone());
+            let name = world
+                .block(chunk.x * 16, 64, chunk.z * 16)
+                .expect("the first chunk must resolve through the M0 tables");
+            eprintln!("first chunk block at (x*16, 64, z*16): {name}");
+        }
         let held = client.hold(Duration::from_secs(17)).unwrap();
         assert!(held.received > 0, "no play packets");
         assert!(held.keep_alives > 0, "no keep-alive answered");
+    }
+
+    #[test]
+    fn chunk_data_sections_biomes_and_block_entities_are_decoded() {
+        let heightmaps = horizon_world::nbt::write_named(
+            &horizon_world::nbt::NamedTag {
+                name: "".into(),
+                tag: horizon_world::nbt::Tag::Compound(Default::default()),
+            },
+            horizon_world::nbt::Limits::default(),
+        )
+        .unwrap();
+        let mut section = Writer::new();
+        section.u16(1); // one solid block
+        section.u8(4);
+        section.varint(1);
+        section.varint(0);
+        section.varint(256);
+        for _ in 0..256 {
+            section.i64(0);
+        }
+        let mut packet = Writer::new();
+        packet.i32(2);
+        packet.i32(-3);
+        packet.bool(true);
+        packet.varint(1);
+        packet.bytes(&heightmaps);
+        packet.varint(1024);
+        for _ in 0..1024 {
+            packet.varint(1);
+        }
+        packet.byte_array(&section.data);
+        packet.varint(0);
+        let chunk = parse_chunk_data(&packet.data).unwrap();
+        assert_eq!((chunk.x, chunk.z), (2, -3));
+        assert!(chunk.full);
+        assert_eq!(chunk.bitmask, 1);
+        assert_eq!(chunk.biomes.len(), 1024);
+        assert_eq!(chunk.sections.len(), 1);
+        let (index, section) = &chunk.sections[0];
+        assert_eq!(*index, 0);
+        assert_eq!(section.block_count, 1);
+        assert_eq!(section.bits, 4);
+        assert_eq!(section.palette, [0]);
+        assert_eq!(section.data.len(), 256);
+        assert!(chunk.block_entities.is_empty());
+    }
+
+    #[test]
+    fn packed_palette_and_biome_lookups_follow_1_16_5_order() {
+        let mut data = vec![0i64; 256];
+        let index = 2 * 256 + 3 * 16 + 1; // y=2, z=3, x=1
+        data[index / 16] = 1i64 << ((index % 16) * 4);
+        let section = ChunkSection {
+            block_count: 1,
+            bits: 4,
+            palette: vec![0, 5],
+            data,
+        };
+        assert_eq!(section.block_state(1, 2, 3).unwrap(), 5);
+        assert_eq!(section.block_state(0, 0, 0).unwrap(), 0);
+        assert!(section.block_state(16, 0, 0).is_err());
+        let chunk = ChunkData {
+            x: 0,
+            z: 0,
+            full: true,
+            bitmask: 1,
+            heightmaps: horizon_world::nbt::Tag::Compound(Default::default()),
+            biomes: (0..1024).collect(),
+            sections: vec![(0, section)],
+            block_entities: vec![],
+        };
+        assert_eq!(chunk.block_state(1, 2, 3).unwrap(), 5);
+        assert_eq!(chunk.block_state(1, 32, 3).unwrap(), 0);
+        assert_eq!(chunk.biome(4, 8, 4), Some(2 * 16 + 1 * 4 + 1));
+        assert_eq!(chunk.biome(0, 256, 0), None);
+    }
+
+    #[test]
+    fn world_resolves_palette_ids_through_the_m0_tables() {
+        let tables = serde_json::json!({
+            "version": "1.16.5",
+            "blocks": {"entries": {
+                "minecraft:air": {"states": [{"id": 0, "default": true}]},
+                "minecraft:stone": {"states": [{"id": 5, "default": true}]},
+            }},
+        });
+        let mut section = Writer::new();
+        section.u16(1);
+        section.u8(4);
+        section.varint(2);
+        section.varint(0);
+        section.varint(5);
+        section.varint(256);
+        for i in 0..256 {
+            section.i64(if i == (2 * 256 + 3 * 16 + 1) / 16 {
+                1i64 << (((2 * 256 + 3 * 16 + 1) % 16) * 4)
+            } else {
+                0
+            });
+        }
+        let heightmaps = horizon_world::nbt::write_named(
+            &horizon_world::nbt::NamedTag {
+                name: "".into(),
+                tag: horizon_world::nbt::Tag::Compound(Default::default()),
+            },
+            horizon_world::nbt::Limits::default(),
+        )
+        .unwrap();
+        let mut packet = Writer::new();
+        packet.i32(0);
+        packet.i32(0);
+        packet.bool(true);
+        packet.varint(1);
+        packet.bytes(&heightmaps);
+        packet.varint(1024);
+        for _ in 0..1024 {
+            packet.varint(1);
+        }
+        packet.byte_array(&section.data);
+        packet.varint(0);
+        let chunk = parse_chunk_data(&packet.data).unwrap();
+        let tables_path =
+            std::env::temp_dir().join(format!("horizon-1165-tables-{}.json", std::process::id()));
+        std::fs::write(&tables_path, serde_json::to_vec(&tables).unwrap()).unwrap();
+        let mut world = World::load(&tables_path).unwrap();
+        std::fs::remove_file(&tables_path).unwrap();
+        world.apply_chunk(chunk);
+        assert_eq!(world.block(1, 2, 3), Some("minecraft:stone"));
+        assert_eq!(world.block(0, 0, 0), Some("minecraft:air"));
+        assert_eq!(world.block(1, 32, 3), Some("minecraft:air"));
+        assert_eq!(world.block(16, 2, 3), None);
+        assert_eq!(world.biome(1, 2, 3), Some(1));
     }
 
     #[test]

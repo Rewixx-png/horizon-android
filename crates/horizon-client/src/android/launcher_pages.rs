@@ -374,17 +374,34 @@ impl Launcher {
                 color::SECONDARY_CONTAINER,
             );
         }
-        let tune = if settings {
+        let cog = if settings {
             color::PRIMARY
         } else {
             color::ON_SURFACE_VARIANT
         };
-        let tune_x = settings_x + 12.0;
-        for (i, knob) in [6.0, -3.0, 4.0].into_iter().enumerate() {
-            let y = settings_y + 14.0 + i as f32 * 6.0;
-            ui.rounded(tune_x, y, 16.0, 2.0, 1.0, tune);
-            ui.rounded(tune_x + 8.0 + knob, y - 3.0, 4.0, 8.0, 2.0, tune);
+        let cx = settings_x + 20.0;
+        let cy = settings_y + 20.0;
+        // Eight cog teeth around a ring; the centre hole uses the app-bar or
+        // selected-container colour so the icon reads as a settings gear.
+        for (dx, dy) in [
+            (0.0, -11.0),
+            (0.0, 7.0),
+            (-11.0, 0.0),
+            (7.0, 0.0),
+            (-8.0, -8.0),
+            (5.0, -8.0),
+            (-8.0, 5.0),
+            (5.0, 5.0),
+        ] {
+            ui.rounded(cx + dx - 2.0, cy + dy - 2.0, 4.0, 4.0, 1.0, cog);
         }
+        ui.rounded(cx - 9.0, cy - 9.0, 18.0, 18.0, 9.0, cog);
+        let hole = if settings {
+            color::SECONDARY_CONTAINER
+        } else {
+            color::BG
+        };
+        ui.rounded(cx - 3.0, cy - 3.0, 6.0, 6.0, 3.0, hole);
         targets.push((
             [settings_x - 4.0, settings_y - 4.0, 48.0, 48.0],
             Action::Page(Page::Settings),

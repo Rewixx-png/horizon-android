@@ -1,5 +1,6 @@
 //! Mobile launcher state. Browser operations reuse the desktop backend unchanged.
 use crate::browser::{self, Kind, Project, Query, Source, installed::Installed};
+use horizon_client::{launcher_i18n::tr as translate, tr};
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
@@ -40,6 +41,7 @@ pub struct Config {
     pub proxy: Option<String>,
     pub name: String,
     pub server: String,
+    pub language: horizon_client::launcher_i18n::Language,
     #[serde(skip)]
     pub microsoft_client_id: String,
     pub renderer: RendererMode,
@@ -314,7 +316,7 @@ impl Catalog {
                         && item.file == format!("{}.hmod", project.id)
                 }))
         {
-            return Some("Installed".into());
+            return Some(translate(self.config.language, "Installed").into());
         }
         None
     }
@@ -324,9 +326,9 @@ impl Catalog {
             .as_ref()
             .is_some_and(|(source, id)| *source == project.source && *id == project.id)
         {
-            "Retry"
+            translate(self.config.language, "Retry")
         } else {
-            "Install"
+            translate(self.config.language, "Install")
         }
     }
     fn job(&mut self, status: &str, job: impl FnOnce() -> Result<Reply, String> + Send + 'static) {
@@ -400,7 +402,11 @@ impl Catalog {
                 self.import_native(home);
             } else {
                 self.results.clear();
-                self.status = "Press Import .hmod to download this HTTPS link".into();
+                self.status = translate(
+                    self.config.language,
+                    "Press Import .hmod to download this HTTPS link",
+                )
+                .into();
             }
             return;
         }
@@ -416,35 +422,45 @@ impl Catalog {
             self.show_results(items);
         } else {
             self.results.clear();
-            self.status = "Searching... You can switch tabs while results load.".into();
+            self.status = translate(
+                self.config.language,
+                "Searching... You can switch tabs while results load.",
+            )
+            .into();
         }
         self.start_search();
     }
     fn show_results(&mut self, items: Vec<Project>) {
+        let language = self.config.language;
         self.status = if self.page == Page::Shaders
             && items.is_empty()
             && self.config.shader_source == crate::shader_catalog::Origin::Horizon
         {
-            "No Horizon shader packs match this search. Try another query or import a .hshader."
-                .into()
+            translate(
+                language,
+                "No Horizon shader packs match this search. Try another query or import a .hshader.",
+            )
+            .to_owned()
         } else if self.page == Page::Mods
             && self.config.mod_source == crate::shader_catalog::Origin::Modrinth
         {
-            format!(
-                "{} Java mods - browsing only; this Rust client cannot run Java loaders",
-                items.len()
+            tr!(
+                language,
+                "{count} Java mods - browsing only; this Rust client cannot run Java loaders",
+                { count = items.len() }
             )
         } else if self.page == Page::Mods {
             let native = items.iter().filter(|p| source_only_mod(p)).count();
-            format!(
-                "{} .hmod / {} source-only .hnmod (not supported yet)",
-                items.len() - native,
-                native
+            tr!(
+                language,
+                "{hmod} .hmod / {hnmod} source-only .hnmod (not supported yet)",
+                { hmod = items.len() - native, hnmod = native }
             )
         } else {
-            format!(
-                "{} results - select Install to check compatibility",
-                items.len()
+            tr!(
+                language,
+                "{count} results - select Install to check compatibility",
+                { count = items.len() }
             )
         };
         self.results = items;
@@ -484,7 +500,10 @@ impl Catalog {
     pub fn import_native(&mut self, home: &Path) {
         let url = self.query.trim().to_owned();
         let game = self.config.game_home(home);
-        self.job("Downloading sandboxed .hmod over HTTPS...",move||{
+        let language = self.config.language;
+        self.job(
+            translate(language, "Downloading sandboxed .hmod over HTTPS..."),
+            move || {
             use std::io::Read;
             let mut bytes=Vec::new();
             ureq::AgentBuilder::new().https_only(true).timeout_connect(std::time::Duration::from_secs(20)).timeout_read(std::time::Duration::from_secs(90)).build().get(&url).call().map_err(|e|e.to_string())?.into_reader().take(32*1024*1024+1).read_to_end(&mut bytes).map_err(|e|e.to_string())?;
@@ -496,7 +515,14 @@ impl Catalog {
                 let destination=dir.join(format!("{}.hmod",package.manifest.id));
                 if destination.exists(){std::fs::copy(&destination,destination.with_extension("hmod.previous")).map_err(|e|e.to_string())?;}
                 std::fs::rename(&stage,destination).map_err(|e|e.to_string())?;
-                Ok(Reply::Done(format!("Installed {}. Enable it in Installed after reviewing its capabilities in game Mods.",package.manifest.name), horizon_client::content_files::Kind::Mods))
+                Ok(Reply::Done(
+                    tr!(
+                        language,
+                        "Installed {name}. Enable it in Installed after reviewing its capabilities in game Mods.",
+                        { name = package.manifest.name }
+                    ),
+                    horizon_client::content_files::Kind::Mods,
+                ))
             })();
             let _=std::fs::remove_file(stage);result
         });
@@ -506,7 +532,11 @@ impl Catalog {
             return;
         };
         if source_only_mod(&project) {
-            self.status = "This .hnmod needs a separately compiled client. Android support is planned; sandboxed .hmod mods can be installed now.".into();
+            self.status = translate(
+                self.config.language,
+                "This .hnmod needs a separately compiled client. Android support is planned; sandboxed .hmod mods can be installed now.",
+            )
+            .into();
             return;
         }
         if self.busy() || self.download_label(&project).is_some() {
@@ -529,11 +559,12 @@ impl Catalog {
         self.failed = None;
         *self.progress.lock().unwrap_or_else(|e| e.into_inner()) = 0.0;
         let progress = self.progress.clone();
+        let language = self.config.language;
         let status =
             if project.kind == Kind::Shader && project.source == browser::SourceId::Modrinth {
-                "Downloading experimental shader ZIP..."
+                translate(language, "Downloading experimental shader ZIP...")
             } else {
-                "Checking compatibility and downloading..."
+                translate(language, "Checking compatibility and downloading...")
             };
         self.job(status, move || {
             std::fs::create_dir_all(&game).map_err(|e| e.to_string())?;
@@ -555,7 +586,11 @@ impl Catalog {
                 .len()
             };
             Ok(Reply::Done(
-                format!("Installed {count} item(s). Open Play to load this profile."),
+                tr!(
+                    language,
+                    "Installed {count} item(s). Open Play to load this profile.",
+                    { count = count }
+                ),
                 match project.kind {
                     Kind::Mod => horizon_client::content_files::Kind::Mods,
                     Kind::Shader => horizon_client::content_files::Kind::Shaders,
@@ -574,7 +609,11 @@ impl Catalog {
         match item.kind {
             horizon_client::content_files::Kind::Mods => {
                 if !cfg!(target_pointer_width = "64") {
-                    self.status = "Sandboxed code mods require a 64-bit APK".into();
+                    self.status = translate(
+                        self.config.language,
+                        "Sandboxed code mods require a 64-bit APK",
+                    )
+                    .into();
                     return;
                 }
                 let mut on = horizon_client::mod_list::ModList::load(&game);
@@ -605,7 +644,11 @@ impl Catalog {
                 settings.save(&path);
             }
         }
-        self.status = "Selection saved for the next game launch".into();
+        self.status = translate(
+            self.config.language,
+            "Selection saved for the next game launch",
+        )
+        .into();
         self.refresh(home);
     }
     pub fn remove_local(&mut self, home: &Path) {
@@ -659,8 +702,9 @@ impl Catalog {
             }
             Ok(())
         })();
+        let language = self.config.language;
         self.status = match result {
-            Ok(()) => format!("Removed {}", item.title),
+            Ok(()) => tr!(language, "Removed {name}", { name = item.title }),
             Err(e) => e,
         };
         self.refresh(home);

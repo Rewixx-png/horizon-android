@@ -77,6 +77,7 @@ pub mod item_sync;
 pub mod item_tooltip;
 pub mod lan;
 pub mod landing;
+pub mod launcher_i18n;
 pub mod locator_bar;
 pub mod menu;
 pub mod merchant;

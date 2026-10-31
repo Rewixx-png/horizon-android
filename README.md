@@ -13,6 +13,8 @@ Rust engine for Minecraft Java 26.3. Unofficial and in active development.
 - Four touch schemes: joystick or D-pad, each with tap or crosshair aiming.
 - Editable button positions, sizes and opacity; handedness, circle size, optional
   360-degree movement, Auto Sprint and Sprint-button visibility.
+- English and Russian launcher UI from **Settings > Language**; the game keeps
+  its own Options > Language setting.
 - Java multiplayer, including the Hypixel Arcade lobby shown below.
 - Native launcher, verified resource downloads, resource packs and `.hmod` import.
 - Vulkan rendering modes and resolution scaling; Android keyboard, clipboard,

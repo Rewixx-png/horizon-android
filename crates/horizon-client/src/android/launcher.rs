@@ -17,11 +17,14 @@ use horizon_client::{
     Result,
     gfx::Renderer,
     hud::{HudAtlas, HudBatch},
+    launcher_i18n::tr as translate,
+    tr,
     ui_theme::{Face, Ui},
 };
+use parking_lot::Mutex;
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
 use winit::{
@@ -250,7 +253,11 @@ impl Launcher {
                 let id = self.catalog.config.microsoft_client_id.clone();
                 let (sender, receiver) = mpsc::channel();
                 self.session_worker = Some(receiver);
-                self.catalog.status = "Preparing Microsoft session...".into();
+                self.catalog.status = translate(
+                    self.catalog.config.language,
+                    "Preparing Microsoft session...",
+                )
+                .to_owned();
                 std::thread::spawn(move || {
                     let result = (|| {
                         login::Login::session(&id)?
@@ -306,12 +313,14 @@ impl Launcher {
             self.game.as_mut().unwrap().resumed(events);
         } else {
             if !self.home.join("engine-data.zip").is_file() {
-                return Err(
-                    "This APK is missing its engine data. Install a complete build.".into(),
-                );
+                return Err(translate(
+                    self.catalog.config.language,
+                    "This APK is missing its engine data. Install a complete build.",
+                )
+                .into());
             }
             self.error = None;
-            *self.install.lock().unwrap() = Default::default();
+            *self.install.lock() = Default::default();
             let home = self.home.clone();
             let install = self.install.clone();
             let (sender, receiver) = mpsc::channel();
@@ -319,7 +328,7 @@ impl Launcher {
             std::thread::spawn(move || {
                 let result =
                     horizon_client::official_install::install_with_progress(&home, |update| {
-                        let mut current = install.lock().unwrap();
+                        let mut current = install.lock();
                         let done = if current.stage == update.stage {
                             current.done.max(update.done)
                         } else {
@@ -478,14 +487,19 @@ impl ApplicationHandler for Launcher {
             .and_then(|r| r.try_recv().ok())
         {
             self.diagnostic_export = None;
+            let language = self.catalog.config.language;
             self.catalog.status = match result {
                 Ok(name) => {
                     let _ = crate::platform::open_documents("reports");
-                    format!(
-                        "Saved {name} in Reports. Review the ZIP before sharing; nothing was uploaded."
+                    tr!(
+                        language,
+                        "Saved {name} in Reports. Review the ZIP before sharing; nothing was uploaded.",
+                        { name = name }
                     )
                 }
-                Err(error) => format!("Diagnostic export failed: {error}"),
+                Err(error) => tr!(language, "Diagnostic export failed: {error}", {
+                    error = error
+                }),
             };
         }
         crate::platform::poll_gamepad_connections();
@@ -521,8 +535,10 @@ impl ApplicationHandler for Launcher {
                 self.catalog.show_installed(notice.kind);
             }
         }
+        let language = self.catalog.config.language;
         for result in crate::gallery::poll() {
-            self.catalog.status = result.unwrap_or_else(|e| format!("File export failed: {e}"));
+            self.catalog.status = result
+                .unwrap_or_else(|e| tr!(language, "File export failed: {error}", { error = e }));
         }
         self.login.poll();
         if let Some(result) = self.session_worker.as_ref().and_then(|w| w.try_recv().ok()) {

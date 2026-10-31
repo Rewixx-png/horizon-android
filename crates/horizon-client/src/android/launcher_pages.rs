@@ -1,5 +1,10 @@
 use super::*;
-use horizon_client::{osk::Output, ui_theme::color};
+use horizon_client::{
+    launcher_i18n::{Language, tr as translate},
+    osk::Output,
+    tr,
+    ui_theme::color,
+};
 use winit::{
     event::{KeyEvent, Touch},
     keyboard::{KeyCode, PhysicalKey},
@@ -56,8 +61,17 @@ pub(super) enum Action {
     ChooseDisplayHz(u16),
     PerformanceHints,
     GpuProfile,
+    Language,
+    ChooseLanguage(Language),
 }
 
+/// The phone gutter from the design system: 16 dp, 32 dp on tablets.
+pub(super) fn gutter(width: f32) -> f32 {
+    if width < 700.0 { 16.0 } else { 32.0 }
+}
+
+/// An action control. Pills are the launcher's default shape; the text is
+/// centred and fitted, so a translated label never runs outside the target.
 pub(super) fn button(
     ui: &mut Ui,
     targets: &mut Vec<([f32; 4], Action)>,
@@ -67,28 +81,28 @@ pub(super) fn button(
     accent: bool,
 ) {
     let [x, y, w, h] = rect;
+    let radius = (h / 2.0).min(24.0);
     ui.rounded(
         x,
         y,
         w,
         h,
-        2.0,
+        radius,
         if accent { color::ACCENT } else { color::RAISED },
     );
-    let padding = (w * 0.12).clamp(4.0, 12.0);
-    let base = if w < 80.0 { 13.0 } else { 16.0 };
-    let font = if matches!(action, Action::Page(_)) {
-        (base * ((w - 2.0 * padding) / ui.measure(Face::Medium, base, label).max(1.0)).min(1.0))
-            .max(9.0)
-    } else {
-        base
-    };
-    let label = ui.fit_text(Face::Medium, font, label, w - 2.0 * padding);
+    let padding = 14.0_f32.min(w * 0.12);
+    let mut size = if h >= 48.0 { 16.0 } else { 15.0 };
+    let mut label = ui.fit_text(Face::Medium, size, label, w - 2.0 * padding);
+    while size > 11.0 && ui.measure(Face::Medium, size, &label) > w - 2.0 * padding {
+        size -= 1.0;
+        label = ui.fit_text(Face::Medium, size, &label, w - 2.0 * padding);
+    }
+    let text_w = ui.measure(Face::Medium, size, &label);
     ui.text(
         Face::Medium,
-        font,
-        x + padding,
-        y + 11.0,
+        size,
+        x + (w - text_w) / 2.0,
+        y + (h - size * 1.45) / 2.0,
         if accent {
             color::ON_ACCENT
         } else {
@@ -98,39 +112,105 @@ pub(super) fn button(
     );
     targets.push((rect, action));
 }
+
+/// A text field: left-aligned, sunk into a soft plate, with an accent focus
+/// ring instead of a permanent border.
+pub(super) fn field(
+    ui: &mut Ui,
+    targets: &mut Vec<([f32; 4], Action)>,
+    rect: [f32; 4],
+    text: &str,
+    action: Action,
+    focused: bool,
+) {
+    let [x, y, w, h] = rect;
+    ui.rounded(x, y, w, h, 8.0, color::RAISED);
+    if focused {
+        ui.border(x, y, w, h, 8.0, color::ACCENT);
+    }
+    let text = ui.fit_text(Face::Medium, 15.0, text, w - 24.0);
+    ui.text(
+        Face::Medium,
+        15.0,
+        x + 12.0,
+        y + (h - 15.0 * 1.45) / 2.0,
+        color::TEXT,
+        &text,
+    );
+    targets.push((rect, action));
+}
+
 fn toggle(
     ui: &mut Ui,
     targets: &mut Vec<([f32; 4], Action)>,
     rect: [f32; 4],
     on: bool,
     action: Action,
+    language: Language,
 ) {
     let [x, y, w, h] = rect;
+    if w >= 80.0 {
+        ui.text(
+            Face::Regular,
+            14.0,
+            x,
+            y + (h - 14.0 * 1.45) / 2.0,
+            color::MUTED,
+            translate(language, if on { "On" } else { "Off" }),
+        );
+    }
+    let track = 44.0_f32.min(w);
+    let knob = 18.0;
+    ui.rounded(
+        x + w - track,
+        y + (h - 24.0) / 2.0,
+        track,
+        24.0,
+        12.0,
+        if on { color::ACCENT } else { color::HOVER },
+    );
+    ui.rounded(
+        x + w - track + if on { track - knob - 3.0 } else { 3.0 },
+        y + (h - knob) / 2.0,
+        knob,
+        knob,
+        knob / 2.0,
+        if on { color::ON_ACCENT } else { color::TEXT },
+    );
+    targets.push((rect, action));
+}
+
+pub(super) fn rule(ui: &mut Ui, x: f32, y: f32, w: f32) {
+    ui.rounded(x, y, w, 1.0, 0.0, color::BORDER);
+}
+
+/// A page's display title and one-line description. Returns the content top.
+pub(super) fn page_header(ui: &mut Ui, title: &str, caption: &str, x: f32, y: f32, w: f32) -> f32 {
+    let size = if w < 420.0 { 24.0 } else { 28.0 };
+    let title = ui.fit_text(Face::Medium, size, title, w);
+    let mut title_size = size;
+    while title_size > 20.0 && ui.measure(Face::Medium, title_size, &title) > w {
+        title_size -= 1.0;
+    }
+    ui.text(Face::Medium, title_size, x, y, color::TEXT, &title);
+    let caption = ui.fit_text(Face::Regular, 14.0, caption, w);
     ui.text(
         Face::Regular,
         14.0,
         x,
-        y + 11.0,
-        color::TEXT,
-        if on { "On" } else { "Off" },
+        y + title_size * 1.45 + 2.0,
+        color::MUTED,
+        &caption,
     );
-    ui.rounded(
-        x + w - 52.0,
-        y + 8.0,
-        48.0,
-        24.0,
-        12.0,
-        if on { color::TEXT } else { color::HOVER },
-    );
-    ui.rounded(
-        x + w - if on { 26.0 } else { 50.0 },
-        y + 10.0,
-        20.0,
-        20.0,
-        10.0,
-        if on { color::BG } else { color::TEXT },
-    );
-    targets.push(([x, y, w, h], action));
+    y + title_size * 1.45 + 2.0 + 14.0 * 1.45 + 14.0
+}
+
+pub(super) fn progress_bar(ui: &mut Ui, x: f32, y: f32, w: f32, fraction: f32) {
+    ui.rounded(x, y, w, 4.0, 2.0, color::RAISED);
+    let fraction = fraction.clamp(0.0, 1.0);
+    if fraction > 0.0 {
+        ui.rounded(x, y, w * fraction, 4.0, 2.0, color::ACCENT);
+    }
 }
 impl Launcher {
     /// The same spatial focus algorithm as the game's controller menus.
@@ -223,161 +303,183 @@ impl Launcher {
         let scale = ui.density / ui.batch.scale;
         ui.batch
             .fill(&gui.atlas, 0.0, 0.0, w * scale, h * scale, color::BG);
+        let language = self.catalog.config.language;
+        let compact = w < 700.0;
+        let margin = gutter(w);
+        let content_w = w - 2.0 * margin;
+
+        // App bar: the wordmark names the app, the version is a quiet detail,
+        // and the account chip is the only control on the row.
         ui.text(
             Face::Medium,
-            if w < 400.0 {
-                20.0
-            } else if w < 700.0 {
-                24.0
-            } else {
-                32.0
-            },
-            32.0,
-            if w < 700.0 { 12.0 } else { 28.0 },
+            if compact { 20.0 } else { 22.0 },
+            margin,
+            12.0,
             color::TEXT,
-            &format!("Horizon Android {}", crate::backend::VERSION),
+            "Horizon",
         );
+        let brand_w = ui.measure(Face::Medium, if compact { 20.0 } else { 22.0 }, "Horizon");
+        ui.text(
+            Face::Regular,
+            11.0,
+            margin + brand_w + 8.0,
+            19.0,
+            color::MUTED,
+            crate::backend::VERSION,
+        );
+        let account_w = (content_w * 0.46).clamp(140.0, 260.0);
         button(
             &mut ui,
             &mut self.targets,
-            [
-                if w < 700.0 { 32.0 } else { w - 320.0 },
-                if w < 700.0 { 47.0 } else { 24.0 },
-                if w < 700.0 { w - 64.0 } else { 288.0 },
-                if w < 700.0 { 34.0 } else { 46.0 },
-            ],
-            &self.login.status(&self.catalog.config.name),
+            [w - margin - account_w, 8.0, account_w, 36.0],
+            &self.login.status(&self.catalog.config.name, language),
             Action::Account,
-            self.login.signed_in,
+            false,
         );
-        let tabs = Page::ALL.len() as f32;
-        let tab_margin = if w < 700.0 { 16.0 } else { 32.0 };
-        let tab_width = (w - 2.0 * tab_margin) / tabs;
+
+        // Navigation: one row of six on tablets, three by two on phones. A
+        // selected page is ink, not the action accent; the accent stays for
+        // the one main action on the page.
+        let nav_top = 56.0;
+        let columns = if compact && content_w < 560.0 { 3 } else { 6 };
+        let rows = Page::ALL.len().div_ceil(columns);
+        let gap = 6.0;
+        let tab_h = if rows == 2 { 44.0 } else { 46.0 };
+        let tab_w = (content_w - gap * (columns as f32 - 1.0)) / columns as f32;
         for (i, page) in Page::ALL.iter().enumerate() {
-            let x = tab_margin + i as f32 * tab_width;
-            button(
-                &mut ui,
-                &mut self.targets,
-                [x, 88.0, tab_width - 4.0, 42.0],
-                if w < 700.0 {
-                    match page {
-                        Page::Installed => "Files",
-                        Page::Settings => "Setup",
-                        _ => page.name(),
-                    }
-                } else {
-                    page.name()
-                },
-                Action::Page(*page),
-                *page == self.catalog.page,
+            let column = i % columns;
+            let row = i / columns;
+            let rect = [
+                margin + column as f32 * (tab_w + gap),
+                nav_top + row as f32 * (tab_h + gap),
+                tab_w,
+                tab_h,
+            ];
+            let selected = *page == self.catalog.page;
+            let label = translate(language, page.name());
+            let [x, y, tw, th] = rect;
+            ui.rounded(
+                x,
+                y,
+                tw,
+                th,
+                (th / 2.0).min(24.0),
+                if selected { color::TEXT } else { color::RAISED },
             );
+            let size = if compact { 13.0 } else { 15.0 };
+            let label = ui.fit_text(Face::Medium, size, label, tw - 16.0);
+            let text_w = ui.measure(Face::Medium, size, &label);
+            ui.text(
+                Face::Medium,
+                size,
+                x + (tw - text_w) / 2.0,
+                y + (th - size * 1.45) / 2.0,
+                if selected { color::BG } else { color::TEXT },
+                &label,
+            );
+            self.targets.push((rect, Action::Page(*page)));
         }
-        let compact = w < 700.0;
+        let nav_bottom = nav_top + rows as f32 * tab_h + (rows as f32 - 1.0) * gap;
+        let page_top = nav_bottom + 18.0;
+        let content_bottom = h - 64.0;
         let page = self.catalog.page;
         if page == Page::Play {
             use horizon_client::official_install::InstallStage;
             let installed = horizon_client::official_install::ready(&self.home);
             let installing = self.worker.is_some();
-            let progress = *self.install.lock().unwrap();
-            let top = 160.0;
-            ui.text(
-                Face::Medium,
-                32.0,
-                32.0,
-                top,
-                color::TEXT,
-                if installing {
-                    "Getting your game ready"
-                } else if installed {
-                    "Ready to play"
-                } else {
-                    if compact {
-                        "Your Java worlds"
-                    } else {
-                        "Your Java worlds, on Android"
-                    }
-                },
-            );
-            ui.text(
-                Face::Regular,
-                17.0,
-                32.0,
-                top + 47.0,
-                color::MUTED,
-                &format!("Minecraft 26.3  /  Profile {}", self.catalog.config.profile),
-            );
+            let progress = *self.install.lock();
+            let title = if installing {
+                translate(language, "Getting your game ready")
+            } else if installed {
+                translate(language, "Ready to play")
+            } else if compact {
+                translate(language, "Your Java worlds")
+            } else {
+                translate(language, "Your Java worlds, on Android")
+            };
+            let caption = tr!(language, "Minecraft 26.3  /  Profile {profile}", {
+                profile = self.catalog.config.profile
+            });
+            let top = page_header(&mut ui, title, &caption, margin, page_top, content_w);
             if installing {
                 let current = InstallStage::ALL
                     .iter()
-                    .position(|s| *s == progress.stage)
+                    .position(|stage| *stage == progress.stage)
                     .unwrap_or(0);
-                let row_height = ((h - 360.0) / 6.0).clamp(25.0, 40.0);
-                if h >= 620.0 {
-                    for (index, stage) in InstallStage::ALL.iter().enumerate() {
-                        let y = top + 90.0 + index as f32 * row_height;
-                        let label = if index < current {
-                            format!("{:02}  {}  - done", index + 1, stage.label())
-                        } else {
-                            format!("{:02}  {}", index + 1, stage.label())
-                        };
-                        ui.text(
-                            Face::Regular,
-                            16.0,
-                            32.0,
-                            y,
-                            if index == current {
-                                color::TEXT
-                            } else {
-                                color::MUTED
-                            },
-                            &label,
-                        );
+                let available = (content_bottom - top - 108.0).max(0.0);
+                let row_height = (available / 6.0).clamp(28.0, 44.0);
+                let show_all = available >= 6.0 * 34.0;
+                for (index, stage) in InstallStage::ALL.iter().enumerate() {
+                    if !show_all && index != current {
+                        continue;
                     }
-                } else {
-                    ui.text(
-                        Face::Regular,
-                        18.0,
-                        32.0,
-                        top + 100.0,
-                        color::TEXT,
-                        progress.stage.label(),
-                    );
+                    let y = top
+                        + if show_all {
+                            index as f32 * row_height
+                        } else {
+                            0.0
+                        };
+                    let number = format!("{:02}", index + 1);
+                    ui.text(Face::Regular, 11.0, margin, y + 4.0, color::MUTED, &number);
+                    let label = translate(language, stage.label());
+                    let label = ui.fit_text(Face::Regular, 15.0, label, content_w - 34.0);
                     ui.text(
                         Face::Regular,
                         15.0,
-                        32.0,
-                        top + 138.0,
-                        color::MUTED,
-                        &format!("Step {} of 6", current + 1),
+                        margin + 30.0,
+                        y + 2.0,
+                        if index == current {
+                            color::TEXT
+                        } else {
+                            color::MUTED
+                        },
+                        &label,
                     );
+                    if index < current {
+                        ui.text(
+                            Face::Medium,
+                            12.0,
+                            w - margin - 20.0,
+                            y + 3.0,
+                            color::SUCCESS,
+                            "OK",
+                        );
+                    }
+                    rule(&mut ui, margin, y + row_height - 6.0, content_w);
                 }
+                let bar_y = content_bottom - 52.0;
                 let fraction = if progress.total > 0 {
                     progress.done as f32 / progress.total as f32
                 } else {
                     0.0
                 };
                 let overall = (current as f32 + fraction.clamp(0.0, 1.0)) / 6.0;
-                let bar_y = h - 152.0;
-                ui.rounded(32.0, bar_y, w - 64.0, 4.0, 2.0, color::RAISED);
-                if overall > 0.0 {
-                    ui.rounded(32.0, bar_y, (w - 64.0) * overall, 4.0, 2.0, color::ACCENT);
-                }
+                progress_bar(&mut ui, margin, bar_y, content_w, overall);
                 let detail = match progress.stage {
-                    InstallStage::Download => format!(
-                        "{:.1} / {:.1} MiB  - verified downloads",
-                        progress.done as f64 / 1048576.0,
-                        progress.total as f64 / 1048576.0
+                    InstallStage::Download => tr!(
+                        language,
+                        "{done} / {total} MiB  - verified downloads",
+                        {
+                            done = format!("{:.1}", progress.done as f64 / 1048576.0),
+                            total = format!("{:.1}", progress.total as f64 / 1048576.0)
+                        }
                     ),
-                    InstallStage::Controls => format!(
-                        "{} / {} control files verified",
-                        progress.done, progress.total
+                    InstallStage::Controls => tr!(
+                        language,
+                        "{done} / {total} control files verified",
+                        { done = progress.done, total = progress.total }
                     ),
-                    _ => "Please keep Horizon open. Downloaded files are kept for retry.".into(),
+                    _ => translate(
+                        language,
+                        "Please keep Horizon open. Downloaded files are kept for retry.",
+                    )
+                    .to_owned(),
                 };
+                let detail = ui.fit_text(Face::Regular, 13.0, &detail, content_w);
                 ui.text(
                     Face::Regular,
-                    14.0,
-                    32.0,
+                    13.0,
+                    margin,
                     bar_y + 12.0,
                     color::MUTED,
                     &detail,
@@ -397,111 +499,61 @@ impl Launcher {
                     ]
                 };
                 for (index, line) in rows.iter().enumerate() {
+                    let y = top + index as f32 * 46.0;
+                    let line = translate(language, line);
+                    let line = ui.fit_text(Face::Regular, 16.0, line, content_w);
+                    ui.text(Face::Regular, 16.0, margin, y + 4.0, color::TEXT, &line);
+                    rule(&mut ui, margin, y + 38.0, content_w);
+                }
+                if let Some(error) = &self.error {
+                    let text = ui.fit_text(Face::Regular, 13.0, error, content_w - 24.0);
+                    ui.rounded(
+                        margin,
+                        content_bottom - 118.0,
+                        content_w,
+                        44.0,
+                        8.0,
+                        color::RAISED,
+                    );
+                    ui.rounded(
+                        margin + 12.0,
+                        content_bottom - 101.0,
+                        6.0,
+                        6.0,
+                        3.0,
+                        color::DANGER,
+                    );
                     ui.text(
                         Face::Regular,
-                        17.0,
-                        32.0,
-                        top + 100.0 + index as f32 * 42.0,
-                        color::MUTED,
-                        line,
+                        13.0,
+                        margin + 26.0,
+                        content_bottom - 108.0,
+                        color::TEXT,
+                        &text,
                     );
                 }
-            }
-            if installing {
-                ui.text(
-                    Face::Medium,
-                    19.0,
-                    32.0,
-                    h - 90.0,
-                    color::TEXT,
-                    progress.stage.label(),
-                );
-            } else {
                 button(
                     &mut ui,
                     &mut self.targets,
-                    [32.0, h - 100.0, 320.0, 60.0],
+                    [margin, content_bottom - 52.0, content_w.min(360.0), 52.0],
                     if installed {
-                        "Play"
+                        translate(language, "Play")
                     } else if self.error.is_some() {
-                        "Retry installation"
+                        translate(language, "Retry installation")
                     } else {
-                        "Download Minecraft 26.3"
+                        translate(language, "Download Minecraft 26.3")
                     },
                     Action::Play,
                     true,
                 );
             }
         } else if page.is_catalog() {
-            ui.text(
-                Face::Medium,
-                18.0,
-                32.0,
-                142.0,
-                color::TEXT,
-                if page == Page::Mods {
-                    "Horizon Mods"
-                } else if page == Page::Shaders {
-                    if w < 360.0 { "Shaders" } else { "Shader Packs" }
-                } else {
-                    "Resource Packs"
-                },
-            );
-            button(
-                &mut ui,
-                &mut self.targets,
-                [32.0, 174.0, w - 240.0, 44.0],
-                &format!(
-                    "{}{}",
-                    if page == Page::Mods {
-                        "Search / .hmod URL: "
-                    } else {
-                        "Search: "
-                    },
-                    self.catalog.query
-                ),
-                Action::Field("search"),
-                false,
-            );
-            button(
-                &mut ui,
-                &mut self.targets,
-                [w - 190.0, 174.0, 158.0, 44.0],
-                if page == Page::Mods && self.catalog.query.trim().starts_with("https://") {
-                    "Import .hmod"
-                } else {
-                    "Search"
-                },
-                Action::Search,
-                true,
-            );
-            if matches!(page, Page::Shaders | Page::Mods) {
-                use crate::shader_catalog::Origin;
-                let width = ((w - 185.0) / 2.0).clamp(58.0, 120.0);
-                for (i, origin) in [Origin::Horizon, Origin::Modrinth].into_iter().enumerate() {
-                    let rect = [w - 32.0 - (2 - i) as f32 * width, 134.0, width - 5.0, 32.0];
-                    button(
-                        &mut ui,
-                        &mut self.targets,
-                        rect,
-                        origin.source().label(),
-                        if page == Page::Mods {
-                            Action::ModSource(origin)
-                        } else {
-                            Action::ShaderSource(origin)
-                        },
-                        false,
-                    );
-                    if (if page == Page::Mods {
-                        self.catalog.config.mod_source
-                    } else {
-                        self.catalog.config.shader_source
-                    }) == origin
-                    {
-                        ui.border(rect[0], rect[1], rect[2], rect[3], 1.0, color::TEXT);
-                    }
-                }
-            }
+            let title = match page {
+                Page::Mods => translate(language, "Horizon Mods"),
+                Page::Shaders if compact => translate(language, "Shaders"),
+                Page::Shaders => translate(language, "Shader Packs"),
+                _ => translate(language, "Resource Packs"),
+            };
             let hint = match page {
                 Page::Mods
                     if self.catalog.config.mod_source
@@ -519,43 +571,113 @@ impl Launcher {
                 Page::Shaders => "Horizon native .hshader packs",
                 _ => "Verified downloads / enable in Installed",
             };
-            let hint = ui.fit_text(Face::Regular, 14.0, hint, w - 64.0);
-            ui.text(Face::Regular, 14.0, 32.0, 270.0, color::MUTED, &hint);
+            let hint = translate(language, hint);
+            let mut top = page_header(&mut ui, title, hint, margin, page_top, content_w);
             let kind = match page {
                 Page::Mods => horizon_client::content_files::Kind::Mods,
                 Page::Shaders => horizon_client::content_files::Kind::Shaders,
                 _ => horizon_client::content_files::Kind::Packs,
             };
-            let file_button_width = ((w - 72.0) / 2.0).min(158.0);
+            if matches!(page, Page::Shaders | Page::Mods) {
+                use crate::shader_catalog::Origin;
+                let width = ((content_w - 8.0) / 2.0).min(180.0);
+                for (i, origin) in [Origin::Horizon, Origin::Modrinth].into_iter().enumerate() {
+                    let rect = [margin + i as f32 * (width + 8.0), top, width, 38.0];
+                    let selected = (if page == Page::Mods {
+                        self.catalog.config.mod_source
+                    } else {
+                        self.catalog.config.shader_source
+                    }) == origin;
+                    ui.rounded(
+                        rect[0],
+                        rect[1],
+                        rect[2],
+                        rect[3],
+                        19.0,
+                        if selected { color::TEXT } else { color::RAISED },
+                    );
+                    let label =
+                        ui.fit_text(Face::Medium, 14.0, origin.source().label(), rect[2] - 24.0);
+                    let text_w = ui.measure(Face::Medium, 14.0, &label);
+                    ui.text(
+                        Face::Medium,
+                        14.0,
+                        rect[0] + (rect[2] - text_w) / 2.0,
+                        rect[1] + (rect[3] - 14.0 * 1.45) / 2.0,
+                        if selected { color::BG } else { color::TEXT },
+                        &label,
+                    );
+                    self.targets.push((
+                        rect,
+                        if page == Page::Mods {
+                            Action::ModSource(origin)
+                        } else {
+                            Action::ShaderSource(origin)
+                        },
+                    ));
+                }
+                top += 46.0;
+            }
+            let search_button_w = 104.0;
+            let search_w = (content_w - search_button_w - 8.0).max(80.0);
+            let search_label = if self.catalog.query.is_empty() {
+                translate(
+                    language,
+                    if page == Page::Mods {
+                        "Search / .hmod URL: "
+                    } else {
+                        "Search: "
+                    },
+                )
+                .to_owned()
+            } else {
+                self.catalog.query.clone()
+            };
+            field(
+                &mut ui,
+                &mut self.targets,
+                [margin, top, search_w, 44.0],
+                &search_label,
+                Action::Field("search"),
+                self.catalog.editing == Some("search"),
+            );
             button(
                 &mut ui,
                 &mut self.targets,
-                [32.0, 222.0, file_button_width, 38.0],
-                "Open folder",
-                Action::OpenFolder(kind),
-                false,
+                [margin + search_w + 8.0, top, search_button_w, 44.0],
+                if page == Page::Mods && self.catalog.query.trim().starts_with("https://") {
+                    translate(language, "Import .hmod")
+                } else {
+                    translate(language, "Search")
+                },
+                Action::Search,
+                true,
             );
-            button(
-                &mut ui,
-                &mut self.targets,
-                [w - 32.0 - file_button_width, 222.0, file_button_width, 38.0],
-                "Import file",
-                Action::Import(kind),
-                false,
-            );
-            let top = 296.0;
-            let bottom = h - 112.0;
-            self.catalog.scroll = self.catalog.scroll.clamp(
-                0.0,
-                (self.catalog.results.len() as f32 * 78.0 - (bottom - top)).max(0.0),
-            );
-            self.list_view = Some([
-                top,
-                bottom,
-                (self.catalog.results.len() as f32 * 78.0 - (bottom - top)).max(0.0),
-            ]);
+            let top = top + 60.0;
+            let bottom = content_bottom - 48.0;
+            let row_height = 76.0;
+            let maximum =
+                (self.catalog.results.len() as f32 * row_height - (bottom - top)).max(0.0);
+            self.catalog.scroll = self.catalog.scroll.clamp(0.0, maximum);
+            self.list_view = Some([top, bottom, maximum]);
+            if self.catalog.results.is_empty() {
+                let text = ui.fit_text(
+                    Face::Regular,
+                    15.0,
+                    translate(language, "No results. Try another query or import a file."),
+                    content_w,
+                );
+                ui.text(
+                    Face::Regular,
+                    15.0,
+                    margin,
+                    (top + bottom) / 2.0,
+                    color::MUTED,
+                    &text,
+                );
+            }
             for (i, p) in self.catalog.results.iter().enumerate() {
-                let y = top + i as f32 * 78.0 - self.catalog.scroll;
+                let y = top + i as f32 * row_height - self.catalog.scroll;
                 let download = self.catalog.download_label(p);
                 if download.is_none()
                     && !crate::catalog::source_only_mod(p)
@@ -563,89 +685,149 @@ impl Launcher {
                         && p.source == crate::browser::SourceId::Modrinth)
                 {
                     self.list_targets
-                        .push(([w - 150.0, y, 118.0, 70.0], Action::Install(i)));
+                        .push(([w - margin - 108.0, y, 108.0, 64.0], Action::Install(i)));
                 }
-                if y < top || y + 70.0 > bottom {
+                if y < top - row_height || y + 64.0 > bottom {
                     continue;
                 }
-                let title = ui.fit_text(Face::Medium, 19.0, &p.title, w - 214.0);
-                let summary = ui.fit_text(Face::Regular, 14.0, &p.summary, w - 214.0);
-                ui.text(Face::Medium, 19.0, 32.0, y, color::TEXT, &title);
-                ui.text(Face::Regular, 14.0, 32.0, y + 29.0, color::MUTED, &summary);
+                let title = ui.fit_text(Face::Medium, 17.0, &p.title, content_w - 120.0);
+                let summary = ui.fit_text(Face::Regular, 13.0, &p.summary, content_w - 120.0);
+                ui.text(Face::Medium, 17.0, margin, y + 4.0, color::TEXT, &title);
+                ui.text(
+                    Face::Regular,
+                    13.0,
+                    margin,
+                    y + 31.0,
+                    color::MUTED,
+                    &summary,
+                );
+                rule(&mut ui, margin, y + row_height - 8.0, content_w);
                 if let Some(state) = download {
-                    ui.text(Face::Medium, 16.0, w - 150.0, y + 12.0, color::TEXT, &state);
+                    let state = if state == "Installed" {
+                        translate(language, "Installed").to_owned()
+                    } else {
+                        state
+                    };
+                    ui.text(
+                        Face::Medium,
+                        14.0,
+                        w - margin - 108.0,
+                        y + 12.0,
+                        color::MUTED,
+                        &state,
+                    );
                 } else if p.kind == crate::browser::Kind::Mod
                     && p.source == crate::browser::SourceId::Modrinth
                 {
                     ui.text(
                         Face::Regular,
-                        14.0,
-                        w - 150.0,
+                        13.0,
+                        w - margin - 108.0,
                         y + 12.0,
                         color::MUTED,
-                        "Java mod",
+                        translate(language, "Java mod"),
                     );
                 } else if crate::catalog::source_only_mod(p) {
                     ui.text(
                         Face::Regular,
-                        14.0,
-                        w - 150.0,
+                        13.0,
+                        w - margin - 108.0,
                         y + 12.0,
                         color::MUTED,
-                        ".hnmod: later",
+                        translate(language, ".hnmod: later"),
                     );
                 } else if p.kind == crate::browser::Kind::Mod && !cfg!(target_pointer_width = "64")
                 {
                     ui.text(
                         Face::Regular,
-                        14.0,
-                        w - 150.0,
+                        13.0,
+                        w - margin - 108.0,
                         y + 12.0,
                         color::MUTED,
-                        "64-bit required",
+                        translate(language, "64-bit required"),
                     );
                 } else {
                     button(
                         &mut ui,
                         &mut self.targets,
-                        [w - 150.0, y, 118.0, 42.0],
-                        self.catalog.install_button(p),
+                        [w - margin - 108.0, y + 10.0, 108.0, 38.0],
+                        translate(language, self.catalog.install_button(p)),
                         Action::Install(i),
                         false,
                     );
                 }
             }
+            let action_y = content_bottom - 40.0;
+            let action_gap = 6.0;
+            let action_w = if compact {
+                (content_w - 3.0 * action_gap) / 4.0
+            } else {
+                110.0
+            };
             button(
                 &mut ui,
                 &mut self.targets,
-                [32.0, h - 100.0, 120.0, 40.0],
-                "Previous",
+                [margin, action_y, action_w, 36.0],
+                translate(language, "Previous"),
                 Action::Previous,
                 false,
             );
             button(
                 &mut ui,
                 &mut self.targets,
-                [166.0, h - 100.0, 120.0, 40.0],
-                "Next",
+                [margin + action_w + action_gap, action_y, action_w, 36.0],
+                translate(language, "Next"),
                 Action::Next,
+                false,
+            );
+            button(
+                &mut ui,
+                &mut self.targets,
+                [
+                    w - margin - 2.0 * action_w - action_gap,
+                    action_y,
+                    action_w,
+                    36.0,
+                ],
+                translate(language, "Folder"),
+                Action::OpenFolder(kind),
+                false,
+            );
+            button(
+                &mut ui,
+                &mut self.targets,
+                [w - margin - action_w, action_y, action_w, 36.0],
+                translate(language, "Import"),
+                Action::Import(kind),
                 false,
             );
         } else if page == Page::Installed {
             use horizon_client::content_files::Kind;
-            let top = 156.0;
-            let bottom = h - 100.0;
-            let row_height = if compact { 110.0 } else { 72.0 };
+            let title = translate(language, "Installed");
+            let caption = translate(
+                language,
+                "Mods, resource packs and shaders for this profile",
+            );
+            let top = page_header(&mut ui, title, caption, margin, page_top, content_w);
+            let bottom = content_bottom;
+            let narrow = content_w < 340.0;
+            let section_h = 52.0;
+            let item_h = if narrow { 100.0 } else { 68.0 };
             let total = Kind::ALL
                 .iter()
                 .enumerate()
-                .map(|(i, k)| {
-                    48.0 + if self.catalog.sections[i] {
-                        self.catalog.local.iter().filter(|e| e.kind == *k).count() as f32
-                            * row_height
-                    } else {
-                        0.0
-                    }
+                .map(|(i, kind)| {
+                    section_h
+                        + if self.catalog.sections[i] {
+                            self.catalog
+                                .local
+                                .iter()
+                                .filter(|entry| entry.kind == *kind)
+                                .count() as f32
+                                * item_h
+                        } else {
+                            0.0
+                        }
                 })
                 .sum::<f32>();
             let maximum = (total - (bottom - top)).max(0.0);
@@ -655,38 +837,41 @@ impl Launcher {
             for (section, kind) in Kind::ALL.into_iter().enumerate() {
                 let count = self.catalog.local.iter().filter(|e| e.kind == kind).count();
                 let y = top + offset - self.catalog.scroll;
-                let label = format!(
-                    "{} {} ({count})",
-                    if self.catalog.sections[section] {
-                        "-"
-                    } else {
-                        "+"
-                    },
-                    kind.label()
-                );
+                let label_w = (content_w - 88.0).max(80.0);
+                let import_rect = [w - margin - 80.0, y, 80.0, 40.0];
                 self.list_targets
-                    .push(([32.0, y, w - 210.0, 40.0], Action::ToggleSection(section)));
-                self.list_targets
-                    .push(([w - 165.0, y, 133.0, 40.0], Action::Import(kind)));
-                if y >= top && y + 40.0 <= bottom {
-                    button(
-                        &mut ui,
-                        &mut self.targets,
-                        [32.0, y, w - 210.0, 40.0],
+                    .push(([margin, y, label_w, 44.0], Action::ToggleSection(section)));
+                self.list_targets.push((import_rect, Action::Import(kind)));
+                if y >= top - 44.0 && y + 44.0 <= bottom {
+                    ui.rounded(margin, y, label_w, 44.0, 22.0, color::RAISED);
+                    let label = format!(
+                        "{}  {} ({count})",
+                        if self.catalog.sections[section] {
+                            "-"
+                        } else {
+                            "+"
+                        },
+                        translate(language, kind.label())
+                    );
+                    let label = ui.fit_text(Face::Medium, 15.0, &label, label_w - 28.0);
+                    ui.text(
+                        Face::Medium,
+                        15.0,
+                        margin + 14.0,
+                        y + (44.0 - 15.0 * 1.45) / 2.0,
+                        color::TEXT,
                         &label,
-                        Action::ToggleSection(section),
-                        false,
                     );
                     button(
                         &mut ui,
                         &mut self.targets,
-                        [w - 165.0, y, 133.0, 40.0],
-                        "Import",
+                        import_rect,
+                        translate(language, "Import"),
                         Action::Import(kind),
                         false,
                     );
                 }
-                offset += 48.0;
+                offset += section_h;
                 if !self.catalog.sections[section] {
                     continue;
                 }
@@ -698,308 +883,343 @@ impl Launcher {
                     .filter(|(_, e)| e.kind == kind)
                 {
                     let y = top + offset - self.catalog.scroll;
-                    offset += row_height;
-                    self.list_targets.push((
-                        [
-                            if compact { 32.0 } else { w - 300.0 },
-                            y,
-                            120.0,
-                            row_height - 4.0,
-                        ],
-                        Action::ToggleLocal(i),
-                    ));
-                    self.list_targets.push((
-                        [w - 165.0, y, 133.0, row_height - 4.0],
-                        Action::DeleteLocal(i),
-                    ));
-                    if y < top || y + row_height - 4.0 > bottom {
+                    offset += item_h;
+                    let switch_x = if narrow {
+                        margin
+                    } else {
+                        w - margin - 80.0 - 8.0 - 44.0
+                    };
+                    let remove_x = w - margin - 80.0;
+                    let controls_y = if narrow { y + 52.0 } else { y + 14.0 };
+                    self.list_targets
+                        .push(([switch_x, controls_y, 44.0, 40.0], Action::ToggleLocal(i)));
+                    self.list_targets
+                        .push(([remove_x, controls_y, 80.0, 36.0], Action::DeleteLocal(i)));
+                    if y < top - item_h || y + item_h > bottom {
                         continue;
                     }
-                    let title = ui.fit_text(
-                        Face::Medium,
-                        19.0,
-                        &item.title,
-                        if compact { w - 64.0 } else { w - 364.0 },
-                    );
-                    ui.text(Face::Medium, 19.0, 32.0, y, color::TEXT, &title);
+                    let title_w = if narrow {
+                        content_w
+                    } else {
+                        (content_w - 148.0).max(80.0)
+                    };
+                    let title = ui.fit_text(Face::Medium, 16.0, &item.title, title_w);
+                    ui.text(Face::Medium, 16.0, margin, y + 4.0, color::TEXT, &title);
                     ui.text(
                         Face::Regular,
-                        14.0,
-                        32.0,
-                        y + 28.0,
+                        13.0,
+                        margin,
+                        y + 29.0,
                         color::MUTED,
-                        kind.label(),
+                        translate(language, kind.label()),
                     );
                     if kind == Kind::Mods && !cfg!(target_pointer_width = "64") {
                         ui.text(
                             Face::Regular,
-                            14.0,
-                            if compact { 32.0 } else { w - 300.0 },
-                            y + if compact { 62.0 } else { 12.0 },
+                            13.0,
+                            switch_x,
+                            controls_y + 8.0,
                             color::MUTED,
-                            "64-bit required",
+                            translate(language, "64-bit required"),
                         );
                     } else {
                         toggle(
                             &mut ui,
                             &mut self.targets,
-                            [
-                                if compact { 32.0 } else { w - 300.0 },
-                                y + if compact { 55.0 } else { 0.0 },
-                                120.0,
-                                40.0,
-                            ],
+                            [switch_x, controls_y, 44.0, 40.0],
                             item.enabled,
                             Action::ToggleLocal(i),
+                            language,
                         );
                     }
                     button(
                         &mut ui,
                         &mut self.targets,
-                        [w - 165.0, y + if compact { 55.0 } else { 0.0 }, 133.0, 40.0],
-                        "Remove",
+                        [remove_x, controls_y, 80.0, 36.0],
+                        translate(language, "Remove"),
                         Action::DeleteLocal(i),
                         false,
                     );
+                    rule(&mut ui, margin, y + item_h - 6.0, content_w);
                 }
+            }
+            if total == 0.0 {
+                let text = translate(language, "No items installed yet");
+                let text_w = ui.measure(Face::Regular, 15.0, text);
+                ui.text(
+                    Face::Regular,
+                    15.0,
+                    margin + (content_w - text_w) / 2.0,
+                    (top + bottom) / 2.0,
+                    color::MUTED,
+                    text,
+                );
             }
         } else {
             let c = &self.catalog.config;
-            ui.text(
-                Face::Medium,
-                24.0,
-                32.0,
-                156.0,
-                color::TEXT,
-                "Launch settings",
-            );
-            let row_height = if compact { 82.0 } else { 66.0 };
-            self.catalog.scroll = self
-                .catalog
-                .scroll
-                .clamp(0.0, (15.0 * row_height - (h - 130.0 - 195.0)).max(0.0));
-            self.list_view = Some([
-                195.0,
-                h - 130.0,
-                (15.0 * row_height - (h - 130.0 - 195.0)).max(0.0),
-            ]);
-            for (i, (title, value, action)) in [
-                ("Rendering", c.renderer.label().to_owned(), Action::Renderer),
-                (
+            let language = c.language;
+            let title = translate(language, "Settings");
+            let caption = translate(language, "Display, input and performance");
+            let top = page_header(&mut ui, title, caption, margin, page_top, content_w);
+
+            enum Entry {
+                Section(&'static str),
+                Row(&'static str, Action, Kind),
+            }
+            enum Kind {
+                Toggle(bool),
+                Choice(String),
+                Action(String),
+            }
+            let refresh = if c.device.display_hz == 0 {
+                translate(language, "System default").to_owned()
+            } else {
+                tr!(language, "{hz} Hz (request)", { hz = c.device.display_hz })
+            };
+            let entries = vec![
+                Entry::Section("Display"),
+                Entry::Row(
+                    "Language",
+                    Action::Language,
+                    Kind::Choice(c.language.label().to_owned()),
+                ),
+                Entry::Row(
+                    "Rendering",
+                    Action::Renderer,
+                    Kind::Choice(translate(language, c.renderer.label()).to_owned()),
+                ),
+                Entry::Row(
                     "Client resolution",
-                    if self.catalog.editing == Some("render_scale") {
+                    Action::RenderScale,
+                    Kind::Choice(if self.catalog.editing == Some("render_scale") {
                         self.catalog.render_scale_text.clone()
                     } else {
                         format!("{}%", c.render_scale.percent())
-                    },
-                    Action::RenderScale,
+                    }),
                 ),
-                ("Profile", format!("Profile {}", c.profile), Action::Profile),
-                (
+                Entry::Row(
+                    "Profile",
+                    Action::Profile,
+                    Kind::Choice(tr!(language, "Profile {id}", { id = c.profile })),
+                ),
+                Entry::Row(
                     "Orientation",
-                    c.orientation.label().to_owned(),
                     Action::Orientation,
+                    Kind::Choice(translate(language, c.orientation.label()).to_owned()),
                 ),
-                ("Input", c.input_host.label().to_owned(), Action::InputHost),
-                (
+                Entry::Row(
+                    "Input",
+                    Action::InputHost,
+                    Kind::Choice(translate(language, c.input_host.label()).to_owned()),
+                ),
+                Entry::Row(
                     "Immersive fullscreen",
-                    if c.screen.immersive { "On" } else { "Off" }.into(),
                     Action::Immersive,
+                    Kind::Toggle(c.screen.immersive),
                 ),
-                (
+                Entry::Row(
                     "Avoid camera cutout",
-                    if c.screen.avoid_cutout { "On" } else { "Off" }.into(),
                     Action::Cutout,
+                    Kind::Toggle(c.screen.avoid_cutout),
                 ),
-                (
+                Entry::Row(
                     "Aspect ratio",
-                    c.screen.aspect.label().into(),
                     Action::Aspect,
+                    Kind::Choice(translate(language, c.screen.aspect.label()).to_owned()),
                 ),
-                (
+                Entry::Row(
                     "Display refresh rate",
-                    c.device.display_label(),
                     Action::DisplayHz,
+                    Kind::Choice(refresh),
                 ),
-                (
+                Entry::Section("Performance"),
+                Entry::Row(
                     "Performance hints",
-                    if c.device.performance_hints {
-                        "On (ADPF)"
-                    } else {
-                        "Off"
-                    }
-                    .into(),
                     Action::PerformanceHints,
+                    Kind::Toggle(c.device.performance_hints),
                 ),
-                (
+                Entry::Row(
                     "GPU profiling",
-                    if c.device.gpu_profile {
-                        "On / included in report"
-                    } else {
-                        "Off"
-                    }
-                    .into(),
                     Action::GpuProfile,
+                    Kind::Toggle(c.device.gpu_profile),
                 ),
-                (
+                Entry::Row(
                     "Performance recording",
-                    if c.record_performance {
-                        "On / up to 30 min"
-                    } else {
-                        "Off"
-                    }
-                    .into(),
                     Action::RecordPerformance,
+                    Kind::Toggle(c.record_performance),
                 ),
-                (
-                    "Diagnostic report",
-                    "Export ZIP / review before sharing".into(),
-                    Action::ExportDiagnostics,
-                ),
-                (
-                    "Performance report",
-                    "Open in Files / Reports".into(),
-                    Action::ExportPerformance,
-                ),
-                (
+                Entry::Section("Network"),
+                Entry::Row(
                     "Server",
-                    if c.server.is_empty() {
-                        "Singleplayer / tap to enter server".into()
+                    Action::Field("server"),
+                    Kind::Choice(if c.server.is_empty() {
+                        translate(language, "Singleplayer / tap to enter server").to_owned()
                     } else {
                         c.server.clone()
-                    },
-                    Action::Field("server"),
+                    }),
                 ),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let y = 195.0 + i as f32 * row_height - self.catalog.scroll;
-                self.list_targets.push((
-                    [
-                        if compact { 32.0 } else { w * 0.36 },
-                        y,
-                        if compact { w - 64.0 } else { w * 0.64 - 32.0 },
-                        if compact { 70.0 } else { 46.0 },
-                    ],
-                    action,
-                ));
-                if y < 185.0 || y + if compact { 70.0 } else { 46.0 } > h - 130.0 {
-                    continue;
-                }
-                ui.text(
-                    Face::Regular,
-                    16.0,
-                    32.0,
-                    y + if compact { 0.0 } else { 13.0 },
-                    color::MUTED,
-                    title,
-                );
-                if matches!(
-                    action,
-                    Action::PerformanceHints | Action::Immersive | Action::Cutout
-                ) {
-                    toggle(
-                        &mut ui,
-                        &mut self.targets,
-                        [
-                            if compact { 32.0 } else { w * 0.36 },
-                            y + if compact { 24.0 } else { 0.0 },
-                            if compact { w - 64.0 } else { w * 0.64 - 32.0 },
-                            46.0,
-                        ],
-                        match action {
-                            Action::PerformanceHints => c.device.performance_hints,
-                            Action::Immersive => c.screen.immersive,
-                            Action::Cutout => c.screen.avoid_cutout,
-                            _ => c.device.gpu_profile,
-                        },
-                        action,
-                    );
-                } else {
-                    button(
-                        &mut ui,
-                        &mut self.targets,
-                        [
-                            if compact { 32.0 } else { w * 0.36 },
-                            y + if compact { 24.0 } else { 0.0 },
-                            if compact { w - 64.0 } else { w * 0.64 - 32.0 },
-                            46.0,
-                        ],
-                        &format!(
-                            "{} {}",
-                            value,
-                            if matches!(
-                                action,
-                                Action::Renderer
-                                    | Action::Aspect
-                                    | Action::DisplayHz
-                                    | Action::RenderScale
-                                    | Action::Profile
-                                    | Action::Orientation
-                                    | Action::InputHost
-                            ) {
-                                "v"
-                            } else {
-                                ""
+                Entry::Section("Support"),
+                Entry::Row(
+                    "Diagnostic report",
+                    Action::ExportDiagnostics,
+                    Kind::Action(
+                        translate(language, "Export ZIP / review before sharing").to_owned(),
+                    ),
+                ),
+                Entry::Row(
+                    "Performance report",
+                    Action::ExportPerformance,
+                    Kind::Action(translate(language, "Open in Files / Reports").to_owned()),
+                ),
+            ];
+            let row_h = if compact { 56.0 } else { 54.0 };
+            let section_h = 30.0;
+            let total = entries
+                .iter()
+                .map(|entry| match entry {
+                    Entry::Section(_) => section_h,
+                    Entry::Row(..) => row_h,
+                })
+                .sum::<f32>();
+            let action_y = content_bottom - 44.0;
+            let bottom = action_y - 12.0;
+            let maximum = (total - (bottom - top)).max(0.0);
+            self.catalog.scroll = self.catalog.scroll.clamp(0.0, maximum);
+            self.list_view = Some([top, bottom, maximum]);
+            let mut y = top - self.catalog.scroll;
+            for entry in entries {
+                match entry {
+                    Entry::Section(name) => {
+                        let name = translate(language, name);
+                        if y + section_h > top - section_h && y < bottom {
+                            ui.text(Face::Medium, 12.0, margin, y + 8.0, color::MUTED, name);
+                            rule(&mut ui, margin, y + section_h - 8.0, content_w);
+                        }
+                        y += section_h;
+                    }
+                    Entry::Row(name, action, kind) => {
+                        let rect = [margin, y, content_w, row_h];
+                        self.list_targets.push((rect, action));
+                        if y + row_h > top - row_h && y < bottom {
+                            let name = translate(language, name);
+                            let choice = matches!(kind, Kind::Choice(_));
+                            match kind {
+                                Kind::Toggle(on) => {
+                                    let state = translate(language, if on { "On" } else { "Off" });
+                                    let state_w = ui.measure(Face::Regular, 13.0, state);
+                                    let title_w = (content_w - state_w - 64.0).max(80.0);
+                                    let title = ui.fit_text(Face::Medium, 15.0, name, title_w);
+                                    ui.text(
+                                        Face::Medium,
+                                        15.0,
+                                        margin,
+                                        y + (row_h - 15.0 * 1.45) / 2.0,
+                                        color::TEXT,
+                                        &title,
+                                    );
+                                    ui.text(
+                                        Face::Regular,
+                                        13.0,
+                                        w - margin - 52.0 - state_w,
+                                        y + (row_h - 13.0 * 1.45) / 2.0,
+                                        color::MUTED,
+                                        state,
+                                    );
+                                    toggle(
+                                        &mut ui,
+                                        &mut self.targets,
+                                        [w - margin - 44.0, y + (row_h - 40.0) / 2.0, 44.0, 40.0],
+                                        on,
+                                        action,
+                                        language,
+                                    );
+                                }
+                                Kind::Choice(value) | Kind::Action(value) => {
+                                    let ends_with_chevron = choice;
+                                    let right_pad = if ends_with_chevron { 18.0 } else { 0.0 };
+                                    let value = ui.fit_text(
+                                        Face::Regular,
+                                        14.0,
+                                        &value,
+                                        (content_w * 0.52).max(80.0),
+                                    );
+                                    let value_w = ui.measure(Face::Regular, 14.0, &value);
+                                    let title_w =
+                                        (content_w - value_w - right_pad - 24.0).max(80.0);
+                                    let title = ui.fit_text(Face::Medium, 15.0, name, title_w);
+                                    ui.text(
+                                        Face::Medium,
+                                        15.0,
+                                        margin,
+                                        y + (row_h - 15.0 * 1.45) / 2.0,
+                                        color::TEXT,
+                                        &title,
+                                    );
+                                    ui.text(
+                                        Face::Regular,
+                                        14.0,
+                                        w - margin - right_pad - value_w,
+                                        y + (row_h - 14.0 * 1.45) / 2.0,
+                                        color::MUTED,
+                                        &value,
+                                    );
+                                    if ends_with_chevron {
+                                        ui.text(
+                                            Face::Medium,
+                                            18.0,
+                                            w - margin - 10.0,
+                                            y + (row_h - 18.0 * 1.45) / 2.0,
+                                            color::MUTED,
+                                            ">",
+                                        );
+                                    }
+                                    self.targets.push((rect, action));
+                                }
                             }
-                        ),
-                        action,
-                        false,
-                    );
+                            rule(&mut ui, margin, y + row_h - 1.0, content_w);
+                        }
+                        y += row_h;
+                    }
                 }
-                ui.rounded(
-                    32.0,
-                    y + if compact { 78.0 } else { 62.0 },
-                    w - 64.0,
-                    1.0,
-                    0.0,
-                    color::BORDER,
-                );
             }
+            let half = (content_w - 8.0) / 2.0;
             button(
                 &mut ui,
                 &mut self.targets,
-                [w * 0.5 + 6.0, h - 114.0, w * 0.5 - 38.0, 42.0],
-                "Microsoft / Xbox account",
-                Action::Account,
-                true,
-            );
-            button(
-                &mut ui,
-                &mut self.targets,
-                [32.0, h - 114.0, w * 0.5 - 38.0, 42.0],
-                "Diagnostics",
+                [margin, action_y, half, 44.0],
+                translate(language, "Diagnostics"),
                 Action::Logs,
                 false,
             );
-        }
-        let status = self.error.as_deref().unwrap_or(&self.catalog.status);
-        for (i, line) in status
-            .chars()
-            .collect::<Vec<_>>()
-            .chunks(110)
-            .take(2)
-            .enumerate()
-        {
-            ui.text(
-                Face::Regular,
-                14.0,
-                32.0,
-                h - 47.0 + i as f32 * 18.0,
-                color::MUTED,
-                &ui.fit_text(
-                    Face::Regular,
-                    14.0,
-                    &line.iter().collect::<String>(),
-                    (w - 210.0).max(40.0),
-                ),
+            button(
+                &mut ui,
+                &mut self.targets,
+                [margin + half + 8.0, action_y, half, 44.0],
+                translate(language, "Microsoft / Xbox account"),
+                Action::Account,
+                true,
             );
         }
+        let bar_y = h - 52.0;
+        rule(&mut ui, margin, bar_y, content_w);
+        let status = self.error.as_deref().unwrap_or(&self.catalog.status);
+        let status = ui.fit_text(Face::Regular, 12.0, status, content_w - 92.0);
+        ui.text(
+            Face::Regular,
+            12.0,
+            margin,
+            bar_y + 13.0,
+            if self.error.is_some() {
+                color::DANGER
+            } else {
+                color::MUTED
+            },
+            &status,
+        );
         button(
             &mut ui,
             &mut self.targets,
-            [w - 142.0, h - 52.0, 110.0, 32.0],
+            [w - margin - 72.0, bar_y + 9.0, 72.0, 30.0],
             "GitHub",
             Action::Repository,
             false,
@@ -1012,6 +1232,7 @@ impl Launcher {
                 &mut self.targets,
                 &self.catalog.config.name,
                 self.catalog.editing == Some("name"),
+                language,
             );
         }
         if let Some(chooser) = &mut self.chooser {
@@ -1041,14 +1262,12 @@ impl Launcher {
                 "name" => self.catalog.config.name.clone(),
                 "server" => self.catalog.config.server.clone(),
                 "render_scale" => self.catalog.render_scale_text.clone(),
-                _ => format!("Search: {}", self.catalog.query),
+                _ => self.catalog.query.clone(),
             };
             for ([x, y, w, _], action) in &self.targets {
-                if *action == Action::Field(name)
-                    || (name == "render_scale" && *action == Action::RenderScale)
-                {
-                    let text = ui.fit_text(Face::Medium, 16.0, &value, w - 24.0);
-                    let caret_x = x + 12.0 + ui.measure(Face::Medium, 16.0, &text);
+                if *action == Action::Field(name) {
+                    let text = ui.fit_text(Face::Medium, 15.0, &value, w - 24.0);
+                    let caret_x = x + 12.0 + ui.measure(Face::Medium, 15.0, &text);
                     ui.rounded(
                         caret_x.min(x + w - 10.0),
                         y + 12.0,
@@ -1146,6 +1365,7 @@ impl Launcher {
         }
         self.feedback = action.map(|action| (action, std::time::Instant::now()));
         self.focus = None;
+        let language = self.catalog.config.language;
         if action.is_some() && horizon_client::official_install::ready(&self.home) {
             let audio = self.audio.get_or_insert_with(|| {
                 let mut audio = horizon_client::audio::Audio::new(
@@ -1194,13 +1414,21 @@ impl Launcher {
             }
             Some(Action::PerformanceHints) => {
                 self.catalog.config.device.performance_hints ^= true;
-                self.catalog.status="ADPF gives Android CPU frame-work hints on supported devices. It does not cap FPS or guarantee a speedup.".into();
+                self.catalog.status = translate(
+                    language,
+                    "ADPF gives Android CPU frame-work hints on supported devices. It does not cap FPS or guarantee a speedup.",
+                )
+                .to_owned();
                 self.catalog.config.save(&self.home)?;
                 crate::device_runtime::configure(self.catalog.config.device);
             }
             Some(Action::GpuProfile) => {
                 self.catalog.config.device.gpu_profile ^= true;
-                self.catalog.status="Detailed GPU profiling records diagnostics and has overhead. Reports remain on this device.".into();
+                self.catalog.status = translate(
+                    language,
+                    "Detailed GPU profiling records diagnostics and has overhead. Reports remain on this device.",
+                )
+                .to_owned();
                 self.catalog.config.save(&self.home)?;
                 crate::device_runtime::configure(self.catalog.config.device);
             }
@@ -1226,9 +1454,17 @@ impl Launcher {
                 };
                 let id = crate::document_store::folder_id(self.catalog.config.profile, folder);
                 self.catalog.status = if crate::platform::open_documents(&id) {
-                    "Opened in Files. Return here after copying files.".into()
+                    translate(
+                        language,
+                        "Opened in Files. Return here after copying files.",
+                    )
+                    .to_owned()
                 } else {
-                    "Open the system Files app and choose Horizon Android.".into()
+                    translate(
+                        language,
+                        "Open the system Files app and choose Horizon Android.",
+                    )
+                    .to_owned()
                 };
             }
             Some(Action::Import(kind)) => {
@@ -1246,7 +1482,10 @@ impl Launcher {
             Some(Action::DeleteLocal(i)) => {
                 self.catalog.pending_delete = self.catalog.local.get(i).cloned();
                 if let Some(item) = &self.catalog.pending_delete {
-                    self.chooser = Some(super::chooser::Chooser::confirm_delete(item.file.clone()));
+                    self.chooser = Some(super::chooser::Chooser::confirm_delete(
+                        item.file.clone(),
+                        self.catalog.config.language,
+                    ));
                 }
             }
             Some(Action::ConfirmDeleteLocal) => {
@@ -1255,11 +1494,10 @@ impl Launcher {
             }
             Some(Action::Repository) => {
                 self.catalog.status = if crate::platform::open_repository() {
-                    "Repository opened in browser."
+                    translate(language, "Repository opened in browser.").to_owned()
                 } else {
-                    "No browser available to open the repository."
-                }
-                .into();
+                    translate(language, "No browser available to open the repository.").to_owned()
+                };
             }
             Some(Action::Account) => {
                 self.login.visible = true;
@@ -1328,6 +1566,12 @@ impl Launcher {
                 self.catalog.offset = self.catalog.offset.saturating_sub(12);
                 self.catalog.search(&self.home);
             }
+            Some(Action::Language) => self.open_chooser(chooser::Kind::Language),
+            Some(Action::ChooseLanguage(language)) => {
+                self.catalog.config.language = language;
+                self.catalog.config.save(&self.home)?;
+                self.chooser = None;
+            }
             Some(Action::Profile) => self.open_chooser(chooser::Kind::Profile),
             Some(Action::Renderer) => self.open_chooser(chooser::Kind::Renderer),
             Some(Action::RenderScale) => self.open_chooser(chooser::Kind::RenderScale),
@@ -1373,10 +1617,11 @@ impl Launcher {
             Some(Action::Logs) => {
                 self.catalog.status = crate::diagnostics::summary(&self.home);
                 if let Ok(error) = std::fs::read_to_string(self.home.join("android-error.txt")) {
-                    self.catalog.status = format!(
-                        "Last handled error: {}. {}",
-                        crate::diagnostics::redact(&error),
-                        self.catalog.status
+                    let summary = std::mem::take(&mut self.catalog.status);
+                    self.catalog.status = tr!(
+                        language,
+                        "Last handled error: {error}. {summary}",
+                        { error = crate::diagnostics::redact(&error), summary = summary }
                     );
                 }
             }
@@ -1384,8 +1629,11 @@ impl Launcher {
                 let home = self.home.clone();
                 let (sender, receiver) = mpsc::channel();
                 self.diagnostic_export = Some(receiver);
-                self.catalog.status =
-                    "Preparing local diagnostic ZIP. No upload; review before sharing.".into();
+                self.catalog.status = translate(
+                    language,
+                    "Preparing local diagnostic ZIP. No upload; review before sharing.",
+                )
+                .to_owned();
                 std::thread::spawn(move || {
                     let result = crate::diagnostics::export(&home).map(|p| {
                         p.file_name()
@@ -1404,12 +1652,22 @@ impl Launcher {
                 }
                 self.catalog.config.save(&self.home)?;
                 self.catalog.status = if self.catalog.config.record_performance {
-                    "Recording starts on Play. Detailed timings add overhead. Return here to save the report."
-                } else { "Performance recording off." }.into();
+                    translate(
+                        language,
+                        "Recording starts on Play. Detailed timings add overhead. Return here to save the report.",
+                    )
+                    .to_owned()
+                } else {
+                    translate(language, "Performance recording off.").to_owned()
+                };
             }
             Some(Action::ExportPerformance) => {
                 self.catalog.status = match crate::performance::export(&self.home) {
-                    Ok(()) => "Reports opened in Files. Copy or share a report from there.".into(),
+                    Ok(()) => translate(
+                        language,
+                        "Reports opened in Files. Copy or share a report from there.",
+                    )
+                    .to_owned(),
                     Err(e) => e,
                 };
             }

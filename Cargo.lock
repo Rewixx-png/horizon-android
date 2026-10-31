@@ -1444,6 +1444,7 @@ dependencies = [
  "log",
  "miniz_oxide 0.8.9",
  "naga",
+ "parking_lot",
  "png",
  "pollster",
  "regex",

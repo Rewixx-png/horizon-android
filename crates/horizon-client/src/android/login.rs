@@ -1,7 +1,11 @@
 //! Native account panel; authentication is shared with the desktop launcher.
 use super::pages::{Action, button};
 use crate::account::{self, Account, Accounts, Secrets, SignIn, SignInState};
-use horizon_client::ui_theme::{Face, Ui, color};
+use horizon_client::{
+    launcher_i18n::{Language, tr as translate},
+    tr,
+    ui_theme::{Face, Ui, color},
+};
 
 pub(super) struct Login {
     pub visible: bool,
@@ -11,6 +15,7 @@ pub(super) struct Login {
     auto_open_device: bool,
     state: Option<SignInState>,
     message: String,
+    language: Language,
 }
 impl Login {
     pub fn new() -> Self {
@@ -22,6 +27,7 @@ impl Login {
             auto_open_device: false,
             state: None,
             message: String::new(),
+            language: Language::English,
         };
         login.refresh_status();
         login
@@ -37,13 +43,20 @@ impl Login {
                 .is_some_and(|s| serde_json::from_str::<Secrets>(&s).is_ok())
         });
     }
-    pub fn status(&self, offline_name: &str) -> String {
+    pub fn status(&mut self, offline_name: &str, language: Language) -> String {
+        self.language = language;
         match (&self.profile, self.signed_in) {
-            (Some(name), true) => format!("Signed in: {name}"),
-            (Some(name), false) => format!("Sign in required: {name}"),
-            _ if self.pending() => "Signing in...".into(),
-            _ if !offline_name.trim().is_empty() => format!("Offline: {offline_name}"),
-            _ => "Offline / Sign in".into(),
+            (Some(name), true) => {
+                tr!(language, "Signed in: {name}", { name = name })
+            }
+            (Some(name), false) => {
+                tr!(language, "Sign in required: {name}", { name = name })
+            }
+            _ if self.pending() => tr!(language, "Signing in...").to_owned(),
+            _ if !offline_name.trim().is_empty() => {
+                tr!(language, "Offline: {name}", { name = offline_name })
+            }
+            _ => tr!(language, "Offline / Sign in").to_owned(),
         }
     }
 
@@ -79,9 +92,11 @@ impl Login {
                     }
                 }))
         {
-            self.message =
+            self.message = tr!(
+                self.language,
                 "Register our Microsoft public client application first, then enter its client ID."
-                    .into();
+            )
+            .to_owned();
             return;
         }
         self.message.clear();
@@ -93,7 +108,7 @@ impl Login {
             self.state = Some(task.state());
             if let Some(SignInState::Done(result)) = &self.state {
                 self.message = match result {
-                    Ok(a) => format!("Signed in as {}", a.name),
+                    Ok(a) => tr!(self.language, "Signed in as {name}", { name = a.name }),
                     Err(e) => e.clone(),
                 };
                 self.task = None;
@@ -114,7 +129,7 @@ impl Login {
                 .remove(account::store(), &a.uuid)
                 .and_then(|_| accounts.save())
             {
-                Ok(()) => "Signed out. Offline play is available.".into(),
+                Ok(()) => tr!(self.language, "Signed out. Offline play is available.").to_owned(),
                 Err(e) => e,
             };
         }
@@ -123,9 +138,13 @@ impl Login {
     pub fn copy_code(&mut self) {
         if let Some(SignInState::Code(code)) = &self.state {
             self.message = if crate::platform::copy_login_code(&code.user_code) {
-                "Code copied. Paste it on the Microsoft page.".into()
+                tr!(
+                    self.language,
+                    "Code copied. Paste it on the Microsoft page."
+                )
+                .to_owned()
             } else {
-                "Could not copy the code. Try again.".into()
+                tr!(self.language, "Could not copy the code. Try again.").to_owned()
             };
         }
     }
@@ -164,39 +183,68 @@ impl Login {
         Ok(Some((a, secrets)))
     }
     pub fn draw(
-        &self,
+        &mut self,
         ui: &mut Ui,
         targets: &mut Vec<([f32; 4], Action)>,
         offline_name: &str,
         editing_name: bool,
+        language: Language,
     ) {
         targets.clear();
-        let w = (ui.w - 32.0).min(720.0);
-        let h = (ui.h - 24.0).min(550.0);
+        ui.rounded(
+            0.0,
+            0.0,
+            ui.w,
+            ui.h,
+            0.0,
+            horizon_client::hud::rgba(0, 0, 0, 140),
+        );
+        let w = (ui.w - 32.0).min(640.0);
+        let h = (ui.h - 32.0).min(560.0);
         let x = (ui.w - w) / 2.0;
         let y = (ui.h - h) / 2.0;
-        ui.rounded(x, y, w, h, 8.0, color::BG);
+        ui.rounded(x, y, w, h, 12.0, color::SURFACE);
+        ui.border(x, y, w, h, 12.0, color::BORDER);
+        let compact = h < 550.0;
+        let code_state = matches!(self.state, Some(SignInState::Code(_)));
+        let message_y = if compact {
+            y + if code_state { 126.0 } else { 102.0 }
+        } else {
+            y + 166.0
+        };
+        let message_lines = if compact { 2 } else { 5 };
+        let message_size = if compact { 13.0 } else { 14.0 };
+        let message_line = if compact { 18.0 } else { 20.0 };
+        let offline_label_y = if compact { y + 150.0 } else { y + h - 247.0 };
+        let offline_field_y = if compact { y + 168.0 } else { y + h - 226.0 };
+        let primary_y = if compact {
+            y + h - 104.0
+        } else {
+            y + h - 148.0
+        };
+        let secondary_y = if compact { y + h - 54.0 } else { y + h - 98.0 };
+        let show_offline = !self.pending() && (!compact || h >= 320.0);
         if editing_name {
             ui.text(
                 Face::Medium,
-                24.0,
+                22.0,
                 x + 20.0,
-                y + 20.0,
+                y + 22.0,
                 color::TEXT,
-                "Offline player name",
+                tr!(language, "Offline player name"),
             );
             ui.text(
                 Face::Regular,
-                16.0,
+                14.0,
                 x + 20.0,
-                y + 66.0,
+                y + 62.0,
                 color::MUTED,
-                "Used when signed out of Microsoft.",
+                tr!(language, "Used when signed out of Microsoft."),
             );
             button(
                 ui,
                 targets,
-                [x + 20.0, y + 100.0, w - 40.0, 44.0],
+                [x + 20.0, y + 96.0, w - 40.0, 48.0],
                 offline_name,
                 Action::Field("name"),
                 false,
@@ -204,8 +252,8 @@ impl Login {
             button(
                 ui,
                 targets,
-                [x + 20.0, y + h - 56.0, w - 40.0, 36.0],
-                "Done",
+                [x + 20.0, y + h - 60.0, w - 40.0, 44.0],
+                tr!(language, "Done"),
                 Action::FinishNameEdit,
                 true,
             );
@@ -214,15 +262,16 @@ impl Login {
 
         ui.text(
             Face::Medium,
-            24.0,
+            22.0,
             x + 20.0,
-            y + 18.0,
+            y + 22.0,
             color::TEXT,
-            "Accounts",
+            tr!(language, "Accounts"),
         );
+        let status = self.status(offline_name, language);
         ui.text(
             Face::Medium,
-            18.0,
+            15.0,
             x + 20.0,
             y + 58.0,
             if self.signed_in {
@@ -230,34 +279,47 @@ impl Login {
             } else {
                 color::MUTED
             },
-            &self.status(offline_name),
+            &status,
         );
         if let Some(SignInState::Code(code)) = &self.state {
+            let label = tr!(language, "{code}    /    Copy code", {
+                code = code.user_code
+            });
             button(
                 ui,
                 targets,
-                [x + 20.0, y + 96.0, w - 40.0, 48.0],
-                &format!("{}    /    Copy code", code.user_code),
+                [
+                    x + 20.0,
+                    if compact { y + 72.0 } else { y + 96.0 },
+                    w - 40.0,
+                    if compact { 42.0 } else { 48.0 },
+                ],
+                &label,
                 Action::CopyLoginCode,
                 false,
             );
         } else {
             ui.text(
                 Face::Regular,
-                16.0,
+                14.0,
                 x + 20.0,
-                y + 104.0,
+                if compact { y + 72.0 } else { y + 100.0 },
                 color::TEXT,
-                if self.signed_in {
-                    "Account saved securely. Sessions renew automatically."
-                } else {
-                    "Your password is entered in Microsoft's browser."
-                },
+                translate(
+                    language,
+                    if self.signed_in {
+                        "Account saved securely. Sessions renew automatically."
+                    } else {
+                        "Your password is entered in Microsoft's browser."
+                    },
+                ),
             );
         }
         let text = match &self.state {
-            Some(SignInState::Starting) => "Requesting a sign-in code...",
-            _ => &self.message,
+            Some(SignInState::Starting) => {
+                translate(language, "Requesting a sign-in code...").to_owned()
+            }
+            _ => self.message.clone(),
         };
         let limit = ((w - 40.0) / 7.5).max(20.0) as usize;
         let mut line = String::new();
@@ -266,15 +328,15 @@ impl Login {
             if line.len() + word.len() + 1 > limit {
                 ui.text(
                     Face::Regular,
-                    14.0,
+                    message_size,
                     x + 20.0,
-                    y + 166.0 + row as f32 * 20.0,
+                    message_y + row as f32 * message_line,
                     color::TEXT,
                     &line,
                 );
                 row += 1;
                 line.clear();
-                if row >= 5 {
+                if row >= message_lines {
                     break;
                 }
             }
@@ -283,31 +345,36 @@ impl Login {
             }
             line.push_str(word);
         }
-        if row < 5 {
+        if row < message_lines {
             ui.text(
                 Face::Regular,
-                14.0,
+                message_size,
                 x + 20.0,
-                y + 166.0 + row as f32 * 20.0,
+                message_y + row as f32 * message_line,
                 color::TEXT,
                 &line,
             );
         }
-        if !self.pending() {
+        if show_offline {
             ui.text(
                 Face::Regular,
-                14.0,
+                13.0,
                 x + 20.0,
-                y + h - 247.0,
+                offline_label_y,
                 color::MUTED,
-                "Offline player name",
+                tr!(language, "Offline player name"),
             );
             button(
                 ui,
                 targets,
-                [x + 20.0, y + h - 226.0, w - 40.0, 38.0],
+                [
+                    x + 20.0,
+                    offline_field_y,
+                    w - 40.0,
+                    if compact { 40.0 } else { 44.0 },
+                ],
                 if offline_name.is_empty() {
-                    "Enter an offline name"
+                    tr!(language, "Enter an offline name")
                 } else {
                     offline_name
                 },
@@ -316,34 +383,48 @@ impl Login {
             );
         }
         let half = (w - 52.0) / 2.0;
-        if self.message.contains("not approved by Mojang") {
+        if !compact && self.message.contains("not approved by Mojang") {
             button(
                 ui,
                 targets,
-                [x + 20.0, y + h - 183.0, w - 40.0, 30.0],
-                "Request Minecraft API approval",
+                [x + 20.0, y + h - 183.0, w - 40.0, 34.0],
+                tr!(language, "Request Minecraft API approval"),
                 Action::ReviewApp,
                 false,
             );
         }
         let (label, action) = if matches!(self.state, Some(SignInState::Code(_))) {
-            ("Copy code and open browser", Action::LoginLink)
+            (
+                translate(language, "Copy code and open browser"),
+                Action::LoginLink,
+            )
         } else if self.pending() {
-            ("Restart browser sign-in", Action::SignIn)
+            (
+                translate(language, "Restart browser sign-in"),
+                Action::SignIn,
+            )
         } else {
             (
-                if self.signed_in {
-                    "Switch Microsoft account"
-                } else {
-                    "Sign in with browser"
-                },
+                translate(
+                    language,
+                    if self.signed_in {
+                        "Switch Microsoft account"
+                    } else {
+                        "Sign in with browser"
+                    },
+                ),
                 Action::SignIn,
             )
         };
         button(
             ui,
             targets,
-            [x + 20.0, y + h - 148.0, w - 40.0, 42.0],
+            [
+                x + 20.0,
+                primary_y,
+                w - 40.0,
+                if compact { 44.0 } else { 48.0 },
+            ],
             label,
             action,
             true,
@@ -351,47 +432,45 @@ impl Login {
         button(
             ui,
             targets,
-            [x + 20.0, y + h - 98.0, half, 38.0],
-            "Use a device code instead",
+            [x + 20.0, secondary_y, half, 40.0],
+            tr!(language, "Use a device code instead"),
             Action::DeviceSignIn,
             false,
         );
         button(
             ui,
             targets,
-            [x + 32.0 + half, y + h - 98.0, half, 38.0],
+            [x + 32.0 + half, secondary_y, half, 40.0],
             if self.pending() {
-                "Cancel sign-in"
+                tr!(language, "Cancel sign-in")
+            } else if self.profile.is_some() {
+                tr!(language, "Sign out")
             } else {
-                if self.profile.is_some() {
-                    "Sign out"
-                } else {
-                    "Close"
-                }
+                tr!(language, "Close")
             },
             if self.pending() {
                 Action::CancelLogin
+            } else if self.profile.is_some() {
+                Action::SignOut
             } else {
-                if self.profile.is_some() {
-                    Action::SignOut
+                Action::CloseLogin
+            },
+            false,
+        );
+        if !compact {
+            button(
+                ui,
+                targets,
+                [x + 20.0, y + h - 52.0, w - 40.0, 36.0],
+                if self.pending() {
+                    tr!(language, "Back (sign-in continues)")
                 } else {
-                    Action::CloseLogin
-                }
-            },
-            false,
-        );
-        button(
-            ui,
-            targets,
-            [x + 20.0, y + h - 52.0, w - 40.0, 36.0],
-            if self.pending() {
-                "Back (sign-in continues)"
-            } else {
-                "Done"
-            },
-            Action::CloseLogin,
-            false,
-        );
+                    tr!(language, "Done")
+                },
+                Action::CloseLogin,
+                false,
+            );
+        }
     }
 }
 impl Drop for Login {

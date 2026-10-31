@@ -6,6 +6,7 @@ in the [Android guide](android.md#check).
 
 | Horizon feature | Android integration / remaining work |
 |---|---|
+| Launcher language | English and Russian from Settings > Language; the game keeps its own Options > Language setting |
 | Controller action mapping | Touch uses the same actions, default Java eight-direction or optional analog movement, and toggle sneak. Hardware controller enumeration/stick input still needs a native Android backend; do not infer it from desktop gilrs support |
 | Touch layouts | Four explicit schemes, normal Options > Controls settings, 16–64 px circle, optional 360-degree movement, sprint visibility, editable layouts, custom key buttons, global size and per-button scale/opacity sliders, handedness and direct F3/F5 buttons; passive HUD safe-area margins are in Accessibility |
 | Contextual touch | Use action for held items/entities; movement actions serve flight/swimming. Not all Bedrock contextual icons/gestures are implemented |

@@ -1413,10 +1413,18 @@ dependencies = [
 name = "horizon-1-16-5"
 version = "0.1.0"
 dependencies = [
+ "android_logger",
+ "bytemuck",
  "horizon-core",
  "horizon-protocol",
  "horizon-world",
+ "log",
+ "png",
+ "pollster",
  "serde_json",
+ "wgpu",
+ "winit",
+ "zip",
 ]
 
 [[package]]

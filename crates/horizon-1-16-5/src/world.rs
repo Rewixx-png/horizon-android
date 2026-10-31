@@ -128,6 +128,63 @@ impl World {
     pub fn is_empty(&self) -> bool {
         self.chunks.is_empty()
     }
+
+    /// The `minecraft:air` state: the state the world was loaded with, or a
+    /// bare `minecraft:air` if the table does not hold it.
+    pub fn air_state(&self) -> BlockState {
+        self.table
+            .state(self.air)
+            .cloned()
+            .unwrap_or_else(air_state)
+    }
+
+    /// The block-table state id at world coordinates.
+    ///
+    /// A loaded chunk returns its id, or the air id where the y is outside
+    /// 0..256 or the section was not saved. A position without a loaded
+    /// chunk is `None`.
+    pub fn state_id_at(&self, x: i32, y: i32, z: i32) -> Option<u16> {
+        let column = self.chunks.get(&(x >> 4, z >> 4))?;
+        if !(0..256).contains(&y) {
+            return Some(self.air);
+        }
+        Some(match column.section((y >> 4) as usize) {
+            Some(section) => section[(((y & 15) << 8) | ((z & 15) << 4) | (x & 15)) as usize],
+            None => self.air,
+        })
+    }
+
+    /// Writes a block-table state id at world coordinates.
+    ///
+    /// Errors when no chunk is loaded at the position or the y is outside
+    /// 0..256. A missing section is created filled with air.
+    pub fn set_state_id(&mut self, x: i32, y: i32, z: i32, id: u16) -> Result<(), String> {
+        if !(0..256).contains(&y) {
+            return Err(format!("block y {y} is outside 0..256"));
+        }
+        let air = self.air;
+        let column = self
+            .chunks
+            .get_mut(&(x >> 4, z >> 4))
+            .ok_or_else(|| format!("no chunk loaded at ({}, {})", x >> 4, z >> 4))?;
+        let section = column.sections[(y >> 4) as usize]
+            .get_or_insert_with(|| Box::new([air; SECTION_BLOCKS]));
+        section[(((y & 15) << 8) | ((z & 15) << 4) | (x & 15)) as usize] = id;
+        Ok(())
+    }
+
+    /// Writes a block state at world coordinates, resolving it through the
+    /// block table.
+    ///
+    /// Errors when the state is not in the table, no chunk is loaded at the
+    /// position or the y is outside 0..256.
+    pub fn set_state(&mut self, x: i32, y: i32, z: i32, state: &BlockState) -> Result<(), String> {
+        let id = self
+            .table
+            .state_id(state)
+            .ok_or_else(|| format!("{} is not in the 1.16.5 block table", describe(state)))?;
+        self.set_state_id(x, y, z, id)
+    }
 }
 
 impl BlockSource for World {
@@ -235,6 +292,40 @@ impl ChunkColumn {
     /// order, or `None` where the chunk did not save one (air).
     pub fn section(&self, index: usize) -> Option<&[u16; SECTION_BLOCKS]> {
         self.sections.get(index).and_then(Option::as_deref)
+    }
+
+    /// The block-table state id at block coordinates local to the column.
+    ///
+    /// `None` for a coordinate outside 0..16 or where the section was not
+    /// saved (a missing section reads as air).
+    pub fn state_id(&self, x: usize, y: usize, z: usize) -> Option<u16> {
+        if x >= 16 || y >= 16 || z >= 16 {
+            return None;
+        }
+        self.sections[y >> 4]
+            .as_deref()
+            .map(|section| section[(y << 8) | (z << 4) | x])
+    }
+
+    /// Writes a block-table state id at section-local block coordinates
+    /// (each axis in 0..16, addressing the bottom section), creating that
+    /// section filled with `air` where the column did not save one.
+    ///
+    /// Errors for a coordinate outside 0..16 on any axis.
+    pub fn set_state_id(
+        &mut self,
+        x: usize,
+        y: usize,
+        z: usize,
+        id: u16,
+        air: u16,
+    ) -> Result<(), String> {
+        if x >= 16 || y >= 16 || z >= 16 {
+            return Err(format!("block ({x}, {y}, {z}) is outside 0..16"));
+        }
+        let section = self.sections[y >> 4].get_or_insert_with(|| Box::new([air; SECTION_BLOCKS]));
+        section[(y << 8) | (z << 4) | x] = id;
+        Ok(())
     }
 
     /// The raw 1024-entry biome grid, ordered Y (outermost), then Z, then X:
@@ -697,6 +788,189 @@ mod tests {
         // No chunk at all is None.
         assert_eq!(world.state_at(0, 0, 0), None);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn chunk_column_writes_round_trip_air_stone_air() {
+        let table = test_table();
+        let air = table.state_id(&BlockState::new("minecraft:air")).unwrap();
+        let stone = table.state_id(&BlockState::new("minecraft:stone")).unwrap();
+        // One stone block at (3, 2, 1) in section 0; no section above.
+        let palette = vec![entry("minecraft:air", None), entry("minecraft:stone", None)];
+        let mut values = vec![0u64; SECTION_BLOCKS];
+        values[531] = 1;
+        let root = chunk_root(
+            vec![section_tag(0, palette, Some(pack(&values, 4)))],
+            None,
+            0,
+            0,
+        );
+        let mut column = ChunkColumn::from_nbt(&root, ChunkPos::new(0, 0), &table)
+            .unwrap()
+            .unwrap();
+        assert_eq!(column.state_id(3, 2, 1), Some(stone));
+        assert_eq!(column.state_id(4, 2, 1), Some(air));
+        assert!(column.section(1).is_none());
+
+        // Air -> stone at a block that was air, then stone -> air again.
+        column.set_state_id(4, 2, 1, stone, air).unwrap();
+        assert_eq!(column.state_id(4, 2, 1), Some(stone));
+        column.set_state_id(3, 2, 1, air, air).unwrap();
+        assert_eq!(column.state_id(3, 2, 1), Some(air));
+        assert_eq!(column.state_id(4, 2, 1), Some(stone));
+    }
+
+    #[test]
+    fn chunk_column_allocates_a_missing_section() {
+        let table = test_table();
+        let air = table.state_id(&BlockState::new("minecraft:air")).unwrap();
+        let stone = table.state_id(&BlockState::new("minecraft:stone")).unwrap();
+        // A chunk whose only section is out of range (Y=-1) decodes to a
+        // column with no sections at all.
+        let root = chunk_root(vec![compound(&[("Y", Tag::Byte(-1))])], None, 0, 0);
+        let mut column = ChunkColumn::from_nbt(&root, ChunkPos::new(0, 0), &table)
+            .unwrap()
+            .unwrap();
+        assert!(column.section(0).is_none());
+        assert_eq!(column.state_id(5, 2, 5), None);
+
+        // The write allocates the missing section filled with air.
+        column.set_state_id(5, 2, 5, stone, air).unwrap();
+        let section = column.section(0).unwrap();
+        assert_eq!(section[(2 << 8) | (5 << 4) | 5], stone);
+        assert_eq!(section.iter().filter(|&&id| id != air).count(), 1);
+        assert_eq!(column.state_id(5, 2, 5), Some(stone));
+        assert_eq!(column.state_id(5, 1, 5), Some(air));
+    }
+
+    #[test]
+    fn chunk_column_rejects_out_of_range_coordinates() {
+        let table = test_table();
+        let air = table.state_id(&BlockState::new("minecraft:air")).unwrap();
+        let stone = table.state_id(&BlockState::new("minecraft:stone")).unwrap();
+        let root = chunk_root(
+            vec![section_tag(0, vec![entry("minecraft:air", None)], None)],
+            None,
+            0,
+            0,
+        );
+        let mut column = ChunkColumn::from_nbt(&root, ChunkPos::new(0, 0), &table)
+            .unwrap()
+            .unwrap();
+        for (x, y, z) in [
+            (16usize, 0usize, 0usize),
+            (0, 16, 0),
+            (0, 0, 16),
+            (16, 16, 16),
+        ] {
+            let error = column.set_state_id(x, y, z, stone, air).unwrap_err();
+            assert!(error.contains("outside 0..16"), "{error}");
+            assert_eq!(column.state_id(x, y, z), None);
+        }
+    }
+
+    #[test]
+    fn world_mutates_states_and_reports_errors() {
+        let table = test_table();
+        let air = table.state_id(&BlockState::new("minecraft:air")).unwrap();
+        let stone = table.state_id(&BlockState::new("minecraft:stone")).unwrap();
+        let dir = temp_dir("mutation");
+        let region_path = dir.join("region").join("r.0.0.mca");
+        let mut writer = RegionWriter::create(&region_path).unwrap();
+        // Chunk (0, 0), all air, section 0 only.
+        let root = chunk_root(
+            vec![section_tag(0, vec![entry("minecraft:air", None)], None)],
+            None,
+            0,
+            0,
+        );
+        writer
+            .write(
+                ChunkPos::new(0, 0),
+                &ChunkRecord::from_nbt(&root, Compression::Zlib, 0, Limits::saved()).unwrap(),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        let mut world = World::open(&dir, table).unwrap();
+        assert_eq!(world.air_state(), BlockState::new("minecraft:air"));
+        assert_eq!(world.state_id_at(0, 0, 0), Some(air));
+        assert_eq!(world.state_id_at(0, 200, 0), Some(air));
+        // Out-of-range y in a loaded chunk is air; no chunk at all is None.
+        assert_eq!(world.state_id_at(0, -1, 0), Some(air));
+        assert_eq!(world.state_id_at(0, 256, 0), Some(air));
+        assert_eq!(world.state_id_at(64, 0, 0), None);
+
+        // Air -> stone through the table-resolving write; the missing
+        // section 12 is created, and `state_at` sees the new block.
+        world
+            .set_state(3, 2, 1, &BlockState::new("minecraft:stone"))
+            .unwrap();
+        assert_eq!(world.state_id_at(3, 2, 1), Some(stone));
+        assert_eq!(
+            world.state_at(3, 2, 1),
+            Some(BlockState::new("minecraft:stone"))
+        );
+        world
+            .set_state(3, 200, 1, &BlockState::new("minecraft:stone"))
+            .unwrap();
+        assert_eq!(world.state_id_at(3, 200, 1), Some(stone));
+        // Stone -> air by raw id.
+        world.set_state_id(3, 2, 1, air).unwrap();
+        assert_eq!(world.state_id_at(3, 2, 1), Some(air));
+        assert_eq!(
+            world.state_at(3, 2, 1),
+            Some(BlockState::new("minecraft:air"))
+        );
+
+        // Unknown states, unloaded chunks and out-of-range y are errors.
+        let error = world
+            .set_state(0, 0, 0, &BlockState::new("minecraft:not_a_block"))
+            .unwrap_err();
+        assert!(error.contains("not in the 1.16.5 block table"), "{error}");
+        assert!(error.contains("minecraft:not_a_block"), "{error}");
+        assert!(
+            world
+                .set_state(64, 0, 0, &BlockState::new("minecraft:stone"))
+                .is_err()
+        );
+        assert!(
+            world
+                .set_state_id(64, 0, 0, stone)
+                .unwrap_err()
+                .contains("no chunk loaded")
+        );
+        for y in [-1, 256] {
+            let error = world.set_state_id(0, y, 0, stone).unwrap_err();
+            assert!(error.contains("outside 0..256"), "{error}");
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn first_and_default_state_resolve_bare_and_namespaced_names() {
+        let table = test_table();
+        // Bare and namespaced names resolve to the same state.
+        assert_eq!(
+            table.first_state("stone").unwrap(),
+            BlockState::new("minecraft:stone")
+        );
+        assert_eq!(
+            table.first_state("minecraft:stone").unwrap(),
+            BlockState::new("minecraft:stone")
+        );
+        // The table does not store the `default` flag, so `default_state`
+        // is the lowest-id state: oak_log{axis=x} (id 2), not the entry the
+        // test JSON marks `default`.
+        let first = table.first_state("oak_log").unwrap();
+        assert_eq!(first.properties.get("axis").map(String::as_str), Some("x"));
+        assert_eq!(table.default_state("oak_log").unwrap(), first);
+        assert_eq!(
+            table.default_state("stone").unwrap(),
+            BlockState::new("minecraft:stone")
+        );
+        assert!(table.first_state("not_a_block").is_none());
+        assert!(table.default_state("not_a_block").is_none());
     }
 
     #[test]

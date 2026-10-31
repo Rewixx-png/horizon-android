@@ -154,6 +154,15 @@ struct RawFace {
 /// The `minecraft:missingno` fallback for unresolvable texture variables.
 const MISSING_TEXTURE: &str = "minecraft:missingno";
 
+/// The raw JSON of one format-6 model pack, before parent resolution.
+/// Paths are relative to the pack's `assets/minecraft` folder and use `/`,
+/// e.g. `blockstates/stone.json` or `models/block/cube_all.json`.
+#[derive(Default)]
+struct ModelFiles {
+    blockstates: Vec<(String, String)>,
+    models: Vec<(String, String)>,
+}
+
 impl ModelPack {
     /// Loads every blockstate and model under `root/blockstates` and
     /// `root/models`, where `root` is the pack's `assets/minecraft` folder.
@@ -162,7 +171,7 @@ impl ModelPack {
     /// parent, parent cycle) are simply never selectable, matching the
     /// "unsupported -> `None`" contract of [`ModelSource`].
     pub fn load(root: &Path) -> Result<Self, String> {
-        Self::load_impl(root, false)
+        Self::from_model_files(read_directory(root)?, false)
     }
 
     /// Like [`Self::load`], but a malformed or unsupported blockstate/model
@@ -170,33 +179,28 @@ impl ModelPack {
     /// rest of a pack usable and substitutes its missing model; the lenient
     /// path mirrors that for real 1.16.5 data.
     pub fn load_lenient(root: &Path) -> Result<Self, String> {
-        Self::load_impl(root, true)
+        Self::from_model_files(read_directory(root)?, true)
     }
 
-    fn load_impl(root: &Path, lenient: bool) -> Result<Self, String> {
-        let blockstates_dir = root.join("blockstates");
-        let models_dir = root.join("models");
-        if !blockstates_dir.is_dir() {
-            return Err(format!("{}: not a directory", blockstates_dir.display()));
-        }
-        if !models_dir.is_dir() {
-            return Err(format!("{}: not a directory", models_dir.display()));
-        }
-        let mut blockstate_files = Vec::new();
-        let mut model_files = Vec::new();
-        collect_json(&blockstates_dir, &mut blockstate_files)?;
-        collect_json(&models_dir, &mut model_files)?;
+    /// Loads the vanilla blockstates and models straight from a 1.16.5
+    /// client jar's `assets/minecraft` tree. Vanilla's own files are read
+    /// leniently: a file this loader cannot bake is skipped, as vanilla
+    /// substitutes its missing model, instead of rejecting the whole jar.
+    pub fn load_client_jar(jar_path: &Path) -> Result<Self, String> {
+        Self::from_model_files(read_client_jar(jar_path)?, true)
+    }
 
+    fn from_model_files(files: ModelFiles, lenient: bool) -> Result<Self, String> {
         let mut blockstates = HashMap::new();
-        for path in blockstate_files {
+        for (relative, text) in files.blockstates {
+            let path = Path::new(&relative);
             let name = format!(
                 "minecraft:{}",
                 path.file_stem()
                     .and_then(|stem| stem.to_str())
-                    .ok_or_else(|| format!("{}: not a valid file name", path.display()))?
+                    .ok_or_else(|| format!("{relative}: not a valid file name"))?
             );
-            let parsed = read_json(&path).and_then(|text| parse_blockstate(&path, &text));
-            match parsed {
+            match parse_blockstate(path, &text) {
                 Ok(definition) => {
                     blockstates.insert(name, definition);
                 }
@@ -206,17 +210,16 @@ impl ModelPack {
         }
 
         let mut raw_models = HashMap::new();
-        for path in model_files {
-            let relative = path
-                .strip_prefix(&models_dir)
-                .map_err(|_| format!("{}: outside the models folder", path.display()))?;
-            let mut name = relative.to_string_lossy().replace('\\', "/");
+        for (relative, text) in files.models {
+            let mut name = relative
+                .strip_prefix("models/")
+                .unwrap_or(&relative)
+                .to_owned();
             if name.ends_with(".json") {
                 name.truncate(name.len() - ".json".len());
             }
             let name = format!("minecraft:{name}");
-            let parsed = read_json(&path).and_then(|text| parse_model(&path, &text));
-            match parsed {
+            match parse_model(Path::new(&relative), &text) {
                 Ok(model) => {
                     raw_models.insert(name, model);
                 }
@@ -1300,6 +1303,85 @@ impl<'a> Scan<'a> {
 }
 
 // --- Loading helpers --------------------------------------------------------
+
+/// Reads the blockstate and model JSON of an extracted
+/// `assets/minecraft` folder. Subdirectories are walked recursively; paths
+/// in the result are relative to `root` and slash-separated.
+fn read_directory(root: &Path) -> Result<ModelFiles, String> {
+    let blockstates_dir = root.join("blockstates");
+    let models_dir = root.join("models");
+    if !blockstates_dir.is_dir() {
+        return Err(format!("{}: not a directory", blockstates_dir.display()));
+    }
+    if !models_dir.is_dir() {
+        return Err(format!("{}: not a directory", models_dir.display()));
+    }
+    let mut blockstate_paths = Vec::new();
+    let mut model_paths = Vec::new();
+    collect_json(&blockstates_dir, &mut blockstate_paths)?;
+    collect_json(&models_dir, &mut model_paths)?;
+    let mut files = ModelFiles::default();
+    for path in blockstate_paths {
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| format!("{}: outside the pack", path.display()))?;
+        files.blockstates.push((
+            relative.to_string_lossy().replace('\\', "/"),
+            read_json(&path)?,
+        ));
+    }
+    for path in model_paths {
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| format!("{}: outside the pack", path.display()))?;
+        files.models.push((
+            relative.to_string_lossy().replace('\\', "/"),
+            read_json(&path)?,
+        ));
+    }
+    Ok(files)
+}
+
+/// Reads the blockstate and model JSON of a client jar's
+/// `assets/minecraft` tree.
+fn read_client_jar(jar_path: &Path) -> Result<ModelFiles, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(jar_path).map_err(|e| format!("{}: {e}", jar_path.display()))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| format!("{}: not a client jar: {e}", jar_path.display()))?;
+    let mut entries = Vec::new();
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index(index)
+            .map_err(|e| format!("{}: {e}", jar_path.display()))?;
+        let Some(relative) = entry.name().strip_prefix("assets/minecraft/") else {
+            continue;
+        };
+        if relative.ends_with(".json")
+            && (relative.starts_with("blockstates/") || relative.starts_with("models/"))
+        {
+            entries.push(relative.to_owned());
+        }
+    }
+    entries.sort();
+    let mut files = ModelFiles::default();
+    for relative in entries {
+        let archive_name = format!("assets/minecraft/{relative}");
+        let mut entry = archive
+            .by_name(&archive_name)
+            .map_err(|e| format!("{}: {e}", jar_path.display()))?;
+        let mut text = String::new();
+        entry
+            .read_to_string(&mut text)
+            .map_err(|e| format!("{archive_name}: {e}"))?;
+        if relative.starts_with("models/") {
+            files.models.push((relative, text));
+        } else {
+            files.blockstates.push((relative, text));
+        }
+    }
+    Ok(files)
+}
 
 fn read_json(path: &Path) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))

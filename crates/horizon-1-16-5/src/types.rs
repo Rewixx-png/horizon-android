@@ -198,6 +198,28 @@ impl BlockTable {
         self.ids.get(state).copied()
     }
 
+    /// The lowest-id state of a block, by name.
+    ///
+    /// The name may be bare (`stone`) or namespaced (`minecraft:stone`); a
+    /// bare name is read as `minecraft:<name>`. Returns `None` when the
+    /// table has no state with that name.
+    pub fn first_state(&self, name: &str) -> Option<BlockState> {
+        let full = if name.contains(':') {
+            name.to_owned()
+        } else {
+            format!("minecraft:{name}")
+        };
+        self.states.iter().find(|state| state.name == full).cloned()
+    }
+
+    /// The default state of a block, by name.
+    ///
+    /// The table does not store the `default` flag, so this is the lowest-id
+    /// state of the block: the same state `first_state` returns.
+    pub fn default_state(&self, name: &str) -> Option<BlockState> {
+        self.first_state(name)
+    }
+
     pub fn len(&self) -> usize {
         self.states.len()
     }

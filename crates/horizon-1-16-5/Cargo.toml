@@ -6,11 +6,28 @@ license.workspace = true
 rust-version.workspace = true
 description = "Native Minecraft 1.16.5 world, resource-pack and chunk-mesh foundation"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
+bytemuck = { version = "1.24", features = ["derive"] }
 horizon-core = { path = "../horizon-core" }
 horizon-protocol = { path = "../horizon-protocol" }
 horizon-world = { path = "../horizon-world" }
+png = "0.18"
+pollster = "0.4"
 serde_json = "1.0.151"
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "gles", "vulkan", "metal", "wgsl", "naga-ir"] }
+winit = { version = "0.30.13", features = ["android-native-activity"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15"
+log = "0.4"
+
+[[bin]]
+name = "horizon-1165"
+path = "src/bin/play.rs"
 
 [lints]
 workspace = true

@@ -1,0 +1,102 @@
+# Developer APK for the native 1.16.5 target. It builds one arm64 APK from the
+# pinned Mojang inputs on the runner, uploads it as an artifact, and creates a
+# *draft* release. The APK contains the private client jar and fixture world,
+# so it must not be published as a public redistribution; publish only after
+# moving resource delivery to the device (the public 26.3 packaging rule).
+name: Android 1.16.5 dev APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [1.16.5]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-1165-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      CARGO_BUILD_JOBS: "4"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android/sdk/ndk/26.* /usr/local/lib/android/sdk/system-images
+          sudo apt-get clean
+          df -h /
+
+      - name: Install Android SDK, build tools and NDK
+        run: |
+          sdk="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          manager="$sdk/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$manager" ]; then
+            manager="$(command -v sdkmanager)"
+          fi
+          yes | "$manager" --licenses >/dev/null
+          "$manager" --sdk_root="$sdk" "platforms;android-35" "build-tools;35.0.0" "ndk;28.2.13676358"
+          echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$sdk" >> "$GITHUB_ENV"
+
+      - name: Install the Android Rust target
+        run: rustup target add aarch64-linux-android
+
+      - name: Install Gradle 8.14.3
+        run: |
+          curl -fsSL https://services.gradle.org/distributions/gradle-8.14.3-bin.zip -o "$RUNNER_TEMP/gradle.zip"
+          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
+          echo "GRADLE=$RUNNER_TEMP/gradle-8.14.3/bin/gradle" >> "$GITHUB_ENV"
+
+      - name: Cache the private 1.16.5 inputs and tables
+        uses: actions/cache@v4
+        with:
+          path: .local/versions/1.16.5
+          key: horizon-1165-${{ hashFiles('docs/versions/1.16.5.lock.json') }}
+
+      - name: Download and verify Mojang inputs, generate tables
+        run: python3 tools/prepare_1165.py --assets
+
+      - name: Generate the flat fixture world
+        run: python3 tools/make_1165_fixture.py
+
+      - name: Build the arm64 developer APK
+        run: |
+          python3 tools/android_build_1165.py \
+            --abi arm64-v8a \
+            --sdk "$ANDROID_HOME" \
+            --gradle "$GRADLE"
+
+      - name: Write checksums
+        run: |
+          cd .local/android-1165/apk/arm64-v8a
+          sha256sum horizon-1165-dev.apk > SHA256SUMS.txt
+
+      - name: Upload the APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizon-1165-dev-arm64-v8a
+          path: |
+            .local/android-1165/apk/arm64-v8a/horizon-1165-dev.apk
+            .local/android-1165/apk/arm64-v8a/SHA256SUMS.txt
+
+      - name: Create a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v1.16.5-dev.${GITHUB_RUN_ID}"
+          apk=".local/android-1165/apk/arm64-v8a/horizon-1165-dev.apk"
+          sums=".local/android-1165/apk/arm64-v8a/SHA256SUMS.txt"
+          notes="Developer 1.16.5 slice built from ${GITHUB_SHA} for arm64-v8a. This APK bundles the private prepared client jar, tables and fixture world; it is a draft and must not be published as a public redistribution. Touch: left joystick, right look/tap-break, bottom-right place. No save/load yet."
+          gh release create "$tag" "$apk" "$sums" LICENSE THIRD_PARTY_NOTICES.md \
+            --draft \
+            --target "$GITHUB_SHA" \
+            --title "Horizon 1.16.5 dev $tag" \
+            --notes "$notes"

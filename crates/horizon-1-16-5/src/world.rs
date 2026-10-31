@@ -7,10 +7,14 @@
 //! a chunk the region header does not list at all.
 //!
 //! [`World::save`] writes only the chunks changed since opening (or the last
-//! save) back in place. Each one is re-encoded as a fresh root with
-//! `DataVersion` 2586, `Level.Status` `full`, a local palette per section and
-//! the same packing and biome layout described below, so the crate's own
-//! reader round-trips it.
+//! save) back in place. A chunk read from disk keeps the root and `Level`
+//! compound it came from, including its `DataVersion`, `Status`, heightmaps,
+//! entities, tile entities, light and any tag this crate does not model; only
+//! `Level.Sections` and `Level.Biomes` are re-encoded, with a local palette
+//! per section and the packing and biome layout described below. A chunk the
+//! world never read from disk gets a minimal `DataVersion` 2586,
+//! `Level.Status` `full` root instead. Either way the crate's own reader
+//! round-trips the result, and vanilla can still open a saved world.
 //!
 //! # 1.16.5 section storage
 //!
@@ -215,10 +219,15 @@ impl World {
     /// Writes every dirty chunk in place under `root/region/`, creating the
     /// directory and region files as needed.
     ///
-    /// Each chunk is rebuilt as a fresh 1.16.5 `Level` root (`DataVersion`
-    /// 2586, `Status` `full`, local section palettes, packed `BlockStates`
-    /// and the column's `Biomes`), so the result is exactly what this crate's
-    /// [`World::open`] reads back. Clean and unloaded chunks are not touched.
+    /// A chunk read from disk is rebuilt from its original root: every
+    /// top-level tag and every `Level` key (`DataVersion`, `Status`,
+    /// `Heightmaps`, `Entities`, tile ticks, light, ...) is kept and only
+    /// `Level.Sections` (fresh local palettes, packed `BlockStates`) and
+    /// `Level.Biomes` (the column's grid) are replaced. A chunk the world
+    /// never read from disk gets a minimal `Level` root instead. Either way
+    /// the result is exactly what this crate's [`World::open`] reads back,
+    /// and vanilla can still open the world. Clean and unloaded chunks are
+    /// not touched.
     ///
     /// The dirty set loses only the chunks written successfully; a failure
     /// returns an error naming the chunk and its region file, and the chunks
@@ -266,6 +275,13 @@ impl World {
     }
 
     /// Builds the 1.16.5 chunk NBT root for one loaded column.
+    ///
+    /// A column decoded from disk is rebuilt from the root it was read from:
+    /// every top-level tag and every `Level` key is kept, and only
+    /// `Level.Sections` and `Level.Biomes` are replaced with freshly encoded
+    /// ones. Heightmaps, entities, tile entities, light, `Status` and tags
+    /// this crate does not model therefore survive the save. A column with
+    /// no original is written as the minimal root instead.
     fn column_nbt(&self, column: &ChunkColumn) -> Result<NamedTag, String> {
         let at = format!("chunk ({}, {})", column.x, column.z);
         let mut sections = Vec::new();
@@ -275,21 +291,11 @@ impl World {
             };
             sections.push(self.section_nbt(blocks, y, &at)?);
         }
-        Ok(NamedTag {
-            name: JavaString::default(),
-            tag: Tag::compound([
-                ("DataVersion", Tag::Int(2586)),
-                (
-                    "Level",
-                    Tag::compound([
-                        ("xPos", Tag::Int(column.x)),
-                        ("zPos", Tag::Int(column.z)),
-                        ("Status", Tag::String(JavaString::from("full"))),
-                        ("Sections", Tag::List(sections)),
-                        ("Biomes", Tag::IntArray(column.biomes.to_vec())),
-                    ]),
-                ),
-            ]),
+        let sections = Tag::List(sections);
+        let biomes = Tag::IntArray(column.biomes.to_vec());
+        Ok(match &column.original {
+            Some(original) => preserved_root(original, column, sections, biomes),
+            None => minimal_root(column, sections, biomes),
         })
     }
 
@@ -340,6 +346,67 @@ impl World {
     }
 }
 
+/// The minimal chunk root for a column the world never read from disk: the
+/// block data only, with no heightmaps, entities or light.
+fn minimal_root(column: &ChunkColumn, sections: Tag, biomes: Tag) -> NamedTag {
+    NamedTag {
+        name: JavaString::default(),
+        tag: Tag::compound([
+            ("DataVersion", Tag::Int(2586)),
+            (
+                "Level",
+                Tag::compound([
+                    ("xPos", Tag::Int(column.x)),
+                    ("zPos", Tag::Int(column.z)),
+                    ("Status", Tag::String(JavaString::from("full"))),
+                    ("Sections", sections),
+                    ("Biomes", biomes),
+                ]),
+            ),
+        ]),
+    }
+}
+
+/// Rebuilds a chunk root from the one it was decoded from, keeping every
+/// top-level tag and every `Level` key (`Status`, `Heightmaps`,
+/// `LastUpdate`, `InhabitedTime`, `Lights`, `isLightOn`, `TileTicks`,
+/// `LiquidTicks`, `Structures`, `Entities`, `PostProcessing`, `xPos`/`zPos`
+/// and unknown ones alike) and replacing only `Level.Sections` and
+/// `Level.Biomes` with `sections` and `biomes`.
+///
+/// `xPos`/`zPos` are inserted only when the original lacked them, and
+/// `DataVersion` only when the root had none, so a normal 1.16.5 chunk keeps
+/// its own values. A root `from_nbt` would have rejected (no compound
+/// `Level`) falls back to [`minimal_root`].
+fn preserved_root(
+    original: &NamedTag,
+    column: &ChunkColumn,
+    sections: Tag,
+    biomes: Tag,
+) -> NamedTag {
+    let Tag::Compound(original_root) = &original.tag else {
+        return minimal_root(column, sections, biomes);
+    };
+    let mut root = original_root.clone();
+    let Some(Tag::Compound(level)) = root.get_mut(&JavaString::from("Level")) else {
+        return minimal_root(column, sections, biomes);
+    };
+    level.insert(JavaString::from("Sections"), sections);
+    level.insert(JavaString::from("Biomes"), biomes);
+    level
+        .entry(JavaString::from("xPos"))
+        .or_insert(Tag::Int(column.x));
+    level
+        .entry(JavaString::from("zPos"))
+        .or_insert(Tag::Int(column.z));
+    root.entry(JavaString::from("DataVersion"))
+        .or_insert(Tag::Int(2586));
+    NamedTag {
+        name: original.name.clone(),
+        tag: Tag::Compound(root),
+    }
+}
+
 impl BlockSource for World {
     /// The block state at world coordinates.
     ///
@@ -367,12 +434,22 @@ pub struct ChunkColumn {
     pub z: i32,
     sections: [Option<Section>; SECTIONS],
     biomes: [i32; BIOMES],
+    /// The whole chunk NBT root this column was decoded from, kept so a save
+    /// can rebuild everything but the block data (`Level.Sections` and
+    /// `Level.Biomes`): heightmaps, entities, tile entities, light, status
+    /// and any tag this crate does not model survive a round trip.
+    ///
+    /// `None` for a column the world never read from disk; such a column is
+    /// saved with a minimal root instead.
+    original: Option<NamedTag>,
 }
 
 impl ChunkColumn {
     /// Decodes a 1.16.5 chunk NBT root; `None` for an empty chunk (no
     /// `Level.Sections`). `position` is the region slot, the fallback when
-    /// `Level.xPos`/`zPos` are absent.
+    /// `Level.xPos`/`zPos` are absent. The whole `root` is kept in
+    /// [`Self::original`] so a later save preserves every tag the decoder
+    /// does not model.
     fn from_nbt(
         root: &NamedTag,
         position: ChunkPos,
@@ -438,6 +515,7 @@ impl ChunkColumn {
             z,
             sections: decoded,
             biomes,
+            original: Some(root.clone()),
         }))
     }
 
@@ -741,12 +819,15 @@ mod tests {
         Tag::List(entries)
     }
 
-    /// A 1.16.5 chunk root: named compound with a `Level` inside.
+    /// A 1.16.5 chunk root: named compound with a `Level` inside. Carries the
+    /// `Status` a real chunk has, so a save that preserves the original root
+    /// keeps it.
     fn chunk_root(sections: Vec<Tag>, biomes: Option<Vec<i32>>, x: i32, z: i32) -> NamedTag {
         let mut level = vec![
             ("Sections", list(sections)),
             ("xPos", Tag::Int(x)),
             ("zPos", Tag::Int(z)),
+            ("Status", tag("full")),
         ];
         if let Some(biomes) = biomes {
             level.push(("Biomes", Tag::IntArray(biomes)));
@@ -1332,7 +1413,7 @@ mod tests {
         assert!(world.save(&dir).unwrap());
         assert!(!world.has_unsaved_changes());
 
-        // The fresh root carries the 1.16.5 data version, a full status, a
+        // The preserved root keeps the 1.16.5 data version and status, with a
         // local section palette and the column's biome array.
         let saved = read_chunk(&dir, 0, 0);
         assert_eq!(saved.tag.get("DataVersion"), Some(&Tag::Int(2586)));
@@ -1363,9 +1444,12 @@ mod tests {
             section0.get("BlockStates"),
             Some(Tag::LongArray(longs)) if longs.len() == 256
         ));
+        // Biomes are re-encoded from the decoded column grid; only a few
+        // cells were filled, so check that the rewritten array keeps them
+        // (everything else stays the reader's zero fill).
         assert!(matches!(
             level.get("Biomes"),
-            Some(Tag::IntArray(biomes)) if biomes.len() == BIOMES && biomes.iter().all(|&b| b == 7)
+            Some(Tag::IntArray(biomes)) if biomes.len() == BIOMES && biomes.contains(&7)
         ));
 
         // The crate's own reader must see every changed state.
@@ -1378,6 +1462,191 @@ mod tests {
         );
         assert_eq!(world.state_id_at(4, 200, 1), Some(air));
         assert_eq!(world.chunk(0, 0).unwrap().biome(3, 2, 1), 7);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_keeps_every_non_section_tag_from_the_original_chunk() {
+        let table = test_table();
+        let air = table.state_id(&BlockState::new("minecraft:air")).unwrap();
+        let stone = table.state_id(&BlockState::new("minecraft:stone")).unwrap();
+        let dir = temp_dir("save-preserves");
+
+        // Everything a real 1.16.5 chunk carries besides its block data,
+        // plus tags this crate does not model. The 4-entry `Biomes` array is
+        // deliberately short: a save must replace it with the full grid.
+        let heightmaps = compound(&[
+            ("MOTION_BLOCKING", Tag::LongArray(vec![1, 2, 3, 4])),
+            ("WORLD_SURFACE", Tag::LongArray(vec![5, 6, 7, 8])),
+        ]);
+        let entities = list(vec![
+            compound(&[("id", tag("minecraft:pig")), ("CustomName", tag("Wilbur"))]),
+            compound(&[("id", tag("minecraft:item")), ("Age", Tag::Short(12))]),
+        ]);
+        let tile_ticks = list(vec![compound(&[
+            ("i", tag("minecraft:furnace")),
+            ("x", Tag::Int(1)),
+            ("y", Tag::Int(2)),
+            ("z", Tag::Int(3)),
+            ("t", Tag::Int(5)),
+            ("p", Tag::Int(0)),
+        ])]);
+        let structures = compound(&[
+            ("References", compound(&[])),
+            (
+                "Starts",
+                compound(&[("minecraft:village", compound(&[("id", tag("village"))]))]),
+            ),
+        ]);
+        let post_processing = list(vec![
+            list(vec![Tag::Short(0); 16]),
+            list(vec![Tag::Short(-1); 16]),
+        ]);
+        let lights = list(vec![compound(&[
+            ("Y", Tag::Byte(0)),
+            ("SkyLight", Tag::ByteArray(vec![0xff; 2048])),
+        ])]);
+        let level = vec![
+            ("xPos", Tag::Int(5)),
+            ("zPos", Tag::Int(-2)),
+            ("Status", tag("full")),
+            ("Heightmaps", heightmaps.clone()),
+            ("LastUpdate", Tag::Long(123_456_789)),
+            ("InhabitedTime", Tag::Long(987_654_321)),
+            ("isLightOn", Tag::Byte(1)),
+            ("Lights", lights.clone()),
+            ("Entities", entities.clone()),
+            ("TileTicks", tile_ticks.clone()),
+            ("LiquidTicks", list(Vec::new())),
+            ("Structures", structures.clone()),
+            ("PostProcessing", post_processing.clone()),
+            (
+                "Sections",
+                list(vec![
+                    section_tag(0, vec![entry("minecraft:air", None)], None),
+                    // An empty out-of-range section (a flat world's Y=-1):
+                    // re-encoding drops it, and its custom tag with it.
+                    compound(&[
+                        ("Y", Tag::Byte(-1)),
+                        ("SkyLight", Tag::ByteArray(vec![1; 4])),
+                    ]),
+                ]),
+            ),
+            ("Biomes", Tag::IntArray(vec![7; 4])),
+        ];
+        let root = NamedTag {
+            name: JavaString::from(""),
+            tag: compound(&[
+                // An older data version proves the original root is reused
+                // rather than a fresh `DataVersion` 2586 root.
+                ("DataVersion", Tag::Int(2578)),
+                ("Level", compound(&level)),
+                ("CustomTopLevelTag", tag("kept")),
+            ]),
+        };
+        write_chunk(&dir, root, 5, -2);
+
+        let mut world = World::open(&dir, table.clone()).unwrap();
+        assert_eq!(world.chunk(5, -2).unwrap().biome(83, 2, -31), 7);
+        // Block coordinates inside chunk (5, -2): x 80..96, z -32..-16.
+        world
+            .set_state(83, 2, -31, &BlockState::new("minecraft:stone"))
+            .unwrap();
+        assert!(world.save(&dir).unwrap());
+
+        let saved = read_chunk(&dir, 5, -2);
+        // Top-level tags and the chunk's own coordinates survived.
+        assert_eq!(saved.tag.get("DataVersion"), Some(&Tag::Int(2578)));
+        assert_eq!(saved.tag.get("CustomTopLevelTag"), Some(&tag("kept")));
+        let level = saved.tag.get("Level").unwrap();
+        assert_eq!(level.get("xPos"), Some(&Tag::Int(5)));
+        assert_eq!(level.get("zPos"), Some(&Tag::Int(-2)));
+        assert_eq!(level.get("Status"), Some(&tag("full")));
+        assert_eq!(level.get("LastUpdate"), Some(&Tag::Long(123_456_789)));
+        assert_eq!(level.get("InhabitedTime"), Some(&Tag::Long(987_654_321)));
+        assert_eq!(level.get("isLightOn"), Some(&Tag::Byte(1)));
+        assert_eq!(level.get("Heightmaps"), Some(&heightmaps));
+        assert_eq!(level.get("Entities"), Some(&entities));
+        assert_eq!(level.get("TileTicks"), Some(&tile_ticks));
+        assert_eq!(level.get("Lights"), Some(&lights));
+        assert_eq!(level.get("Structures"), Some(&structures));
+        assert_eq!(level.get("PostProcessing"), Some(&post_processing));
+        assert_eq!(level.get("LiquidTicks"), Some(&Tag::List(Vec::new())));
+        // Only Sections and Biomes were replaced: the empty out-of-range
+        // section is gone and the short biome array became the full grid.
+        let sections = match level.get("Sections") {
+            Some(Tag::List(sections)) => sections,
+            other => panic!("Level.Sections: {other:?}"),
+        };
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].get("Y"), Some(&Tag::Byte(0)));
+        assert!(sections[0].get("SkyLight").is_none());
+        // Biomes are re-encoded from the decoded column grid; only a few
+        // cells were filled, so check that the rewritten array keeps them
+        // (everything else stays the reader's zero fill).
+        assert!(matches!(
+            level.get("Biomes"),
+            Some(Tag::IntArray(biomes)) if biomes.len() == BIOMES && biomes.contains(&7)
+        ));
+
+        // The changed block survives a reopen, and the untouched blocks read
+        // back as the air the original chunk held.
+        let world = World::open(&dir, table).unwrap();
+        assert_eq!(world.state_id_at(83, 2, -31), Some(stone));
+        assert_eq!(world.state_id_at(83, 3, -31), Some(air));
+        assert_eq!(world.chunk(5, -2).unwrap().biome(83, 2, -31), 7);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_synthesizes_a_minimal_root_for_a_column_without_an_original() {
+        let table = test_table();
+        let air = table.state_id(&BlockState::new("minecraft:air")).unwrap();
+        let stone = table.state_id(&BlockState::new("minecraft:stone")).unwrap();
+        let dir = temp_dir("save-synthetic");
+
+        // A column the world never read from disk (e.g. one generated in
+        // memory): no original root to preserve.
+        let mut column = ChunkColumn {
+            x: 0,
+            z: 0,
+            sections: std::array::from_fn(|_| None),
+            biomes: [3; BIOMES],
+            original: None,
+        };
+        column.set_state_id(1, 2, 3, stone, air).unwrap();
+        assert!(column.original.is_none());
+        let mut dirty = HashSet::new();
+        dirty.insert((0, 0));
+        let mut world = World {
+            table: table.clone(),
+            air,
+            chunks: HashMap::from([((0, 0), column)]),
+            dirty,
+        };
+        assert!(world.save(&dir).unwrap());
+        assert!(!world.has_unsaved_changes());
+
+        let saved = read_chunk(&dir, 0, 0);
+        assert_eq!(saved.tag.get("DataVersion"), Some(&Tag::Int(2586)));
+        let level = saved.tag.get("Level").unwrap();
+        let Tag::Compound(level) = level else {
+            panic!("Level: {level:?}");
+        };
+        let keys: Vec<String> = level.keys().map(|key| key.to_string_lossy()).collect();
+        assert_eq!(
+            keys.join(","),
+            "Biomes,Sections,Status,xPos,zPos",
+            "a synthetic chunk must get the minimal Level"
+        );
+        assert_eq!(level.get(&JavaString::from("Status")), Some(&tag("full")));
+        assert_eq!(level.get(&JavaString::from("xPos")), Some(&Tag::Int(0)));
+        assert_eq!(level.get(&JavaString::from("zPos")), Some(&Tag::Int(0)));
+
+        let world = World::open(&dir, table).unwrap();
+        assert_eq!(world.state_id_at(1, 2, 3), Some(stone));
+        assert_eq!(world.state_id_at(0, 0, 0), Some(air));
+        assert_eq!(world.chunk(0, 0).unwrap().biome(1, 2, 3), 3);
         fs::remove_dir_all(&dir).unwrap();
     }
 

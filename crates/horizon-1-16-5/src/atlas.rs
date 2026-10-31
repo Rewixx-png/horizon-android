@@ -21,6 +21,14 @@ use std::path::{Path, PathBuf};
 /// The vanilla missing-texture name used by unresolved model variables.
 pub const MISSING_TEXTURE: &str = "minecraft:missingno";
 
+/// The first frame of the block-breaking crack overlay. Every atlas packs it,
+/// whether or not the caller asks for it, so the HUD and world passes can
+/// always find it.
+pub const DESTROY_STAGE_TEXTURE: &str = "minecraft:destroy_stage_0";
+
+/// The asset path the destroy-stage sprite ships at in a client jar.
+const DESTROY_STAGE_PATH: &str = "minecraft/textures/block/destroy_stage_0.png";
+
 /// One decoded RGBA8 texture image, already cropped to its first animation
 /// frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -226,6 +234,8 @@ impl TextureAtlas {
     ///
     /// The packing is deterministic: the missing sprite comes first, then the
     /// requested names in sorted order, shelf-packed with a two-pixel gap.
+    /// [`DESTROY_STAGE_TEXTURE`] is always requested; when the source lacks
+    /// it, the name shares the missing sprite like any unresolved texture.
     pub fn load(
         source: &mut dyn TextureSource,
         textures: impl IntoIterator<Item = String>,
@@ -235,6 +245,7 @@ impl TextureAtlas {
             requested.insert(normalized(texture));
         }
         requested.insert(MISSING_TEXTURE.to_owned());
+        requested.insert(DESTROY_STAGE_TEXTURE.to_owned());
 
         let missing = TextureImage {
             width: 16,
@@ -328,6 +339,16 @@ impl TextureAtlas {
         self.sprite(texture).map(|sprite| sprite.uv(self))
     }
 
+    /// The sprite-local UV rectangle of `texture`, or `None` when the atlas
+    /// was not built with that name.
+    ///
+    /// A sprite always covers its whole texture, so this is `[0, 0, 1, 1]`;
+    /// callers that upload the atlas themselves sample a sprite with these
+    /// local coordinates.
+    pub fn sprite_rect(&self, texture: &str) -> Option<[f32; 4]> {
+        self.sprite(texture).map(|_| [0.0, 0.0, 1.0, 1.0])
+    }
+
     /// Nearest-neighbour CPU sample of `texture` at sprite-local (u, v) in
     /// 0..1. Used by tests and tools that inspect the atlas without a GPU.
     pub fn sample(&self, texture: &str, u: f32, v: f32) -> Option<[u8; 4]> {
@@ -360,8 +381,13 @@ fn normalized(name: String) -> String {
 }
 
 /// The asset-index path of a model texture name, e.g.
-/// `minecraft/textures/block/stone.png`.
+/// `minecraft/textures/block/stone.png`. [`DESTROY_STAGE_TEXTURE`] is the one
+/// exception: its logical name has no `block/` segment, so it maps to
+/// `minecraft/textures/block/destroy_stage_0.png` explicitly.
 fn texture_path(name: &str) -> Option<String> {
+    if name == DESTROY_STAGE_TEXTURE {
+        return Some(DESTROY_STAGE_PATH.to_owned());
+    }
     let (namespace, path) = name.split_once(':')?;
     if namespace.is_empty() || path.is_empty() {
         return None;
@@ -662,6 +688,45 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn destroy_stage_sprite_is_always_packed() {
+        let root = temp_root();
+        write_png(
+            &root.join("minecraft/textures/block/destroy_stage_0.png"),
+            2,
+            2,
+            &solid(2, 2, [10, 20, 30, 40]),
+        );
+        // The caller asks for nothing; the overlay still has to be present.
+        let atlas = TextureAtlas::from_directory(&root, Vec::<String>::new()).unwrap();
+        assert_eq!(
+            atlas.sample(DESTROY_STAGE_TEXTURE, 0.5, 0.5),
+            Some([10, 20, 30, 40])
+        );
+        assert_eq!(
+            atlas.sprite_rect(DESTROY_STAGE_TEXTURE),
+            Some([0.0, 0.0, 1.0, 1.0])
+        );
+        assert_eq!(
+            atlas.sprite_rect(MISSING_TEXTURE),
+            Some([0.0, 0.0, 1.0, 1.0])
+        );
+        assert!(
+            atlas
+                .sprite_rect("minecraft:block/never_requested")
+                .is_none()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn missing_destroy_stage_falls_back_to_missingno() {
+        let root = temp_root();
+        let atlas = TextureAtlas::from_directory(&root, Vec::<String>::new()).unwrap();
+        assert_eq!(atlas.uv(DESTROY_STAGE_TEXTURE), atlas.uv(MISSING_TEXTURE));
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

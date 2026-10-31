@@ -57,12 +57,47 @@ impl Inventory {
         &self.slots
     }
 
+    /// The vanilla block-model texture used as the hotbar icon for `slot`,
+    /// e.g. `minecraft:block/stone`. Empty slots and blocks without an icon
+    /// mapping return `None`.
+    pub fn icon_texture(&self, slot: usize) -> Option<&'static str> {
+        let state = self.slots.get(slot)?.as_ref()?;
+        icon_texture_for(&state.name)
+    }
+
+    /// The icon texture's sprite-local UV rectangle, `[0, 0, 1, 1]`, or
+    /// `None` when [`Self::icon_texture`] has no icon for `slot`.
+    ///
+    /// The app resolves the atlas sprite for [`Self::icon_texture`] itself
+    /// and samples it with these local coordinates.
+    pub fn icon(&self, slot: usize) -> Option<[f32; 4]> {
+        self.icon_texture(slot).map(|_| [0.0, 0.0, 1.0, 1.0])
+    }
+
     /// Stores `state` in `slot`; out-of-range values are ignored.
     pub fn set_slot(&mut self, slot: usize, state: Option<BlockState>) {
         if slot < self.slots.len() {
             self.slots[slot] = state;
         }
     }
+}
+
+/// The vanilla block-model texture that renders each creative block as its
+/// hotbar icon. Bare names are treated as `minecraft:` names.
+fn icon_texture_for(name: &str) -> Option<&'static str> {
+    let path = name.strip_prefix("minecraft:").unwrap_or(name);
+    Some(match path {
+        "stone" => "minecraft:block/stone",
+        "dirt" => "minecraft:block/dirt",
+        "grass_block" => "minecraft:block/grass_block_side",
+        "oak_planks" => "minecraft:block/oak_planks",
+        "oak_log" => "minecraft:block/oak_log",
+        "glass" => "minecraft:block/glass",
+        "bricks" => "minecraft:block/bricks",
+        "stone_bricks" => "minecraft:block/stone_bricks",
+        "white_wool" => "minecraft:block/white_wool",
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -145,5 +180,37 @@ mod tests {
         inventory.set_slot(9, Some(BlockState::new("minecraft:dirt")));
         inventory.set_slot(usize::MAX, Some(BlockState::new("minecraft:dirt")));
         assert_eq!(inventory.slots()[8], wool);
+    }
+
+    #[test]
+    fn icon_textures_for_all_creative_slots() {
+        let inventory = Inventory::creative();
+        let expected = [
+            "minecraft:block/stone",
+            "minecraft:block/dirt",
+            "minecraft:block/grass_block_side",
+            "minecraft:block/oak_planks",
+            "minecraft:block/oak_log",
+            "minecraft:block/glass",
+            "minecraft:block/bricks",
+            "minecraft:block/stone_bricks",
+            "minecraft:block/white_wool",
+        ];
+        for (slot, texture) in expected.iter().enumerate() {
+            assert_eq!(inventory.icon_texture(slot), Some(*texture));
+            assert_eq!(inventory.icon(slot), Some([0.0, 0.0, 1.0, 1.0]));
+        }
+    }
+
+    #[test]
+    fn icon_is_none_for_unknown_and_empty_slots() {
+        let mut inventory = Inventory::creative();
+        inventory.set_slot(0, Some(BlockState::new("minecraft:command_block")));
+        inventory.set_slot(1, None);
+        assert_eq!(inventory.icon_texture(0), None);
+        assert_eq!(inventory.icon(0), None);
+        assert_eq!(inventory.icon_texture(1), None);
+        assert_eq!(inventory.icon_texture(9), None);
+        assert_eq!(inventory.icon(usize::MAX), None);
     }
 }

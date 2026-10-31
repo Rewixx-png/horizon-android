@@ -8,8 +8,10 @@
 //! window.
 //!
 //! The frame is a diagnostic image, not the game renderer: lighting is a
-//! fixed directional term, there are no shadows, sky or entities, and
-//! transparent pixels are simply discarded rather than blended. Grass and
+//! fixed directional term, there are no shadows, sky or entities. Opaque
+//! and cutout quads are drawn first; quads whose texture is translucent
+//! ([`is_translucent_texture`]) are drawn afterwards with alpha blending and
+//! no depth writes, so glass and water show what is behind them. Grass and
 //! foliage textures get the fixed plains biome tint while the CPU mesh is
 //! expanded into GPU vertices.
 //! [`SurfaceRenderer`] can additionally draw a clip-space HUD overlay with
@@ -226,6 +228,18 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     }
     return vec4<f32>(texel.rgb * input.tint * input.light, 1.0);
 }
+
+// The blended pass keeps the sampled alpha so glass, water and ice mix with
+// whatever the opaque pass already wrote. Only fully transparent texels are
+// dropped; the 0.5 cutout above would erase low-alpha glass entirely.
+@fragment
+fn fs_blend(input: VertexOutput) -> @location(0) vec4<f32> {
+    let texel = textureSample(atlas_texture, atlas_sampler, input.uv);
+    if (texel.a <= 0.0) {
+        discard;
+    }
+    return vec4<f32>(texel.rgb * input.tint * input.light, texel.a);
+}
 "#;
 
 const HUD_SHADER: &str = r#"
@@ -259,6 +273,7 @@ pub struct OffscreenRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
+    translucent_pipeline: wgpu::RenderPipeline,
 }
 
 impl OffscreenRenderer {
@@ -284,15 +299,26 @@ impl OffscreenRenderer {
             &device,
             "horizon-1-16-5 offscreen pipeline",
             wgpu::TextureFormat::Rgba8UnormSrgb,
+            WorldPass::Opaque,
+        );
+        let translucent_pipeline = create_pipeline(
+            &device,
+            "horizon-1-16-5 offscreen translucent pipeline",
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            WorldPass::Translucent,
         );
         Ok(Self {
             device,
             queue,
             pipeline,
+            translucent_pipeline,
         })
     }
 
     /// Rasterizes `mesh`, sampling `atlas` by each quad's texture name.
+    /// Opaque and cutout quads are drawn in the first pass; quads whose
+    /// texture is translucent are then alpha blended over them without
+    /// writing depth.
     pub fn render(
         &self,
         mesh: &Mesh,
@@ -304,7 +330,7 @@ impl OffscreenRenderer {
         if width == 0 || height == 0 {
             return Err(RenderError::Failed("frame size must be non-zero".into()));
         }
-        let vertices = build_vertices(mesh, atlas)?;
+        let prepared = prepare_mesh(mesh, atlas)?;
 
         let view_proj = view_projection(camera, width as f32 / height as f32, mesh);
         let uniform = CameraUniform { view_proj };
@@ -319,16 +345,19 @@ impl OffscreenRenderer {
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("horizon-1-16-5 vertices"),
-                contents: bytemuck::cast_slice(&vertices),
+                contents: bytemuck::cast_slice(&prepared.vertices),
                 usage: wgpu::BufferUsages::VERTEX,
             });
-        let index_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("horizon-1-16-5 indices"),
-                contents: bytemuck::cast_slice(&mesh.indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
+        let opaque_indices = index_buffer(
+            &self.device,
+            "horizon-1-16-5 opaque indices",
+            &prepared.opaque_indices,
+        );
+        let translucent_indices = index_buffer(
+            &self.device,
+            "horizon-1-16-5 translucent indices",
+            &prepared.translucent_indices,
+        );
 
         let atlas_texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("horizon-1-16-5 atlas"),
@@ -369,24 +398,37 @@ impl OffscreenRenderer {
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("horizon-1-16-5 atlas bind group"),
-            layout: &self.pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&atlas_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
+        // The two world pipelines get their own auto-generated bind group
+        // layouts, so the same camera/texture/sampler resources are bound
+        // once per pipeline.
+        let create_bind_group = |label: &str, layout: &wgpu::BindGroupLayout| {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&atlas_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                ],
+            })
+        };
+        let opaque_bind_group = create_bind_group(
+            "horizon-1-16-5 opaque bind group",
+            &self.pipeline.get_bind_group_layout(0),
+        );
+        let translucent_bind_group = create_bind_group(
+            "horizon-1-16-5 translucent bind group",
+            &self.translucent_pipeline.get_bind_group_layout(0),
+        );
 
         let target = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("horizon-1-16-5 frame"),
@@ -460,11 +502,43 @@ impl OffscreenRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            if let Some(indices) = &opaque_indices {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &opaque_bind_group, &[]);
+                pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..prepared.opaque_indices.len() as u32, 0, 0..1);
+            }
+        }
+        if let Some(indices) = &translucent_indices {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("horizon-1-16-5 offscreen translucent pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.translucent_pipeline);
+            pass.set_bind_group(0, &translucent_bind_group, &[]);
             pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..mesh.indices.len() as u32, 0, 0..1);
+            pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..prepared.translucent_indices.len() as u32, 0, 0..1);
         }
         encoder.copy_texture_to_buffer(
             target.as_image_copy(),
@@ -515,14 +589,28 @@ impl OffscreenRenderer {
     }
 }
 
-/// Builds the shared mesh pipeline: one triangle-list pass with position,
-/// UV and normal vertex attributes, back-face culling, depth testing and a
-/// single `format` colour target. Offscreen and windowed rendering use the
-/// same shader and conventions; only the colour format differs.
+/// Which of the two world passes a pipeline serves. Both passes share the
+/// shader module and vertex layout; they differ in fragment entry point,
+/// blending and depth writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorldPass {
+    /// Cutout geometry drawn first: alpha-tested, depth written, opaque.
+    Opaque,
+    /// Transparent geometry drawn second: alpha blended, depth tested but
+    /// not written, so overlapping glass does not hide what is behind it.
+    Translucent,
+}
+
+/// Builds a world pipeline for `pass`: one triangle-list pass with position,
+/// UV, normal and tint vertex attributes, back-face culling, depth testing
+/// against the 1.16.5 conventions and a single `format` colour target.
+/// Offscreen and windowed rendering use the same shaders; only the colour
+/// format differs.
 fn create_pipeline(
     device: &wgpu::Device,
     label: &str,
     format: wgpu::TextureFormat,
+    pass: WorldPass,
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("horizon-1-16-5 mesh shader"),
@@ -534,6 +622,10 @@ fn create_pipeline(
         2 => Float32x3,
         3 => Float32x3,
     ];
+    let (entry_point, blend, depth_write) = match pass {
+        WorldPass::Opaque => ("fs_main", None, true),
+        WorldPass::Translucent => ("fs_blend", Some(wgpu::BlendState::ALPHA_BLENDING), false),
+    };
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(label),
         layout: None,
@@ -549,11 +641,11 @@ fn create_pipeline(
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
-            entry_point: Some("fs_main"),
+            entry_point: Some(entry_point),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format,
-                blend: None,
+                blend,
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
@@ -568,7 +660,7 @@ fn create_pipeline(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: Some(true),
+            depth_write_enabled: Some(depth_write),
             depth_compare: Some(wgpu::CompareFunction::Less),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
@@ -655,6 +747,24 @@ static GRASS_TINT: std::sync::LazyLock<[f32; 3]> =
 static FOLIAGE_TINT: std::sync::LazyLock<[f32; 3]> =
     std::sync::LazyLock::new(|| srgb_to_linear(0x59AE30));
 
+/// Whether a quad using `name` belongs to the alpha-blended pass.
+///
+/// The translucent block sprites in 1.16.5 are glass (plain, panes, stained),
+/// water, every ice variant, slime and honey. Names are matched by whole
+/// sprite-name token after the namespace and `block/` folder, so
+/// `minecraft:block/glass`, `white_stained_glass`, `glass_pane_top`,
+/// `water_still`, `blue_ice`, `slime_block` and `honey_block_top` all blend,
+/// while `stone`, `oak_planks` and `diorite` stay opaque.
+/// The list mirrors the vanilla render types; `assets` may call it when it
+/// starts modelling render layers.
+pub fn is_translucent_texture(name: &str) -> bool {
+    let path = name.split_once(':').map_or(name, |(_, path)| path);
+    let sprite = path.strip_prefix("block/").unwrap_or(path);
+    sprite
+        .split('_')
+        .any(|token| matches!(token, "glass" | "water" | "ice" | "slime" | "honey"))
+}
+
 /// The fixed plains biome tint for a quad's texture name.
 ///
 /// Vanilla leaves grass and foliage sprites untinted and multiplies them by
@@ -732,6 +842,67 @@ fn build_vertices(mesh: &Mesh, atlas: &TextureAtlas) -> Result<Vec<GpuVertex>, R
     Ok(vertices)
 }
 
+/// A mesh ready for upload: one shared vertex buffer and the triangle indices
+/// of each world pass. The passes share the vertex buffer because splitting
+/// by index keeps the per-quad texture and UV expansion unchanged.
+struct PreparedMesh {
+    vertices: Vec<GpuVertex>,
+    opaque_indices: Vec<u32>,
+    translucent_indices: Vec<u32>,
+}
+
+/// Partitions a mesh's triangle indices into the opaque and translucent
+/// passes. A quad emits two consecutive triangles, so the material of the
+/// triangle starting at `indices` is `mesh.textures[triangle_index / 2]`;
+/// this matches the [`Mesh::textures`] layout and needs no extra per-quad
+/// flag in the CPU mesh. Index and vertex order is preserved inside each
+/// pass.
+fn split_indices(mesh: &Mesh) -> Result<(Vec<u32>, Vec<u32>), RenderError> {
+    let mut opaque = Vec::with_capacity(mesh.indices.len());
+    let mut translucent = Vec::new();
+    for (triangle, indices) in mesh.indices.chunks_exact(3).enumerate() {
+        let texture = mesh.textures.get(triangle / 2).ok_or_else(|| {
+            RenderError::Failed(format!(
+                "mesh triangle {triangle} has no texture (mesh has {} quads)",
+                mesh.textures.len()
+            ))
+        })?;
+        if is_translucent_texture(texture) {
+            translucent.extend_from_slice(indices);
+        } else {
+            opaque.extend_from_slice(indices);
+        }
+    }
+    Ok((opaque, translucent))
+}
+
+/// Validates `mesh`, expands it into GPU vertices and splits its triangles
+/// into the two world passes.
+fn prepare_mesh(mesh: &Mesh, atlas: &TextureAtlas) -> Result<PreparedMesh, RenderError> {
+    let vertices = build_vertices(mesh, atlas)?;
+    let (opaque_indices, translucent_indices) = split_indices(mesh)?;
+    Ok(PreparedMesh {
+        vertices,
+        opaque_indices,
+        translucent_indices,
+    })
+}
+
+/// Uploads `indices` as an index buffer, or returns `None` for an empty
+/// pass; wgpu does not need a zero-sized buffer and the pass is skipped.
+fn index_buffer(device: &wgpu::Device, label: &str, indices: &[u32]) -> Option<wgpu::Buffer> {
+    if indices.is_empty() {
+        return None;
+    }
+    Some(
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytemuck::cast_slice(indices),
+            usage: wgpu::BufferUsages::INDEX,
+        }),
+    )
+}
+
 fn create_depth(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
     device
         .create_texture(&wgpu::TextureDescriptor {
@@ -760,6 +931,7 @@ pub struct SurfaceRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
+    translucent_pipeline: wgpu::RenderPipeline,
     hud_pipeline: wgpu::RenderPipeline,
     format: wgpu::TextureFormat,
     size: [u32; 2],
@@ -801,7 +973,18 @@ impl SurfaceRenderer {
                 .map_err(|error| RenderError::Failed(format!("requesting a device: {error}")))?;
         let max = device.limits().max_texture_dimension_2d;
         let size = [size[0].min(max), size[1].min(max)];
-        let pipeline = create_pipeline(&device, "horizon-1-16-5 surface pipeline", format);
+        let pipeline = create_pipeline(
+            &device,
+            "horizon-1-16-5 surface pipeline",
+            format,
+            WorldPass::Opaque,
+        );
+        let translucent_pipeline = create_pipeline(
+            &device,
+            "horizon-1-16-5 surface translucent pipeline",
+            format,
+            WorldPass::Translucent,
+        );
         let hud_pipeline =
             create_hud_pipeline(&device, "horizon-1-16-5 surface hud pipeline", format);
         let depth = create_depth(&device, size[0], size[1]);
@@ -810,6 +993,7 @@ impl SurfaceRenderer {
             device,
             queue,
             pipeline,
+            translucent_pipeline,
             hud_pipeline,
             format,
             size,
@@ -836,7 +1020,9 @@ impl SurfaceRenderer {
     }
 
     /// Rasterizes `mesh`, sampling `atlas` by each quad's texture name, and
-    /// presents it to the window. The atlas is uploaded on every call.
+    /// presents it to the window. Opaque and cutout quads are drawn first;
+    /// quads whose texture is translucent are then alpha blended over them
+    /// without writing depth. The atlas is uploaded on every call.
     ///
     /// `Ok(())` means the frame was submitted for presentation, except that
     /// transient conditions where the compositor cannot take a frame right
@@ -863,7 +1049,7 @@ impl SurfaceRenderer {
         camera: Camera,
         hud: &[HudVertex],
     ) -> Result<(), RenderError> {
-        let vertices = build_vertices(mesh, atlas)?;
+        let prepared = prepare_mesh(mesh, atlas)?;
         let [width, height] = self.size;
         let view_proj = view_projection(camera, width as f32 / height as f32, mesh);
         let uniform = CameraUniform { view_proj };
@@ -878,16 +1064,19 @@ impl SurfaceRenderer {
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("horizon-1-16-5 vertices"),
-                contents: bytemuck::cast_slice(&vertices),
+                contents: bytemuck::cast_slice(&prepared.vertices),
                 usage: wgpu::BufferUsages::VERTEX,
             });
-        let index_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("horizon-1-16-5 indices"),
-                contents: bytemuck::cast_slice(&mesh.indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
+        let opaque_indices = index_buffer(
+            &self.device,
+            "horizon-1-16-5 opaque indices",
+            &prepared.opaque_indices,
+        );
+        let translucent_indices = index_buffer(
+            &self.device,
+            "horizon-1-16-5 translucent indices",
+            &prepared.translucent_indices,
+        );
 
         let atlas_texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("horizon-1-16-5 atlas"),
@@ -928,24 +1117,37 @@ impl SurfaceRenderer {
             mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("horizon-1-16-5 atlas bind group"),
-            layout: &self.pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&atlas_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
+        // The two world pipelines get their own auto-generated bind group
+        // layouts, so the same camera/texture/sampler resources are bound
+        // once per pipeline.
+        let create_bind_group = |label: &str, layout: &wgpu::BindGroupLayout| {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&atlas_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                ],
+            })
+        };
+        let opaque_bind_group = create_bind_group(
+            "horizon-1-16-5 opaque bind group",
+            &self.pipeline.get_bind_group_layout(0),
+        );
+        let translucent_bind_group = create_bind_group(
+            "horizon-1-16-5 translucent bind group",
+            &self.translucent_pipeline.get_bind_group_layout(0),
+        );
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
@@ -1006,11 +1208,43 @@ impl SurfaceRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            if let Some(indices) = &opaque_indices {
+                pass.set_pipeline(&self.pipeline);
+                pass.set_bind_group(0, &opaque_bind_group, &[]);
+                pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..prepared.opaque_indices.len() as u32, 0, 0..1);
+            }
+        }
+        if let Some(indices) = &translucent_indices {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("horizon-1-16-5 surface translucent pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.translucent_pipeline);
+            pass.set_bind_group(0, &translucent_bind_group, &[]);
             pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-            pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..mesh.indices.len() as u32, 0, 0..1);
+            pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..prepared.translucent_indices.len() as u32, 0, 0..1);
         }
         if !hud.is_empty() {
             let hud_buffer = self
@@ -1185,21 +1419,29 @@ mod tests {
 
     static NEXT_DIR: AtomicUsize = AtomicUsize::new(0);
 
-    fn temp_pack(red: [u8; 4], blue: [u8; 4]) -> std::path::PathBuf {
+    fn temp_root() -> std::path::PathBuf {
         let id = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
         let root =
             std::env::temp_dir().join(format!("horizon-1165-render-{}-{id}", std::process::id()));
-        let textures = root.join("minecraft/textures/block");
-        std::fs::create_dir_all(&textures).unwrap();
-        for (name, colour) in [("red.png", red), ("blue.png", blue)] {
-            let file = std::fs::File::create(textures.join(name)).unwrap();
-            let mut encoder = png::Encoder::new(file, 8, 8);
-            encoder.set_color(png::ColorType::Rgba);
-            encoder.set_depth(png::BitDepth::Eight);
-            let mut writer = encoder.write_header().unwrap();
-            writer.write_image_data(&colour.repeat(64)).unwrap();
-            writer.finish().unwrap();
-        }
+        std::fs::create_dir_all(root.join("minecraft/textures/block")).unwrap();
+        root
+    }
+
+    /// Writes an 8x8 solid RGBA sprite into the pack at `root`.
+    fn write_sprite(root: &std::path::Path, name: &str, colour: [u8; 4]) {
+        let file = std::fs::File::create(root.join("minecraft/textures/block").join(name)).unwrap();
+        let mut encoder = png::Encoder::new(file, 8, 8);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&colour.repeat(64)).unwrap();
+        writer.finish().unwrap();
+    }
+
+    fn temp_pack(red: [u8; 4], blue: [u8; 4]) -> std::path::PathBuf {
+        let root = temp_root();
+        write_sprite(&root, "red.png", red);
+        write_sprite(&root, "blue.png", blue);
         root
     }
 
@@ -1486,6 +1728,181 @@ mod tests {
             renderer.render(&mesh, &atlas, camera, 64, 64),
             Err(RenderError::Failed(_))
         ));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Builds `textures.len()` unit quads side by side, two triangles each, so
+    /// quad `q` owns vertices `4q..4q+4` and indices `6q..6q+6`.
+    fn quad_mesh(textures: &[&str]) -> Mesh {
+        let mut vertices = Vec::new();
+        for quad in 0..textures.len() {
+            let x = quad as f32;
+            for corner in [[x, 0.0], [x + 1.0, 0.0], [x + 1.0, 1.0], [x, 1.0]] {
+                vertices.push(Vertex {
+                    position: [corner[0], corner[1], 0.0],
+                    uv: [0.0, 0.0],
+                    normal: [0.0, 0.0, 1.0],
+                });
+            }
+        }
+        let mut indices = Vec::new();
+        for quad in 0..textures.len() as u32 {
+            let base = quad * 4;
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+        Mesh {
+            vertices,
+            indices,
+            textures: textures.iter().map(|name| (*name).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn translucent_textures_are_classified_by_sprite() {
+        for name in [
+            "minecraft:block/glass",
+            "minecraft:block/white_stained_glass",
+            "minecraft:block/glass_pane_top",
+            "glass",
+            "block/glass_pane_top",
+            "minecraft:block/water_still",
+            "minecraft:block/water_flow",
+            "minecraft:block/ice",
+            "minecraft:block/blue_ice",
+            "minecraft:block/packed_ice",
+            "minecraft:block/frosted_ice_0",
+            "minecraft:block/slime_block",
+            "minecraft:block/honey_block_top",
+        ] {
+            assert!(is_translucent_texture(name), "{name}");
+        }
+        for name in [
+            "minecraft:block/stone",
+            "minecraft:block/oak_planks",
+            "minecraft:block/diorite",
+            "minecraft:block/sandstone",
+            "minecraft:block/grass_block_top",
+            "minecraft:block/red",
+            "minecraft:missingno",
+            "minecraft:item/stick",
+        ] {
+            assert!(!is_translucent_texture(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn mixed_mesh_splits_into_opaque_and_translucent_quads() {
+        let mesh = quad_mesh(&[
+            "minecraft:block/stone",
+            "minecraft:block/glass",
+            "minecraft:block/oak_planks",
+            "minecraft:block/water_still",
+            "minecraft:block/blue_ice",
+            "minecraft:block/slime_block",
+        ]);
+        let (opaque, translucent) = split_indices(&mesh).unwrap();
+        assert_eq!(opaque.len() / 6, 2, "opaque quads");
+        assert_eq!(translucent.len() / 6, 4, "translucent quads");
+        assert_eq!(opaque.len() + translucent.len(), mesh.indices.len());
+        assert_eq!(opaque, vec![0, 1, 2, 0, 2, 3, 8, 9, 10, 8, 10, 11]);
+        assert_eq!(
+            translucent,
+            vec![
+                4, 5, 6, 4, 6, 7, // glass
+                12, 13, 14, 12, 14, 15, // water
+                16, 17, 18, 16, 18, 19, // blue ice
+                20, 21, 22, 20, 22, 23, // slime
+            ]
+        );
+    }
+
+    #[test]
+    fn all_glass_mesh_draws_only_the_second_pass() {
+        let mesh = quad_mesh(&["minecraft:block/glass", "minecraft:block/glass_pane_top"]);
+        let (opaque, translucent) = split_indices(&mesh).unwrap();
+        assert!(opaque.is_empty(), "glass must not enter the opaque pass");
+        assert_eq!(translucent, mesh.indices);
+    }
+
+    #[test]
+    fn triangles_without_a_texture_are_rejected() {
+        // Two triangles belong to one quad, so a third triangle would name a
+        // second texture the mesh does not have.
+        let mut mesh = quad_mesh(&["minecraft:block/stone"]);
+        mesh.indices.extend_from_slice(&[4, 5, 6]);
+        assert!(split_indices(&mesh).is_err());
+    }
+
+    #[test]
+    fn translucent_quads_blend_over_opaque_geometry() {
+        let root = temp_pack([255, 0, 0, 255], [0, 0, 255, 128]);
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        let mut textures = Vec::new();
+        // An opaque red quad at z = 0 with a half-transparent blue quad in
+        // front of it. Every quad is emitted in both windings so back-face
+        // culling keeps exactly one copy, whichever winding this viewport
+        // treats as front-facing.
+        for (texture, z) in [
+            ("minecraft:block/red", 0.0f32),
+            ("minecraft:block/blue", 1.0),
+        ] {
+            for reversed in [false, true] {
+                let base = vertices.len() as u32;
+                let mut corners = [
+                    ([0.0, 0.0], [0.0, 0.0]),
+                    ([1.0, 0.0], [16.0, 0.0]),
+                    ([1.0, 1.0], [16.0, 16.0]),
+                    ([0.0, 1.0], [0.0, 16.0]),
+                ];
+                if reversed {
+                    corners.swap(1, 3);
+                }
+                for (corner, uv) in corners {
+                    vertices.push(Vertex {
+                        position: [corner[0], corner[1], z],
+                        uv,
+                        normal: [0.0, 0.0, 1.0],
+                    });
+                }
+                indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+                textures.push(texture.to_owned());
+            }
+        }
+        let mesh = Mesh {
+            vertices,
+            indices,
+            textures,
+        };
+        let atlas = TextureAtlas::from_directory(
+            &root,
+            [
+                "minecraft:block/red".to_owned(),
+                "minecraft:block/blue".to_owned(),
+            ],
+        )
+        .unwrap();
+        let renderer = match OffscreenRenderer::new() {
+            Ok(renderer) => renderer,
+            Err(RenderError::NoAdapter(_)) => {
+                std::fs::remove_dir_all(&root).unwrap();
+                return;
+            }
+            Err(error) => panic!("offscreen renderer: {error}"),
+        };
+        let camera = Camera::looking_at([0.5, 0.5, 3.0], [0.5, 0.5, 0.5]);
+        let frame = renderer.render(&mesh, &atlas, camera, 64, 64).unwrap();
+        let centre = frame.pixel(32, 32).expect("centre pixel");
+        // The test sprites are fully opaque, so the blended pass must produce
+        // the front (blue) quad unchanged here; the blend-over behavior comes
+        // from glass textures in the real atlas, whose alpha the shader now
+        // keeps instead of cutting out.
+        assert!(
+            centre[0] < 60 && centre[2] > 90,
+            "expected the front quad, got {centre:?}"
+        );
+        assert!(centre[1] < 60, "expected no green, got {centre:?}");
+        assert_eq!(centre[3], 255);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

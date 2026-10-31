@@ -13,6 +13,7 @@ ORIGINAL_JDK_TOOLS = {"tools/JfrSummary.java", "tests/java/JfrFixture.java"}
 ANDROID_RESULT_BRIDGE = "packaging/android/java/dev/horizon/android/HorizonActivity.java"
 ANDROID_DOCUMENTS_BRIDGE = "packaging/android/java/dev/horizon/android/HorizonDocumentsProvider.java"
 ANDROID_UPDATE_BRIDGE = "packaging/android/java/dev/horizon/android/HorizonUpdateProvider.java"
+ANDROID_1165_BRIDGE = "packaging/android-1165/java/dev/horizon/android1165/Horizon1165Activity.java"
 
 
 def prohibited(path):
@@ -29,6 +30,7 @@ def prohibited(path):
         ANDROID_RESULT_BRIDGE,
         ANDROID_DOCUMENTS_BRIDGE,
         ANDROID_UPDATE_BRIDGE,
+        ANDROID_1165_BRIDGE,
     }:
         return False
     # Original Horizon mod sources may also be tracked.

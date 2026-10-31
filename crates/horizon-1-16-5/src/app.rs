@@ -18,6 +18,8 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::assets::ModelPack;
 use crate::atlas::{TextureAtlas, VanillaAssets};
+use crate::chunk_mesh::{MeshWorker, WorldSnapshot, chunks_around};
+use crate::inventory::Inventory;
 use crate::player::{Input, Player};
 use crate::render::{Camera, HudVertex, SurfaceRenderer, hud_rect};
 use crate::server::{FrameInput, IntegratedServer};
@@ -50,6 +52,8 @@ const HOTBAR_SLOT_COLOR: [f32; 4] = [0.05, 0.05, 0.05, 0.45];
 const HOTBAR_SELECTED_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.40];
 /// Fraction of a hotbar slot left free around the item swatch.
 const HOTBAR_SWATCH_INSET: f32 = 0.2;
+/// Number of colour bands a HUD block icon is drawn with.
+const ICON_GRID: usize = 8;
 
 const USAGE: &str = "usage: horizon-1165 --world <dir> --tables <file> --client-jar <file> \
 --assets-index <file> --assets-objects <dir> [--width <px>] [--height <px>] \
@@ -195,10 +199,13 @@ struct Loaded {
     /// The world directory the chunks are saved back into.
     world_root: PathBuf,
     server: IntegratedServer,
-    models: ModelPack,
     assets: VanillaAssets,
     atlas: TextureAtlas,
     mesh: Mesh,
+    /// Background remesher; owns the model pack after the first mesh.
+    mesh_worker: MeshWorker,
+    /// The world's block table, shared by every captured snapshot.
+    block_table: Arc<BlockTable>,
 }
 
 impl Loaded {
@@ -217,7 +224,10 @@ impl Loaded {
         let table = BlockTable::load(tables)?;
         let world_root = world;
         let world = World::open(&world_root, table)?;
-        let models = ModelPack::load_client_jar(client_jar)?;
+        // The mesh worker owns this pack exclusively from here on, so it does
+        // not need `Sync`: `MeshWorker` moves the sole `Arc` to its thread.
+        #[allow(clippy::arc_with_non_send_sync)]
+        let models = Arc::new(ModelPack::load_client_jar(client_jar)?);
         let mut assets = match (assets_index, assets_objects) {
             (Some(index), Some(objects)) => {
                 VanillaAssets::open(client_jar, Some(index), Some(objects))?
@@ -229,15 +239,20 @@ impl Loaded {
             Some(spawn) => IntegratedServer::new(world, spawn),
             None => IntegratedServer::open(world),
         };
-        let mesh = server.render_mesh(&models, radius);
+        // The first mesh stays synchronous so the first presented frame has
+        // world geometry; every later remesh runs on the worker.
+        let mesh = server.render_mesh(models.as_ref(), radius);
         let atlas = TextureAtlas::load(&mut assets, mesh.textures.iter().cloned())?;
+        let block_table = Arc::new(server.world.table.clone());
+        let mesh_worker = MeshWorker::new(models);
         Ok(Self {
             world_root,
             server,
-            models,
             assets,
             atlas,
             mesh,
+            mesh_worker,
+            block_table,
         })
     }
 }
@@ -246,10 +261,11 @@ impl Loaded {
 struct Pending {
     world_root: PathBuf,
     server: IntegratedServer,
-    models: ModelPack,
     assets: VanillaAssets,
     atlas: TextureAtlas,
     mesh: Mesh,
+    mesh_worker: MeshWorker,
+    block_table: Arc<BlockTable>,
     width: u32,
     height: u32,
     radius: i32,
@@ -263,10 +279,22 @@ struct PlayState {
     server: IntegratedServer,
     /// The world directory chunks are saved into on the timer and on exit.
     world_root: PathBuf,
-    models: ModelPack,
     assets: VanillaAssets,
     atlas: TextureAtlas,
     mesh: Mesh,
+    /// Background remesher. The render thread only swaps its finished meshes.
+    mesh_worker: MeshWorker,
+    /// The world's block table, shared by every captured snapshot.
+    block_table: Arc<BlockTable>,
+    /// Generation of the mesh currently on screen; older results are stale.
+    installed_generation: u64,
+    /// Generation to give the next background remesh.
+    next_generation: u64,
+    /// Highest generation handed to the worker.
+    requested_generation: u64,
+    /// A change arrived while a remesh was in flight; send the newest state
+    /// once that result lands instead of queueing a backlog of snapshots.
+    remesh_wanted: bool,
     radius: i32,
     frames_limit: u32,
     frames_presented: u32,
@@ -315,6 +343,54 @@ impl PlayState {
             }
         }
     }
+
+    /// Captures the visible region and asks the worker for a newer mesh.
+    ///
+    /// At most one remesh is in flight; changes that arrive meanwhile set
+    /// [`Self::remesh_wanted`], so a mining burst cannot queue a backlog of
+    /// snapshots. Only the block-id copy happens here; the meshing runs on the
+    /// worker thread.
+    fn request_remesh(&mut self) {
+        if self.installed_generation < self.requested_generation {
+            self.remesh_wanted = true;
+            return;
+        }
+        let center = [
+            self.server.player.position[0].floor() as i32,
+            self.server.player.position[2].floor() as i32,
+        ];
+        // One extra ring so the faces on the edge of the visible mesh cull
+        // against the same neighbours the synchronous world mesh saw.
+        let chunks = chunks_around(center, self.radius.saturating_add(1));
+        let snapshot = Arc::new(WorldSnapshot::capture_from_world(
+            &self.server.world,
+            &self.block_table,
+            &chunks,
+        ));
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        self.requested_generation = generation;
+        self.remesh_wanted = false;
+        self.mesh_worker
+            .request(snapshot, center, self.radius, generation);
+    }
+
+    /// Installs every finished mesh newer than the visible one, then sends
+    /// the coalesced remesh, if any, once no build is outstanding.
+    fn poll_mesh_worker(&mut self) -> Result<(), String> {
+        while let Some(result) = self.mesh_worker.try_recv() {
+            if !mesh_supersedes(result.generation, self.installed_generation) {
+                continue;
+            }
+            self.atlas = TextureAtlas::load(&mut self.assets, result.textures.iter().cloned())?;
+            self.mesh = result.mesh;
+            self.installed_generation = result.generation;
+        }
+        if self.remesh_wanted {
+            self.request_remesh();
+        }
+        Ok(())
+    }
 }
 
 /// The winit application: owns the play state and funnels errors out.
@@ -342,10 +418,11 @@ pub fn run() -> Result<(), String> {
         pending: Some(Pending {
             world_root: loaded.world_root,
             server: loaded.server,
-            models: loaded.models,
             assets: loaded.assets,
             atlas: loaded.atlas,
             mesh: loaded.mesh,
+            mesh_worker: loaded.mesh_worker,
+            block_table: loaded.block_table,
             width: options.width,
             height: options.height,
             radius: options.radius,
@@ -395,10 +472,11 @@ pub fn run_android(
         pending: Some(Pending {
             world_root: loaded.world_root,
             server: loaded.server,
-            models: loaded.models,
             assets: loaded.assets,
             atlas: loaded.atlas,
             mesh: loaded.mesh,
+            mesh_worker: loaded.mesh_worker,
+            block_table: loaded.block_table,
             width: 1,
             height: 1,
             radius: ANDROID_RADIUS,
@@ -417,8 +495,8 @@ pub fn run_android(
 }
 
 impl PlayApp {
-    /// Runs one 1/20 s tick and rebuilds the visible mesh when the world or
-    /// the player's chunk changed.
+    /// Runs one 1/20 s tick and asks the background worker to remesh when the
+    /// world or the player's chunk changed.
     fn tick(&mut self) -> Result<(), String> {
         let Some(state) = self.state.as_mut() else {
             return Ok(());
@@ -443,13 +521,13 @@ impl PlayApp {
         state.place_block = false;
         state.server.tick(&input);
         let chunk = player_chunk(&state.server.player);
-        if state.server.dirty || chunk != state.last_chunk {
-            state.mesh = state.server.render_mesh(&state.models, state.radius);
-            state.atlas =
-                TextureAtlas::load(&mut state.assets, state.mesh.textures.iter().cloned())?;
+        let changed = state.server.dirty || chunk != state.last_chunk;
+        if changed {
             state.server.dirty = false;
             state.last_chunk = chunk;
+            state.request_remesh();
         }
+        state.poll_mesh_worker()?;
         Ok(())
     }
 
@@ -467,6 +545,8 @@ impl PlayApp {
             &mut state.hud,
             &state.touch,
             state.server.inventory.slots(),
+            &state.server.inventory,
+            Some(&state.atlas),
             state.touch_active,
             size.width,
             size.height,
@@ -582,10 +662,15 @@ impl ApplicationHandler for PlayApp {
             renderer,
             server: pending.server,
             world_root: pending.world_root,
-            models: pending.models,
             assets: pending.assets,
             atlas: pending.atlas,
             mesh: pending.mesh,
+            mesh_worker: pending.mesh_worker,
+            block_table: pending.block_table,
+            installed_generation: 0,
+            next_generation: 1,
+            requested_generation: 0,
+            remesh_wanted: false,
             radius: pending.radius,
             frames_limit: pending.frames,
             frames_presented: 0,
@@ -729,6 +814,13 @@ fn player_chunk(player: &Player) -> [i32; 2] {
     ]
 }
 
+/// Whether a finished worker mesh is newer than the one on screen. Worker
+/// results can arrive after a newer mesh was already installed; those stale
+/// generations must not roll the visible world back.
+fn mesh_supersedes(result_generation: u64, installed_generation: u64) -> bool {
+    result_generation > installed_generation
+}
+
 /// A first-person camera at the player's eye looking along [`Player::look`].
 fn camera_for(player: &Player) -> Camera {
     let eye = player.eye();
@@ -816,6 +908,8 @@ fn fill_hud(
     hud: &mut Vec<HudVertex>,
     touch: &TouchControls,
     slots: &[Option<BlockState>; 9],
+    inventory: &Inventory,
+    atlas: Option<&TextureAtlas>,
     active: bool,
     width: u32,
     height: u32,
@@ -838,18 +932,32 @@ fn fill_hud(
         ));
     }
     for (slot, (rect, _)) in hotbar.iter().enumerate() {
-        let Some(state) = slots[slot].as_ref() else {
-            continue;
-        };
         let inset_x = rect[2] * HOTBAR_SWATCH_INSET;
         let inset_y = rect[3] * HOTBAR_SWATCH_INSET;
-        hud.extend_from_slice(&hud_rect(
-            rect[0] + inset_x,
-            rect[1] + inset_y,
-            rect[2] - inset_x * 2.0,
-            rect[3] - inset_y * 2.0,
-            block_swatch_color(&state.name),
-        ));
+        // Icons come from the creative preset's own textures: the HUD
+        // slots show what the hotbar gives the player, not the slot array.
+        let icon = inventory
+            .icon_texture(slot)
+            .and_then(|texture| hud_icon_quads(atlas, texture, *rect, inset_x, inset_y));
+        match icon {
+            Some(quads) => hud.extend(quads),
+            // No atlas entry (or no atlas yet): keep a flat swatch so the
+            // slot still reads as filled.
+            None => {
+                let color = slots[slot]
+                    .as_ref()
+                    .map_or([0.65, 0.65, 0.65, 1.0], |state| {
+                        block_swatch_color(&state.name)
+                    });
+                hud.extend_from_slice(&hud_rect(
+                    rect[0] + inset_x,
+                    rect[1] + inset_y,
+                    rect[2] - inset_x * 2.0,
+                    rect[3] - inset_y * 2.0,
+                    color,
+                ));
+            }
+        }
     }
     // The brighter overlay goes last so it also tints the item swatch.
     if let Some((rect, _)) = hotbar.iter().find(|(_, selected)| *selected) {
@@ -879,6 +987,51 @@ fn block_swatch_color(name: &str) -> [f32; 4] {
         "white_wool" => [0.93, 0.93, 0.93, 1.0],
         _ => [0.65, 0.65, 0.65, 1.0],
     }
+}
+
+/// One hotbar block icon as a grid of HUD quads, sampled from the atlas.
+///
+/// The HUD pipeline has no texture sampling, so `ICON_GRID` horizontal bands
+/// of row-averaged colours (with alpha, so glass reads as see-through) stand
+/// in for the real sprite. Returns `None` when the atlas lacks the texture,
+/// and the caller then draws a flat swatch.
+fn hud_icon_quads(
+    atlas: Option<&TextureAtlas>,
+    texture: &str,
+    slot: [f32; 4],
+    inset_x: f32,
+    inset_y: f32,
+) -> Option<Vec<HudVertex>> {
+    let atlas = atlas?;
+    atlas.sprite_rect(texture)?;
+    let x = slot[0] + inset_x;
+    let y = slot[1] + inset_y;
+    let width = slot[2] - inset_x * 2.0;
+    let height = slot[3] - inset_y * 2.0;
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let cell_h = height / ICON_GRID as f32;
+    // The HUD has no texture sampling, so the icon is drawn as a vertical run
+    // of full-width bands whose colours average each row of cells. That keeps
+    // the vertex count at one quad per row and still shows the sprite's
+    // shape and alpha.
+    let mut quads = Vec::with_capacity(ICON_GRID * 6);
+    for row in 0..ICON_GRID {
+        let mut channels = [0.0f32; 4];
+        for column in 0..ICON_GRID {
+            let u = (column as f32 + 0.5) / ICON_GRID as f32;
+            let v = (row as f32 + 0.5) / ICON_GRID as f32;
+            let [r, g, b, a] = atlas.sample(texture, u, v)?;
+            channels[0] += f32::from(r) / 255.0;
+            channels[1] += f32::from(g) / 255.0;
+            channels[2] += f32::from(b) / 255.0;
+            channels[3] += f32::from(a) / 255.0;
+        }
+        let color = channels.map(|sum| sum / ICON_GRID as f32);
+        quads.extend_from_slice(&hud_rect(x, y + row as f32 * cell_h, width, cell_h, color));
+    }
+    Some(quads)
 }
 
 /// Two thin quads forming a crosshair centred on the screen. Sizes are
@@ -916,6 +1069,61 @@ fn crosshair_vertices(width: u32, height: u32) -> [HudVertex; 12] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pack holding one flat texture per creative hotbar block, enough for
+    /// the icon grid to sample.
+    fn test_atlas() -> TextureAtlas {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "horizon-1165-app-atlas-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let textures = root.join("minecraft/textures/block");
+        std::fs::create_dir_all(&textures).unwrap();
+        for name in [
+            "stone",
+            "dirt",
+            "grass_block_side",
+            "oak_planks",
+            "oak_log",
+            "glass",
+            "bricks",
+            "stone_bricks",
+            "white_wool",
+            "destroy_stage_0",
+        ] {
+            let file = std::fs::File::create(textures.join(format!("{name}.png"))).unwrap();
+            let mut encoder = png::Encoder::new(file, 4, 4);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer
+                .write_image_data(&[120, 140, 90, 255].repeat(16))
+                .unwrap();
+            writer.finish().unwrap();
+        }
+        let atlas = TextureAtlas::from_directory(
+            &root,
+            [
+                "minecraft:block/stone",
+                "minecraft:block/dirt",
+                "minecraft:block/grass_block_side",
+                "minecraft:block/oak_planks",
+                "minecraft:block/oak_log",
+                "minecraft:block/glass",
+                "minecraft:block/bricks",
+                "minecraft:block/stone_bricks",
+                "minecraft:block/white_wool",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+        atlas
+    }
 
     fn arg(text: &str) -> OsString {
         OsString::from(text)
@@ -1051,6 +1259,16 @@ mod tests {
     }
 
     #[test]
+    fn newer_mesh_generations_install_in_order() {
+        // Gen 1 then gen 2 both replace what is on screen.
+        assert!(mesh_supersedes(1, 0));
+        assert!(mesh_supersedes(2, 1));
+        // A late gen 1 must not roll back an installed gen 2.
+        assert!(!mesh_supersedes(1, 2));
+        assert!(!mesh_supersedes(2, 2));
+    }
+
+    #[test]
     fn digits_map_to_hotbar_slots() {
         assert_eq!(hotbar_slot(KeyCode::Digit1), Some(0));
         assert_eq!(hotbar_slot(KeyCode::Digit5), Some(4));
@@ -1128,12 +1346,36 @@ mod tests {
         touch.resize(800.0, 600.0);
         let slots: [Option<BlockState>; 9] = std::array::from_fn(|_| None);
         let mut hud = Vec::new();
-        fill_hud(&mut hud, &touch, &slots, false, 800, 600);
+        fill_hud(
+            &mut hud,
+            &touch,
+            &slots,
+            &Inventory::creative(),
+            None,
+            false,
+            800,
+            600,
+        );
         assert!(hud.is_empty());
-        fill_hud(&mut hud, &touch, &slots, true, 800, 600);
-        // The four touch rectangles, nine hotbar backgrounds, the selected
+        fill_hud(
+            &mut hud,
+            &touch,
+            &slots,
+            &Inventory::creative(),
+            None,
+            true,
+            800,
+            600,
+        );
+        // The four touch rectangles, nine hotbar backgrounds, the eight
+        // icon grid cells of every creative slot with an icon, the selected
         // overlay and the two-quad crosshair.
-        assert_eq!(hud.len(), touch.hud_rects().len() * 6 + 9 * 6 + 6 + 12);
+        // Empty slots keep the flat swatch; the atlas holds icons for every
+        // creative slot.
+        assert_eq!(
+            hud.len(),
+            touch.hud_rects().len() * 6 + 9 * 6 + 9 * 6 + 6 + 12
+        );
         for vertex in &hud {
             assert!(vertex.position[0].is_finite());
             assert!(vertex.position[1].is_finite());
@@ -1141,7 +1383,16 @@ mod tests {
             assert!((-1.0..=1.0).contains(&vertex.position[1]));
         }
         // The buffer is reused, not appended to, on the next frame.
-        fill_hud(&mut hud, &touch, &slots, false, 800, 600);
+        fill_hud(
+            &mut hud,
+            &touch,
+            &slots,
+            &Inventory::creative(),
+            None,
+            false,
+            800,
+            600,
+        );
         assert!(hud.is_empty());
     }
 
@@ -1210,33 +1461,64 @@ mod tests {
     }
 
     #[test]
-    fn hud_draws_hotbar_swatches_and_a_brighter_selection() {
+    fn hud_draws_hotbar_icons_and_a_brighter_selection() {
         let mut touch = TouchControls::new();
         touch.resize(800.0, 600.0);
         touch.set_selected(3);
         let mut slots: [Option<BlockState>; 9] = std::array::from_fn(|_| None);
         slots[3] = Some(BlockState::new("minecraft:grass_block"));
         let mut hud = Vec::new();
-        fill_hud(&mut hud, &touch, &slots, true, 800, 600);
+        fill_hud(
+            &mut hud,
+            &touch,
+            &slots,
+            &Inventory::creative(),
+            Some(&test_atlas()),
+            true,
+            800,
+            600,
+        );
 
-        // Four controls, nine backgrounds and one swatch, then the selection.
-        let expected = 4 * 6 + 9 * 6 + 6 + 6 + 12;
+        // Four controls, nine backgrounds and one banded icon per creative
+        // slot in the atlas, then the selection overlay.
+        let expected = 4 * 6 + 9 * 6 + 9 * ICON_GRID * 6 + 6 + 12;
         assert_eq!(hud.len(), expected);
         let selected = hud
             .iter()
             .filter(|vertex| vertex.color == HOTBAR_SELECTED_COLOR)
             .count();
         assert_eq!(selected, 6, "only the selected slot gets the overlay");
+        // The atlas icon stands in for the flat swatch: the swatch colour is
+        // absent and the bands carry the sampled colour instead.
         let swatch = hud
             .iter()
             .filter(|vertex| vertex.color == block_swatch_color("minecraft:grass_block"))
             .count();
-        assert_eq!(swatch, 6);
+        assert_eq!(swatch, 0);
+        let icon_cell = [120.0 / 255.0, 140.0 / 255.0, 90.0 / 255.0, 255.0 / 255.0];
+        let cells = hud
+            .iter()
+            .filter(|vertex| {
+                (vertex.color[0] - icon_cell[0]).abs() < 1e-6
+                    && (vertex.color[1] - icon_cell[1]).abs() < 1e-6
+                    && (vertex.color[2] - icon_cell[2]).abs() < 1e-6
+            })
+            .count();
+        assert_eq!(cells, 9 * ICON_GRID * 6, "icon band vertices");
 
         // Moving the selection moves the brighter overlay: the six selected
         // vertices sit inside the new slot's rect.
         touch.set_selected(7);
-        fill_hud(&mut hud, &touch, &slots, true, 800, 600);
+        fill_hud(
+            &mut hud,
+            &touch,
+            &slots,
+            &Inventory::creative(),
+            None,
+            true,
+            800,
+            600,
+        );
         let rect = touch.hotbar_rects()[7].0;
         let (left, top) = (rect[0] * 2.0 - 1.0, 1.0 - rect[1] * 2.0);
         let (right, bottom) = (

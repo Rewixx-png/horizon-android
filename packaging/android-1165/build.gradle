@@ -7,8 +7,8 @@ android {
         applicationId 'dev.horizon.android1165'
         minSdk 28
         targetSdk 35
-        versionCode 3
-        versionName '0.1.2-dev'
+        versionCode 4
+        versionName '0.1.3-dev'
         ndk { abiFilters providers.gradleProperty('abi').getOrElse('arm64-v8a') }
     }
     signingConfigs {

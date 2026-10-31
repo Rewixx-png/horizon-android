@@ -19,13 +19,14 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 use crate::assets::ModelPack;
 use crate::atlas::{TextureAtlas, VanillaAssets};
 use crate::chunk_mesh::{MeshWorker, WorldSnapshot, chunks_around};
-use crate::inventory::Inventory;
+use crate::inventory::{Inventory, ItemStack};
 use crate::player::{Input, Player};
 use crate::render::{Camera, HudVertex, SurfaceRenderer, hud_rect};
 use crate::server::{FrameInput, IntegratedServer};
+use crate::survival::{GameMode, MAX_FOOD, MAX_HEALTH, Survival};
 use crate::touch::TouchControls;
 use crate::world::World;
-use crate::{BlockState, BlockTable, Mesh};
+use crate::{BlockTable, Mesh};
 
 /// One 1/20 s tick.
 const TICK: Duration = Duration::from_millis(50);
@@ -54,10 +55,26 @@ const HOTBAR_SELECTED_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.40];
 const HOTBAR_SWATCH_INSET: f32 = 0.2;
 /// Number of colour bands a HUD block icon is drawn with.
 const ICON_GRID: usize = 8;
+/// Health points drawn as one heart-like cell each, ten to a row.
+const HEALTH_CELLS: usize = 20;
+const HEALTH_CELLS_PER_ROW: usize = 10;
+/// Red fill for a point of health and gray for the missing remainder.
+const HEALTH_FULL_COLOR: [f32; 4] = [0.85, 0.11, 0.11, 0.95];
+const HEALTH_EMPTY_COLOR: [f32; 4] = [0.22, 0.22, 0.22, 0.75];
+/// Food points drawn as ten cells to a row, gold when present.
+const FOOD_CELLS: usize = 20;
+const FOOD_FULL_COLOR: [f32; 4] = [0.86, 0.52, 0.14, 0.95];
+const FOOD_EMPTY_COLOR: [f32; 4] = [0.22, 0.22, 0.22, 0.75];
+/// Height of one health/food cell as a fraction of a hotbar slot.
+const VITAL_CELL_HEIGHT: f32 = 0.34;
+/// Vertical gap between the hotbar and the vital rows, in slot fractions.
+const VITAL_GAP: f32 = 0.07;
+/// Full-screen tint shown while the survival player is dead.
+const DEATH_TINT_COLOR: [f32; 4] = [0.55, 0.03, 0.03, 0.45];
 
 const USAGE: &str = "usage: horizon-1165 --world <dir> --tables <file> --client-jar <file> \
 --assets-index <file> --assets-objects <dir> [--width <px>] [--height <px>] \
-[--spawn <x> <y> <z>] [--radius <chunks>] [--frames <n>]";
+[--spawn <x> <y> <z>] [--radius <chunks>] [--frames <n>] [--survival]";
 
 /// The parsed play arguments.
 #[derive(Debug)]
@@ -74,6 +91,8 @@ struct PlayOptions {
     radius: i32,
     /// Exit after this many presented frames; 0 runs forever.
     frames: u32,
+    /// Start in survival mode instead of the default creative mode.
+    survival: bool,
 }
 
 /// Parses the play arguments. Every flag takes its value as the following
@@ -94,6 +113,7 @@ where
     let mut spawn = None;
     let mut radius = DEFAULT_RADIUS;
     let mut frames = 0u32;
+    let mut survival = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -110,6 +130,7 @@ where
             "--height" => height = parse_number(&args, &mut i, flag)?,
             "--radius" => radius = parse_number(&args, &mut i, flag)?,
             "--frames" => frames = parse_number(&args, &mut i, flag)?,
+            "--survival" => survival = true,
             "--spawn" => {
                 let x = parse_number(&args, &mut i, flag)?;
                 let y = parse_number(&args, &mut i, flag)?;
@@ -165,6 +186,7 @@ where
         spawn,
         radius,
         frames,
+        survival,
     })
 }
 
@@ -223,7 +245,18 @@ impl Loaded {
     ) -> Result<Self, String> {
         let table = BlockTable::load(tables)?;
         let world_root = world;
-        let world = World::open(&world_root, table)?;
+        let mut world = World::open(&world_root, table)?;
+        // The server jar sits beside the world in the bundled layout; loot is
+        // optional, the block-table fallback still drops most blocks.
+        let server_jar = client_jar
+            .parent()
+            .map(|directory| directory.join("server.jar"))
+            .filter(|path| path.is_file());
+        if let Some(server_jar) = server_jar
+            && let Err(error) = world.load_loot(&server_jar)
+        {
+            eprintln!("loot tables from {}: {error}", server_jar.display());
+        }
         // The mesh worker owns this pack exclusively from here on, so it does
         // not need `Sync`: `MeshWorker` moves the sole `Arc` to its thread.
         #[allow(clippy::arc_with_non_send_sync)]
@@ -313,6 +346,8 @@ struct PlayState {
     look: Option<[f32; 2]>,
     break_block: bool,
     place_block: bool,
+    /// One-shot attack from the mouse or the touch attack button.
+    attack: bool,
     select: Option<usize>,
     scroll: i32,
     last_tick: Instant,
@@ -413,6 +448,10 @@ pub fn run() -> Result<(), String> {
         options.spawn,
         options.radius,
     )?;
+    let mut loaded = loaded;
+    if options.survival {
+        loaded.server.survival.toggle_mode();
+    }
 
     let mut app = PlayApp {
         pending: Some(Pending {
@@ -514,11 +553,15 @@ impl PlayApp {
             ),
             break_block: state.break_block || touch.break_block,
             place_block: state.place_block || touch.place_block,
+            // Mouse-left and the touch attack button both attack; a look tap
+            // still breaks through `break_block`, independently.
+            attack: state.attack || touch.attack,
             select: merge_select(state.select.take(), touch.select),
             scroll: std::mem::take(&mut state.scroll),
         };
         state.break_block = false;
         state.place_block = false;
+        state.attack = false;
         state.server.tick(&input);
         let chunk = player_chunk(&state.server.player);
         let changed = state.server.dirty || chunk != state.last_chunk;
@@ -538,19 +581,28 @@ impl PlayApp {
         };
         let camera = camera_for(&state.server.player);
         let size = state.window.inner_size();
-        // Keyboard digits, the wheel and touch all converge on the inventory,
-        // so mirror its selection into the touch HUD's highlight.
-        state.touch.set_selected(state.server.inventory.selected());
+        // Keyboard digits, the wheel and touch all converge on the active
+        // inventory, so mirror its selection into the touch HUD's highlight.
+        let survival = &state.server.survival;
+        let inventory = if survival.is_creative() {
+            &state.server.inventory
+        } else {
+            &survival.inventory
+        };
+        state.touch.set_selected(inventory.selected());
         fill_hud(
             &mut state.hud,
             &state.touch,
-            state.server.inventory.slots(),
-            &state.server.inventory,
+            inventory.slots(),
+            inventory,
             Some(&state.atlas),
             state.touch_active,
             size.width,
             size.height,
         );
+        if survival.mode == GameMode::Survival {
+            survival_hud(&mut state.hud, &state.touch, survival);
+        }
         state
             .renderer
             .render_with_hud(&state.mesh, &state.atlas, camera, &state.hud)
@@ -580,6 +632,11 @@ impl PlayApp {
             KeyCode::Space if !event.repeat => state.movement.jump = pressed,
             KeyCode::ShiftLeft | KeyCode::ShiftRight => state.movement.sprint = pressed,
             KeyCode::ControlLeft | KeyCode::ControlRight => state.movement.sneak = pressed,
+            // F1 toggles survival/creative, for checking the survival HUD.
+            KeyCode::F1 if pressed && !event.repeat => {
+                state.server.survival.toggle_mode();
+                eprintln!("mode: {:?}", state.server.survival.mode);
+            }
             KeyCode::Escape if pressed && !event.repeat => {
                 if state.cursor_grabbed {
                     let _ = state.window.set_cursor_grab(CursorGrabMode::None);
@@ -683,6 +740,7 @@ impl ApplicationHandler for PlayApp {
             look: None,
             break_block: false,
             place_block: false,
+            attack: false,
             select: None,
             scroll: 0,
             last_tick: Instant::now(),
@@ -725,7 +783,12 @@ impl ApplicationHandler for PlayApp {
             } => {
                 let state = self.state.as_mut().unwrap();
                 match button {
-                    MouseButton::Left => state.break_block = true,
+                    MouseButton::Left => {
+                        // Left click attacks; `break_block` stays set so
+                        // creative instant-break behaviour is unchanged.
+                        state.break_block = true;
+                        state.attack = true;
+                    }
                     MouseButton::Right => state.place_block = true,
                     _ => {}
                 }
@@ -903,11 +966,12 @@ fn apply_look_delta(base: [f32; 2], delta: [f32; 2]) -> [f32; 2] {
 
 /// Rebuilds `hud` for one frame: the touch controls and hotbar when they are
 /// active, plus a small crosshair. An inactive HUD is left empty, so the
-/// desktop frame is identical to [`SurfaceRenderer::render`].
+/// desktop creative frame is identical to [`SurfaceRenderer::render`];
+/// survival vitals are appended separately by [`survival_hud`].
 fn fill_hud(
     hud: &mut Vec<HudVertex>,
     touch: &TouchControls,
-    slots: &[Option<BlockState>; 9],
+    slots: &[Option<ItemStack>; 9],
     inventory: &Inventory,
     atlas: Option<&TextureAtlas>,
     active: bool,
@@ -938,7 +1002,7 @@ fn fill_hud(
         // slots show what the hotbar gives the player, not the slot array.
         let icon = inventory
             .icon_texture(slot)
-            .and_then(|texture| hud_icon_quads(atlas, texture, *rect, inset_x, inset_y));
+            .and_then(|texture| hud_icon_quads(atlas, &texture, *rect, inset_x, inset_y));
         match icon {
             Some(quads) => hud.extend(quads),
             // No atlas entry (or no atlas yet): keep a flat swatch so the
@@ -946,8 +1010,8 @@ fn fill_hud(
             None => {
                 let color = slots[slot]
                     .as_ref()
-                    .map_or([0.65, 0.65, 0.65, 1.0], |state| {
-                        block_swatch_color(&state.name)
+                    .map_or([0.65, 0.65, 0.65, 1.0], |stack| {
+                        block_swatch_color(&stack.item)
                     });
                 hud.extend_from_slice(&hud_rect(
                     rect[0] + inset_x,
@@ -970,6 +1034,100 @@ fn fill_hud(
         ));
     }
     hud.extend_from_slice(&crosshair_vertices(width, height));
+}
+
+/// Appends the survival-only HUD: a health bar and a food bar above the
+/// hotbar, plus a full-screen red tint while the player is dead.
+///
+/// Creative players add no vertices, which keeps the creative HUD byte
+/// identical to the pre-survival frame. Positions are derived from the touch
+/// hotbar layout so both bars line up with the slots at every resolution.
+fn survival_hud(hud: &mut Vec<HudVertex>, touch: &TouchControls, survival: &Survival) {
+    if survival.mode != GameMode::Survival {
+        return;
+    }
+    let hotbar = touch.hotbar_rects();
+    let first = hotbar[0].0;
+    let last = hotbar[crate::touch::HOTBAR_SLOTS - 1].0;
+    let left = first[0];
+    let bar_width = last[0] + last[2] - first[0];
+    let cell_width = bar_width / HEALTH_CELLS_PER_ROW as f32;
+    // Small inset so neighbouring cells read as separate pips.
+    let pip_width = cell_width * 0.84;
+    let pip_inset = (cell_width - pip_width) * 0.5;
+    let cell_height = first[3] * VITAL_CELL_HEIGHT;
+    let gap = first[3] * VITAL_GAP;
+    let row_gap = cell_height * 0.18;
+
+    // Food sits directly above the hotbar; health sits above food.
+    let food_y = first[1] - gap - cell_height;
+    let health_y = food_y - cell_height - row_gap;
+
+    let health = survival.health.clamp(0.0, MAX_HEALTH);
+    draw_bar(
+        hud,
+        left,
+        health_y,
+        cell_width,
+        pip_width,
+        pip_inset,
+        cell_height,
+        row_gap,
+        HEALTH_CELLS,
+        |cell| cell as f32 + 0.5 < health,
+        HEALTH_FULL_COLOR,
+        HEALTH_EMPTY_COLOR,
+    );
+
+    let food = survival.food.clamp(0, MAX_FOOD);
+    draw_bar(
+        hud,
+        left,
+        food_y,
+        cell_width,
+        pip_width,
+        pip_inset,
+        cell_height,
+        row_gap,
+        FOOD_CELLS,
+        |cell| cell < food as usize,
+        FOOD_FULL_COLOR,
+        FOOD_EMPTY_COLOR,
+    );
+
+    if survival.dead {
+        hud.extend_from_slice(&hud_rect(0.0, 0.0, 1.0, 1.0, DEATH_TINT_COLOR));
+    }
+}
+
+/// Draws a two-row bar of `cells` pips, ten to a row, bottom row first.
+#[allow(clippy::too_many_arguments)]
+fn draw_bar(
+    hud: &mut Vec<HudVertex>,
+    left: f32,
+    bottom: f32,
+    cell_width: f32,
+    pip_width: f32,
+    pip_inset: f32,
+    cell_height: f32,
+    row_gap: f32,
+    cells: usize,
+    filled: impl Fn(usize) -> bool,
+    full_color: [f32; 4],
+    empty_color: [f32; 4],
+) {
+    for cell in 0..cells {
+        let row = cell / HEALTH_CELLS_PER_ROW;
+        let column = cell % HEALTH_CELLS_PER_ROW;
+        let x = left + column as f32 * cell_width + pip_inset;
+        let y = bottom - row as f32 * (cell_height + row_gap);
+        let color = if filled(cell) {
+            full_color
+        } else {
+            empty_color
+        };
+        hud.extend_from_slice(&hud_rect(x, y, pip_width, cell_height, color));
+    }
 }
 
 /// Swatch color for one hotbar block, keyed by its name without the
@@ -1344,7 +1502,7 @@ mod tests {
     fn touch_hud_is_hidden_until_touch_is_active() {
         let mut touch = TouchControls::new();
         touch.resize(800.0, 600.0);
-        let slots: [Option<BlockState>; 9] = std::array::from_fn(|_| None);
+        let slots: [Option<ItemStack>; 9] = std::array::from_fn(|_| None);
         let mut hud = Vec::new();
         fill_hud(
             &mut hud,
@@ -1367,7 +1525,7 @@ mod tests {
             800,
             600,
         );
-        // The four touch rectangles, nine hotbar backgrounds, the eight
+        // The five touch rectangles, nine hotbar backgrounds, the eight
         // icon grid cells of every creative slot with an icon, the selected
         // overlay and the two-quad crosshair.
         // Empty slots keep the flat swatch; the atlas holds icons for every
@@ -1424,7 +1582,7 @@ mod tests {
         let colors: Vec<[f32; 4]> = inventory
             .slots()
             .iter()
-            .map(|slot| block_swatch_color(&slot.as_ref().unwrap().name))
+            .map(|slot| block_swatch_color(&slot.as_ref().unwrap().item))
             .collect();
         for (i, a) in colors.iter().enumerate() {
             for b in &colors[i + 1..] {
@@ -1465,8 +1623,8 @@ mod tests {
         let mut touch = TouchControls::new();
         touch.resize(800.0, 600.0);
         touch.set_selected(3);
-        let mut slots: [Option<BlockState>; 9] = std::array::from_fn(|_| None);
-        slots[3] = Some(BlockState::new("minecraft:grass_block"));
+        let mut slots: [Option<ItemStack>; 9] = std::array::from_fn(|_| None);
+        slots[3] = Some(ItemStack::new("minecraft:grass_block", 1));
         let mut hud = Vec::new();
         fill_hud(
             &mut hud,
@@ -1479,9 +1637,9 @@ mod tests {
             600,
         );
 
-        // Four controls, nine backgrounds and one banded icon per creative
+        // The five controls, nine backgrounds and one banded icon per creative
         // slot in the atlas, then the selection overlay.
-        let expected = 4 * 6 + 9 * 6 + 9 * ICON_GRID * 6 + 6 + 12;
+        let expected = touch.hud_rects().len() * 6 + 9 * 6 + 9 * ICON_GRID * 6 + 6 + 12;
         assert_eq!(hud.len(), expected);
         let selected = hud
             .iter()
@@ -1534,6 +1692,127 @@ mod tests {
             assert!(vertex.position[0] >= left - 1e-5 && vertex.position[0] <= right + 1e-5);
             assert!(vertex.position[1] >= bottom - 1e-5 && vertex.position[1] <= top + 1e-5);
         }
+    }
+
+    /// One frame of HUD vertices for a survival/creative player, mirroring the
+    /// order in [`PlayApp::render`].
+    fn vital_hud(touch: &TouchControls, survival: &Survival) -> Vec<HudVertex> {
+        let mut hud = Vec::new();
+        fill_hud(
+            &mut hud,
+            touch,
+            survival.inventory.slots(),
+            &survival.inventory,
+            None,
+            true,
+            800,
+            600,
+        );
+        if survival.mode == GameMode::Survival {
+            survival_hud(&mut hud, touch, survival);
+        }
+        hud
+    }
+
+    #[test]
+    fn creative_hud_is_unchanged_by_the_survival_overlay() {
+        let mut touch = TouchControls::new();
+        touch.resize(800.0, 600.0);
+        let survival = Survival::creative();
+        let hud = vital_hud(&touch, &survival);
+
+        // Exactly the pre-survival creative frame: controls, nine slot
+        // backgrounds, nine flat swatches (no atlas), the selection overlay
+        // and the crosshair. No health, food or tint vertices.
+        let expected = touch.hud_rects().len() * 6 + 9 * 6 + 9 * 6 + 6 + 12;
+        assert_eq!(hud.len(), expected);
+        let mut overlay = Vec::new();
+        survival_hud(&mut overlay, &touch, &survival);
+        assert!(overlay.is_empty(), "creative adds no survival vertices");
+    }
+
+    #[test]
+    fn survival_hud_adds_health_food_and_a_death_tint() {
+        let mut touch = TouchControls::new();
+        touch.resize(800.0, 600.0);
+        let mut survival = Survival::new();
+        assert_eq!(survival.mode, GameMode::Survival);
+
+        let without_vitals = {
+            let mut hud = Vec::new();
+            fill_hud(
+                &mut hud,
+                &touch,
+                survival.inventory.slots(),
+                &survival.inventory,
+                None,
+                true,
+                800,
+                600,
+            );
+            hud
+        };
+        let hud = vital_hud(&touch, &survival);
+        assert_eq!(hud.len(), without_vitals.len() + 40 * 6);
+
+        // Full health and food fill every pip red/gold.
+        assert_eq!(
+            hud.iter()
+                .filter(|vertex| vertex.color == HEALTH_FULL_COLOR)
+                .count(),
+            20 * 6
+        );
+        assert_eq!(
+            hud.iter()
+                .filter(|vertex| vertex.color == FOOD_FULL_COLOR)
+                .count(),
+            20 * 6
+        );
+
+        // Every vital pip sits above the hotbar and inside clip space.
+        let hotbar_top = 1.0 - 2.0 * touch.hotbar_rects()[0].0[1];
+        for vertex in hud.iter().filter(|vertex| {
+            vertex.color == HEALTH_FULL_COLOR
+                || vertex.color == HEALTH_EMPTY_COLOR
+                || vertex.color == FOOD_FULL_COLOR
+        }) {
+            assert!(vertex.position[1] >= hotbar_top - 1e-4);
+            assert!((-1.0..=1.0).contains(&vertex.position[1]));
+            assert!((-1.0..=1.0).contains(&vertex.position[0]));
+        }
+
+        // Damage and death: six health pips, three food pips, the rest gray,
+        // and one full-screen red tint quad on top.
+        survival.health = 6.0;
+        survival.food = 3;
+        survival.dead = true;
+        let mut dead = Vec::new();
+        survival_hud(&mut dead, &touch, &survival);
+        assert_eq!(dead.len(), 40 * 6 + 6);
+        assert_eq!(
+            dead.iter()
+                .filter(|vertex| vertex.color == HEALTH_FULL_COLOR)
+                .count(),
+            6 * 6
+        );
+        assert_eq!(
+            dead.iter()
+                .filter(|vertex| vertex.color == FOOD_FULL_COLOR)
+                .count(),
+            3 * 6
+        );
+        assert_eq!(
+            dead.iter()
+                .filter(|vertex| vertex.color == HEALTH_EMPTY_COLOR)
+                .count(),
+            (14 + 17) * 6
+        );
+        assert_eq!(
+            dead.iter()
+                .filter(|vertex| vertex.color == DEATH_TINT_COLOR)
+                .count(),
+            6
+        );
     }
 
     #[test]

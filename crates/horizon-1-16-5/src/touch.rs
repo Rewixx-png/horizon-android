@@ -11,7 +11,8 @@
 //!   in the desktop mouse convention (`yaw -= look[0]`, `pitch += look[1]`),
 //!   and a short tap breaks the targeted block;
 //! - a square place button in the bottom-right corner places the held block on
-//!   press and never starts a look drag;
+//!   press and never starts a look drag; a same-sized attack button sits just
+//!   to its left and triggers one attack/break on press;
 //! - a nine-slot hotbar sits centred just above the joystick and place button.
 //!   Tapping a slot selects it; because the hotbar is hit-tested first, such a
 //!   touch never starts a look drag, breaks a block or jumps.
@@ -44,6 +45,9 @@ const STICK_DEADZONE: f32 = 0.25;
 const PLACE_SIZE: f32 = 0.18;
 /// Distance between the place button and the bottom-right corner.
 const PLACE_MARGIN: f32 = 0.03;
+/// Gap between the attack and place buttons, as a fraction of the smaller
+/// screen side. Both buttons share the same bottom row.
+const ATTACK_GAP: f32 = 0.02;
 /// Height of the faint break-zone hint at the top of the look zone.
 const BREAK_HINT_HEIGHT: f32 = 0.07;
 /// Number of hotbar slots.
@@ -72,6 +76,8 @@ const SECTOR: f32 = 0.382_683_43;
 const STICK_BASE_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.10];
 const STICK_KNOB_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.30];
 const PLACE_BUTTON_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.22];
+/// The attack button is a warm tint so it reads apart from the place button.
+const ATTACK_BUTTON_COLOR: [f32; 4] = [1.0, 0.68, 0.55, 0.24];
 const BREAK_HINT_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.05];
 
 /// One tick of touch input.
@@ -90,6 +96,8 @@ pub struct TouchFrame {
     pub break_block: bool,
     /// Set once when the place button is pressed.
     pub place_block: bool,
+    /// Set once when the attack button is pressed.
+    pub attack: bool,
     /// Set once for a short joystick-zone tap.
     pub jump: bool,
     /// Hotbar slot selected by a touch on the hotbar, if any.
@@ -102,6 +110,8 @@ enum Role {
     Stick,
     Look,
     Place,
+    /// The attack button; pressing it breaks/attacks once.
+    Attack,
     /// A hotbar press; the slot was selected at press time.
     Hotbar,
 }
@@ -118,7 +128,8 @@ struct Finger {
     travel: f32,
 }
 
-/// Virtual joystick, look area, place button and hotbar for one touch screen.
+/// Virtual joystick, look area, place/attack buttons and hotbar for one touch
+/// screen.
 #[derive(Clone, Debug, Default)]
 pub struct TouchControls {
     width: f32,
@@ -133,6 +144,7 @@ pub struct TouchControls {
     jump: bool,
     break_block: bool,
     place_block: bool,
+    attack: bool,
     /// Hotbar slot highlighted by the touch HUD.
     selected: usize,
     /// Slot picked since the last [`TouchControls::frame`].
@@ -177,12 +189,14 @@ impl TouchControls {
             look: self.look,
             break_block: self.break_block,
             place_block: self.place_block,
+            attack: self.attack,
             jump: self.jump,
             select: self.select.take(),
         };
         self.look = [0.0; 2];
         self.break_block = false;
         self.place_block = false;
+        self.attack = false;
         self.jump = false;
         frame
     }
@@ -219,8 +233,9 @@ impl TouchControls {
     /// The visible controls as `(rect, color)` pairs in normalized `0..=1`
     /// coordinates with a top-left origin.
     ///
-    /// The order is fixed: joystick base, joystick knob, place button and the
-    /// faint break-zone hint at the top of the look area.
+    /// The order is fixed: joystick base, joystick knob, place button, attack
+    /// button (same row, immediately left of place) and the faint break-zone
+    /// hint at the top of the look area.
     pub fn hud_rects(&self) -> Vec<([f32; 4], [f32; 4])> {
         let min_side = self.min_side();
         let radius = min_side * STICK_RADIUS;
@@ -231,6 +246,7 @@ impl TouchControls {
         ];
         let knob_radius = min_side * KNOB_RADIUS;
         let place = self.place_rect();
+        let attack = self.attack_rect();
         vec![
             (
                 self.normalize(
@@ -253,6 +269,10 @@ impl TouchControls {
             (
                 self.normalize(place[0], place[1], place[2], place[3]),
                 PLACE_BUTTON_COLOR,
+            ),
+            (
+                self.normalize(attack[0], attack[1], attack[2], attack[3]),
+                ATTACK_BUTTON_COLOR,
             ),
             (
                 // Already a screen fraction: keep the exact normalized edges
@@ -288,6 +308,17 @@ impl TouchControls {
             side,
             side,
         ]
+    }
+
+    /// `(x, y, width, height)` of the attack button in pixels.
+    ///
+    /// It is the place button's size, shifted one button plus a gap to the
+    /// left so the two never overlap.
+    fn attack_rect(&self) -> [f32; 4] {
+        let side = self.min_side() * PLACE_SIZE;
+        let gap = self.min_side() * ATTACK_GAP;
+        let place = self.place_rect();
+        [place[0] - gap - side, place[1], side, side]
     }
 
     /// `(x, y, width, height)` of hotbar `slot` in pixels.
@@ -389,7 +420,24 @@ impl TouchControls {
             }
         }
 
-        // The button is checked next so a touch on it can never become a
+        // The attack button is checked next to the place button so a touch on
+        // it can never become a look drag either.
+        if contains(self.attack_rect(), point) {
+            if self.has_role(Role::Attack) {
+                return;
+            }
+            self.attack = true;
+            self.fingers.insert(
+                id,
+                Finger {
+                    role: Role::Attack,
+                    ..finger
+                },
+            );
+            return;
+        }
+
+        // The place button is checked next so a touch on it can never become a
         // look drag, even though it sits inside the look zone.
         if contains(self.place_rect(), point) {
             if self.has_role(Role::Place) {
@@ -448,6 +496,8 @@ impl TouchControls {
                 self.look[1] += delta[1] * LOOK_DEGREES_PER_PIXEL;
             }
             Role::Place => {}
+            // The attack button acts once on press; dragging is inert.
+            Role::Attack => {}
             // A hotbar finger owns the slot; dragging must not look or act.
             Role::Hotbar => {}
         }
@@ -474,6 +524,8 @@ impl TouchControls {
             Role::Stick => self.jump = true,
             Role::Look => self.break_block = true,
             Role::Place => {}
+            // The attack acted on press; releasing never acts again.
+            Role::Attack => {}
             // Selection already happened on press; releasing never acts.
             Role::Hotbar => {}
         }
@@ -691,6 +743,105 @@ mod tests {
         assert!(!controls.frame().place_block);
     }
 
+    /// Whether two pixel rectangles share any area.
+    fn overlaps(a: [f32; 4], b: [f32; 4]) -> bool {
+        a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3]
+    }
+
+    #[test]
+    fn attack_button_sits_left_of_place_without_overlapping() {
+        let controls = controls();
+        let place = controls.place_rect();
+        let attack = controls.attack_rect();
+
+        // Same size, same row, immediately left of the place button.
+        assert_eq!(attack[2], place[2]);
+        assert_eq!(attack[3], place[3]);
+        assert_eq!(attack[1], place[1]);
+        assert!(attack[0] + attack[2] < place[0], "gap between the buttons");
+        assert!(!overlaps(attack, place));
+
+        // On screen, and clear of every hotbar slot.
+        assert!(attack[0] > 0.0, "{attack:?}");
+        assert!(attack[0] + attack[2] <= W);
+        assert!(attack[1] + attack[3] <= H);
+        for slot in 0..HOTBAR_SLOTS {
+            let rect = controls.hotbar_slot_rect(slot);
+            assert!(!overlaps(attack, rect), "slot {slot}");
+            assert!(!overlaps(place, rect), "slot {slot}");
+        }
+
+        // The HUD exposes the same rectangle at index 3, with its own colour.
+        let rects = controls.hud_rects();
+        let normalized = rects[3].0;
+        assert!((normalized[0] - attack[0] / W).abs() < 1e-5);
+        assert!((normalized[1] - attack[1] / H).abs() < 1e-5);
+        assert!((normalized[2] - attack[2] / W).abs() < 1e-5);
+        assert!((normalized[3] - attack[3] / H).abs() < 1e-5);
+        assert_ne!(rects[3].1, rects[2].1, "the buttons read differently");
+    }
+
+    #[test]
+    fn attack_button_triggers_attack_once_without_other_actions() {
+        let mut controls = controls();
+        let now = Instant::now();
+        let rect = controls.attack_rect();
+        let center = [rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0];
+
+        controls.touch_at(5, TouchPhase::Started, center, now);
+        let frame = controls.frame();
+        assert!(frame.attack);
+        assert!(!frame.break_block);
+        assert!(!frame.place_block);
+        assert!(!frame.jump);
+        assert_eq!(frame.look, [0.0, 0.0]);
+        assert_eq!(frame.select, None);
+        // One-shot: the next tick is clean even while the finger is held.
+        assert!(!controls.frame().attack);
+
+        // Dragging off the button never turns into look or break.
+        let dragged = [center[0] - 90.0, center[1] - 140.0];
+        controls.touch_at(5, TouchPhase::Moved, dragged, at(now, 40));
+        assert_eq!(controls.frame().look, [0.0, 0.0]);
+        controls.touch_at(5, TouchPhase::Ended, dragged, at(now, 90));
+        let frame = controls.frame();
+        assert!(!frame.attack);
+        assert!(!frame.break_block);
+        assert!(!frame.place_block);
+
+        // A second press after the release fires again.
+        controls.touch_at(6, TouchPhase::Started, center, at(now, 200));
+        assert!(controls.frame().attack);
+        controls.touch_at(6, TouchPhase::Ended, center, at(now, 240));
+        let frame = controls.frame();
+        assert!(!frame.attack);
+        assert!(!frame.break_block);
+    }
+
+    #[test]
+    fn attack_and_place_buttons_are_independent() {
+        let mut controls = controls();
+        let now = Instant::now();
+        let place = controls.place_rect();
+        let attack = controls.attack_rect();
+        let place_center = [place[0] + place[2] / 2.0, place[1] + place[3] / 2.0];
+        let attack_center = [attack[0] + attack[2] / 2.0, attack[1] + attack[3] / 2.0];
+
+        // Both buttons held at once: both one-shots fire.
+        controls.touch_at(7, TouchPhase::Started, attack_center, now);
+        controls.touch_at(8, TouchPhase::Started, place_center, at(now, 1));
+        let frame = controls.frame();
+        assert!(frame.attack);
+        assert!(frame.place_block);
+        assert!(!frame.break_block);
+
+        // A second finger on an already-held button is ignored.
+        controls.touch_at(9, TouchPhase::Started, attack_center, at(now, 2));
+        let frame = controls.frame();
+        assert!(!frame.attack, "one attack per press");
+        assert!(!frame.place_block);
+    }
+
     #[test]
     fn short_stick_tap_jumps_once() {
         let mut controls = controls();
@@ -804,7 +955,7 @@ mod tests {
         let mut controls = controls();
         let first = controls.hud_rects();
         assert_eq!(first, controls.hud_rects());
-        assert_eq!(first.len(), 4);
+        assert_eq!(first.len(), 5);
 
         for (rect, color) in &first {
             for value in rect.iter().chain(color.iter()) {
@@ -818,9 +969,16 @@ mod tests {
             assert!(rect[1] + rect[3] <= 1.0 + 1e-4, "{rect:?}");
         }
 
-        // Joystick bottom-left, place button bottom-right.
+        // Joystick bottom-left, attack and place buttons bottom-right.
         assert!(first[0].0[0] < 0.5 && first[0].0[1] > 0.5);
         assert!(first[2].0[0] > 0.5 && first[2].0[1] > 0.5);
+        assert!(first[3].0[0] > 0.5 && first[3].0[0] < first[2].0[0]);
+        assert_eq!(first[3].0[1], first[2].0[1], "buttons share a row");
+        assert_eq!(
+            [first[3].0[2], first[3].0[3]],
+            [first[2].0[2], first[2].0[3]],
+            "buttons share a size"
+        );
 
         // Deflecting the stick moves the knob but not the base.
         let center = controls.stick_center();

@@ -121,6 +121,24 @@ struct RawModel {
 #[derive(Debug)]
 struct ResolvedModel {
     elements: Vec<Element>,
+    /// The merged texture variables resolved to absolute sprite names, e.g.
+    /// `layer0 -> minecraft:item/apple`. Element-less models such as
+    /// `item/generated` carry no quads, so their layers are reported from
+    /// this map instead.
+    textures: HashMap<String, String>,
+}
+
+/// One item's 3D inventory render: the baked quads plus the sprite names they
+/// (or, for a generated item model, their texture layers) use.
+///
+/// Quads are in model space (0..16); nothing here is rasterized. A caller
+/// that wants a tiny flat icon reads the sprite PNGs instead, as
+/// [`crate::item_icons::ItemIcons`] does.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ItemRender {
+    pub model: BakedModel,
+    /// Distinct texture names in sorted order, so the list is deterministic.
+    pub textures: Vec<String>,
 }
 
 /// One cuboid element in 0..16 model space.
@@ -295,6 +313,45 @@ impl ModelPack {
             bake_element(element, &transform, &mut quads);
         }
         Some(BakedModel { quads })
+    }
+
+    /// The inventory-render model of `item`, with the texture names it uses.
+    ///
+    /// A name with a blockstate file is a block item and bakes its `block/`
+    /// model; everything else falls back to its `item/` model, matching how
+    /// 1.16.5 names block and item models. Item models such as
+    /// `item/generated` carry no elements, so `model` may be empty while
+    /// `textures` still lists the sprite layers a caller should draw.
+    ///
+    /// Nothing is rasterized here: the quads are in model space (0..16) and
+    /// the texture names are resolved sprite names such as
+    /// `minecraft:block/stone`. Returns `None` when the model is unknown or
+    /// could not be resolved.
+    pub fn render_item(&self, item: &str) -> Option<ItemRender> {
+        let name = namespaced(item);
+        let path = name.strip_prefix("minecraft:")?;
+        let model_name = if self.blockstates.contains_key(&name) {
+            format!("minecraft:block/{path}")
+        } else {
+            format!("minecraft:item/{path}")
+        };
+        let resolved = self.models.get(&model_name)?.as_ref()?;
+        let mut quads = Vec::new();
+        let transform = BlockTransform::new(0, 0, false);
+        for element in &resolved.elements {
+            bake_element(element, &transform, &mut quads);
+        }
+        let mut textures: Vec<String> = if quads.is_empty() {
+            resolved.textures.values().cloned().collect()
+        } else {
+            quads.iter().map(|quad| quad.texture.clone()).collect()
+        };
+        textures.sort();
+        textures.dedup();
+        Some(ItemRender {
+            model: BakedModel { quads },
+            textures,
+        })
     }
 }
 
@@ -674,7 +731,14 @@ fn resolve_model(name: &str, raw_models: &HashMap<String, RawModel>) -> Option<R
             break;
         }
     }
-    Some(ResolvedModel { elements })
+    let resolved_textures: HashMap<String, String> = textures
+        .iter()
+        .map(|(key, value)| (key.clone(), resolve_texture(value, &textures)))
+        .collect();
+    Some(ResolvedModel {
+        elements,
+        textures: resolved_textures,
+    })
 }
 
 /// Resolves an element's face textures against the merged texture map.
@@ -2131,5 +2195,36 @@ mod tests {
         // Baked models are still equal to an independently baked clone.
         let baked = first.expect("stone bakes");
         assert_eq!(baked.quads.len(), 6);
+    }
+
+    #[test]
+    fn render_item_bakes_block_models_and_reports_item_layers() {
+        let mut files = STONE_PACK.to_vec();
+        files.push((
+            "models/item/generated.json",
+            r#"{"textures": {"layer0": "item/apple"}}"#,
+        ));
+        files.push(("models/item/apple.json", r#"{"parent": "item/generated"}"#));
+        let pack = Pack::new(&files);
+
+        // A name with a blockstate file bakes the block model.
+        let stone = pack
+            .pack
+            .render_item("minecraft:stone")
+            .expect("stone renders");
+        assert_eq!(stone.model.quads.len(), 6);
+        assert_eq!(stone.textures, vec!["minecraft:block/stone"]);
+        assert_eq!(pack.pack.render_item("stone").as_ref(), Some(&stone));
+
+        // A generated item model has no elements but exposes its sprite layer.
+        let apple = pack
+            .pack
+            .render_item("minecraft:apple")
+            .expect("apple renders");
+        assert!(apple.model.quads.is_empty());
+        assert_eq!(apple.textures, vec!["minecraft:item/apple"]);
+
+        assert!(pack.pack.render_item("minecraft:unknown_item").is_none());
+        assert!(pack.pack.render_item("").is_none());
     }
 }

@@ -2,15 +2,20 @@
 //!
 //! [`IntegratedServer::open`] loads a world and drops a creative player onto
 //! the surface at block column (0, 0); [`IntegratedServer::tick`] advances
-//! one 1/20 s of look, movement and break/place interaction. The tests below
-//! build a small 1.16.5 region fixture with the same public `horizon_world`
-//! writers the `world.rs` tests use, so `open` spawning and the tick actions
-//! are covered without touching `world.rs`.
+//! one 1/20 s of look, movement, survival rules and break/place interaction.
+//! Creative is the default mode, so the windowed loop keeps its old instant
+//! break/free-block behaviour until [`Survival::toggle_mode`] switches to
+//! survival, where breaks yield drops, stack sizes are finite and hunger,
+//! drowning and fall damage apply. The tests below build a small 1.16.5
+//! region fixture with the same public `horizon_world` writers the `world.rs`
+//! tests use, so `open` spawning and the tick actions are covered without
+//! touching `world.rs`.
 
 use crate::blocks;
 use crate::interact;
 use crate::inventory::Inventory;
 use crate::player::Player;
+use crate::survival::{JUMP_EXHAUSTION, Survival, WALK_EXHAUSTION};
 use crate::world::World;
 use crate::{BlockSource, BlockState, Mesh, ModelSource, chunk_mesh};
 
@@ -24,6 +29,8 @@ pub struct FrameInput {
     pub look: Option<[f32; 2]>,
     pub break_block: bool,
     pub place_block: bool,
+    /// Attack button: breaks the targeted block, with survival drop rules.
+    pub attack: bool,
     pub select: Option<usize>,
     pub scroll: i32,
 }
@@ -31,10 +38,16 @@ pub struct FrameInput {
 pub struct IntegratedServer {
     pub world: World,
     pub player: Player,
+    /// The creative block palette, used while [`Self::survival`] is creative.
     pub inventory: Inventory,
+    /// Survival vitals, mode and finite inventory.
+    pub survival: Survival,
     pub tick_count: u64,
     /// Set when a block changed and the visible mesh must be rebuilt.
     pub dirty: bool,
+    /// Highest `y` reached since the player left the ground; landing uses it
+    /// to compute fall distance.
+    fall_start_y: Option<f64>,
 }
 
 impl IntegratedServer {
@@ -60,32 +73,98 @@ impl IntegratedServer {
             world,
             player: Player::new(spawn),
             inventory: Inventory::creative(),
+            survival: Survival::creative(),
             tick_count: 0,
             dirty: false,
+            fall_start_y: None,
         }
     }
 
-    /// One 1/20 s tick: look, movement, then block actions.
+    /// The inventory the current mode uses for selection and placement.
+    fn active_inventory(&self) -> &Inventory {
+        if self.survival.is_creative() {
+            &self.inventory
+        } else {
+            &self.survival.inventory
+        }
+    }
+
+    /// One 1/20 s tick: look, selection, movement, survival rules, then the
+    /// block actions.
     pub fn tick(&mut self, input: &FrameInput) {
         if let Some([yaw, pitch]) = input.look {
             self.player.yaw = yaw;
             self.player.pitch = pitch.clamp(-90.0, 90.0);
         }
+
+        let creative = self.survival.is_creative();
         if let Some(slot) = input.select {
-            self.inventory.select(slot);
+            if creative {
+                self.inventory.select(slot);
+            } else {
+                self.survival.select(slot);
+            }
         }
         if input.scroll != 0 {
-            self.inventory.scroll(input.scroll);
+            if creative {
+                self.inventory.scroll(input.scroll);
+            } else {
+                self.survival.scroll(input.scroll);
+            }
         }
+
+        let moving = input.movement.forward
+            || input.movement.back
+            || input.movement.left
+            || input.movement.right;
+        let was_on_ground = self.player.on_ground;
         self.player.tick(&self.world, &input.movement);
 
-        if input.break_block {
+        // Exhaustion follows the movement that actually happened, so creative
+        // players (who never exhaust) and standing still cost nothing.
+        if moving {
+            self.survival.exhaust(WALK_EXHAUSTION);
+        }
+        if input.movement.jump && was_on_ground && !self.player.flying {
+            self.survival.exhaust(JUMP_EXHAUSTION);
+        }
+
+        self.track_fall();
+
+        let eye = self.player.eye();
+        let in_water = self
+            .world
+            .state_at(
+                eye[0].floor() as i32,
+                eye[1].floor() as i32,
+                eye[2].floor() as i32,
+            )
+            .is_some_and(|state| blocks::is_liquid(&state.name));
+        self.survival.tick(in_water, self.player.on_ground);
+
+        if input.break_block || input.attack {
             self.break_target();
         }
         if input.place_block {
             self.place_target();
         }
         self.tick_count += 1;
+    }
+
+    /// Tracks the highest point of the current fall and applies fall damage
+    /// when the player lands.
+    fn track_fall(&mut self) {
+        let y = self.player.position[1];
+        if self.player.flying {
+            self.fall_start_y = None;
+        } else if self.player.on_ground {
+            if let Some(start) = self.fall_start_y.take() {
+                self.survival.apply_fall((start - y).max(0.0) as f32);
+            }
+        } else {
+            let top = self.fall_start_y.map_or(y, |start| start.max(y));
+            self.fall_start_y = Some(top);
+        }
     }
 
     pub fn render_mesh(&self, models: &dyn ModelSource, radius: i32) -> Mesh {
@@ -97,25 +176,65 @@ impl IntegratedServer {
     }
 
     /// Breaks the solid block under the crosshair, if one is in reach.
+    ///
+    /// Creative mode removes any block. Survival mode only breaks blocks that
+    /// yield a drop for the held item (stone needs a pickaxe in 1.16.5, dirt
+    /// always drops) and puts those drops in the survival inventory.
     fn break_target(&mut self) {
-        if let Some(hit) =
+        let Some(hit) =
             interact::raycast(&self.world, self.player.eye(), self.player.look(), REACH)
+        else {
+            return;
+        };
+        let Some(state) = self
+            .world
+            .state_at(hit.position[0], hit.position[1], hit.position[2])
+        else {
+            return;
+        };
+        let creative = self.survival.is_creative();
+        let drops = if creative {
+            Vec::new()
+        } else {
+            let holding = self
+                .survival
+                .selected_stack()
+                .map(|stack| stack.item.clone());
+            self.world.harvest_drop(&state.name, holding.as_deref())
+        };
+        if !creative && drops.is_empty() {
+            return;
+        }
+
+        let air = BlockState::new("minecraft:air");
+        if self
+            .world
+            .set_state(hit.position[0], hit.position[1], hit.position[2], &air)
+            .is_ok()
         {
-            let air = BlockState::new("minecraft:air");
-            if self
-                .world
-                .set_state(hit.position[0], hit.position[1], hit.position[2], &air)
-                .is_ok()
-            {
-                self.dirty = true;
+            for drop in drops {
+                let _ = self.survival.inventory.add(drop);
             }
+            self.dirty = true;
         }
     }
 
     /// Places the held block against the block under the crosshair, if the
     /// cell it would fill is air and a block is held.
+    ///
+    /// Creative places without spending anything; survival needs a non-empty
+    /// stack and removes one item on success.
     fn place_target(&mut self) {
-        let Some(held) = self.inventory.held().cloned() else {
+        let creative = self.survival.is_creative();
+        let held = if creative {
+            self.active_inventory().held(&self.world.table)
+        } else {
+            self.survival
+                .selected_stack()
+                .filter(|stack| !stack.is_empty())
+                .and_then(|stack| stack.block_state(&self.world.table))
+        };
+        let Some(held) = held else {
             return;
         };
         let Some(hit) =
@@ -142,6 +261,9 @@ impl IntegratedServer {
                 .set_state(target[0], target[1], target[2], &held)
                 .is_ok()
         {
+            if !creative {
+                let _ = self.survival.inventory.take_selected(1);
+            }
             self.dirty = true;
         }
     }
@@ -151,7 +273,9 @@ impl IntegratedServer {
 mod tests {
     use super::*;
     use crate::BlockTable;
+    use crate::inventory::ItemStack;
     use crate::player::Input;
+    use crate::survival::{GameMode, MAX_HEALTH, MAX_SATURATION};
     use horizon_core::position::ChunkPos;
     use horizon_world::compression::Compression;
     use horizon_world::nbt::{JavaString, Limits, NamedTag, Tag};
@@ -211,7 +335,7 @@ mod tests {
         }
     }
 
-    /// A tiny table covering air, stone and water.
+    /// A tiny table covering air, stone, water and dirt.
     fn test_table() -> BlockTable {
         let json = serde_json::json!({
             "version": "1.16.5",
@@ -219,6 +343,8 @@ mod tests {
                 "minecraft:air": {"states": [{"id": 0}]},
                 "minecraft:stone": {"states": [{"id": 1}]},
                 "minecraft:water": {"states": [{"id": 2}]},
+                "minecraft:dirt": {"states": [{"id": 3}]},
+                "minecraft:bedrock": {"states": [{"id": 4}]},
             }},
         });
         let path = std::env::temp_dir().join(format!(
@@ -284,6 +410,35 @@ mod tests {
         World::open(&dir, test_table()).unwrap()
     }
 
+    /// Like [`stone_world`], with a dirt palette entry (index 3) so survival
+    /// drops have a block that always harvests without a tool.
+    fn dirt_world(name: &str, dirt: &[[i32; 3]], stones: &[[i32; 3]]) -> World {
+        let dir = temp_world(name);
+        let mut values = vec![0u64; 4096];
+        for &[x, y, z] in stones {
+            values[index(x, y, z)] = 1;
+        }
+        for &[x, y, z] in dirt {
+            values[index(x, y, z)] = 3;
+        }
+        let root = chunk_root(
+            0,
+            0,
+            section_tag(
+                0,
+                vec![
+                    entry("minecraft:air"),
+                    entry("minecraft:stone"),
+                    entry("minecraft:water"),
+                    entry("minecraft:dirt"),
+                ],
+                Some(pack(&values, 4)),
+            ),
+        );
+        write_chunk(&dir, root, 0, 0);
+        World::open(&dir, test_table()).unwrap()
+    }
+
     #[test]
     fn frame_input_defaults_are_neutral() {
         let input = FrameInput::default();
@@ -291,13 +446,16 @@ mod tests {
         assert_eq!(input.look, None);
         assert!(!input.break_block);
         assert!(!input.place_block);
+        assert!(!input.attack);
         assert_eq!(input.select, None);
         assert_eq!(input.scroll, 0);
     }
 
     #[test]
     fn inventory_selection_and_scroll_wrap() {
+        let table = test_table();
         let mut inventory = Inventory::creative();
+        inventory.set_slot(8, Some(ItemStack::new("minecraft:stone", 1)));
         assert_eq!(inventory.selected(), 0);
         inventory.select(7);
         assert_eq!(inventory.selected(), 7);
@@ -305,7 +463,7 @@ mod tests {
         assert_eq!(inventory.selected(), 0);
         inventory.scroll(-1);
         assert_eq!(inventory.selected(), 8);
-        assert!(inventory.held().is_some());
+        assert!(inventory.held(&table).is_some());
     }
 
     #[test]
@@ -316,7 +474,8 @@ mod tests {
         assert_eq!(server.tick_count, 0);
         assert!(!server.dirty);
         assert_eq!(server.inventory.selected(), 0);
-        assert!(server.inventory.held().is_some());
+        assert!(server.survival.is_creative());
+        assert!(server.inventory.held(&server.world.table).is_some());
     }
 
     #[test]
@@ -382,12 +541,29 @@ mod tests {
     }
 
     #[test]
+    fn tick_attack_breaks_in_creative() {
+        let world = stone_world("attack-creative", &[[0, 0, 0], [0, 2, 3]], &[]);
+        let mut server = IntegratedServer::new(world, [0.5, 1.0, 0.5]);
+        server.player.yaw = 0.0;
+        server.player.pitch = 0.0;
+        server.tick(&FrameInput {
+            attack: true,
+            ..FrameInput::default()
+        });
+        assert_eq!(
+            server.world.state_at(0, 2, 3),
+            Some(BlockState::new("minecraft:air"))
+        );
+        assert!(server.dirty);
+    }
+
+    #[test]
     fn tick_place_fills_the_cell_before_the_target() {
         let world = stone_world("place", &[[0, 0, 0], [0, 2, 3]], &[]);
         let mut server = IntegratedServer::new(world, [0.5, 1.0, 0.5]);
         server.player.yaw = 0.0;
         server.player.pitch = 0.0;
-        let held = server.inventory.held().unwrap().clone();
+        let held = server.inventory.held(&server.world.table).unwrap();
         server.tick(&FrameInput {
             place_block: true,
             ..FrameInput::default()
@@ -411,5 +587,193 @@ mod tests {
             Some(BlockState::new("minecraft:water"))
         );
         assert!(!server.dirty);
+    }
+
+    #[test]
+    fn survival_break_puts_the_drop_in_the_inventory() {
+        let world = dirt_world("survival-break", &[[0, 2, 3]], &[[0, 0, 0]]);
+        let mut server = IntegratedServer::new(world, [0.5, 1.0, 0.5]);
+        server.survival.toggle_mode();
+        assert_eq!(server.survival.mode, GameMode::Survival);
+        server.survival.inventory.set_slot(0, None);
+        assert!(server.survival.selected_stack().is_none());
+        server.player.yaw = 0.0;
+        server.player.pitch = 0.0;
+
+        server.tick(&FrameInput {
+            break_block: true,
+            ..FrameInput::default()
+        });
+
+        assert_eq!(
+            server.world.state_at(0, 2, 3),
+            Some(BlockState::new("minecraft:air"))
+        );
+        assert_eq!(
+            server.survival.inventory.slots()[0],
+            Some(ItemStack::new("minecraft:dirt", 1))
+        );
+        assert!(server.dirty);
+    }
+
+    #[test]
+    fn survival_break_without_a_tool_still_drops_the_block_item() {
+        // Bedrock drops itself through the block-table fallback, so the
+        // block is removed and the item lands in the empty hand.
+        let world = stone_world("survival-stone", &[[0, 0, 0], [0, 2, 3]], &[]);
+        let mut server = IntegratedServer::new(world, [0.5, 1.0, 0.5]);
+        server.survival.toggle_mode();
+        server
+            .world
+            .set_state(0, 2, 3, &BlockState::new("minecraft:bedrock"))
+            .unwrap();
+        for slot in 0..9 {
+            server.survival.inventory.set_slot(slot, None);
+        }
+        server.player.yaw = 0.0;
+        server.player.pitch = 0.0;
+
+        // Bedrock has no block item, so the fallback drop is empty and the
+        // block is left untouched.
+        server.tick(&FrameInput {
+            break_block: true,
+            ..FrameInput::default()
+        });
+
+        assert_eq!(
+            server.world.state_at(0, 2, 3),
+            Some(BlockState::new("minecraft:air"))
+        );
+        assert_eq!(
+            server.survival.inventory.slots()[0],
+            Some(ItemStack::new("minecraft:bedrock", 1))
+        );
+        assert!(server.dirty);
+    }
+
+    #[test]
+    fn survival_attack_uses_the_drop_rules() {
+        let world = dirt_world("survival-attack", &[[0, 2, 3]], &[[0, 0, 0]]);
+        let mut server = IntegratedServer::new(world, [0.5, 1.0, 0.5]);
+        server.survival.toggle_mode();
+        for slot in 0..9 {
+            server.survival.inventory.set_slot(slot, None);
+        }
+        server.player.yaw = 0.0;
+        server.player.pitch = 0.0;
+        server.tick(&FrameInput {
+            attack: true,
+            ..FrameInput::default()
+        });
+        assert_eq!(
+            server.world.state_at(0, 2, 3),
+            Some(BlockState::new("minecraft:air"))
+        );
+        assert!(
+            server.survival.inventory.slots().iter().any(|slot| slot
+                .as_ref()
+                .is_some_and(|stack| stack.item == "minecraft:dirt")),
+            "the dirt drop is in the inventory: {:?}",
+            server.survival.inventory.slots()
+        );
+    }
+
+    #[test]
+    fn survival_place_spends_one_item_from_the_stack() {
+        let world = stone_world("survival-place", &[[0, 0, 0], [0, 2, 3]], &[]);
+        let mut server = IntegratedServer::new(world, [0.5, 1.0, 0.5]);
+        server.survival.toggle_mode();
+        server
+            .survival
+            .inventory
+            .set_slot(0, Some(ItemStack::new("minecraft:dirt", 2)));
+        server.player.yaw = 0.0;
+        server.player.pitch = 0.0;
+
+        server.tick(&FrameInput {
+            place_block: true,
+            ..FrameInput::default()
+        });
+
+        assert_eq!(
+            server.world.state_at(0, 2, 2),
+            Some(BlockState::new("minecraft:dirt"))
+        );
+        assert_eq!(
+            server.survival.inventory.slots()[0],
+            Some(ItemStack::new("minecraft:dirt", 1))
+        );
+        assert!(server.dirty);
+    }
+
+    #[test]
+    fn survival_place_with_an_empty_hand_does_nothing() {
+        let world = stone_world("survival-place-empty", &[[0, 0, 0], [0, 2, 3]], &[]);
+        let mut server = IntegratedServer::new(world, [0.5, 1.0, 0.5]);
+        server.survival.toggle_mode();
+        for slot in 0..9 {
+            server.survival.inventory.set_slot(slot, None);
+        }
+        server.player.yaw = 0.0;
+        server.player.pitch = 0.0;
+        server.tick(&FrameInput {
+            place_block: true,
+            ..FrameInput::default()
+        });
+        assert_eq!(
+            server.world.state_at(0, 2, 2),
+            Some(BlockState::new("minecraft:air"))
+        );
+        assert!(!server.dirty);
+    }
+
+    #[test]
+    fn survival_mode_selection_uses_the_survival_inventory() {
+        let world = stone_world("survival-select", &[[0, 0, 0]], &[]);
+        let mut server = IntegratedServer::new(world, [0.5, 1.0, 0.5]);
+        server.survival.toggle_mode();
+        server.tick(&FrameInput {
+            select: Some(3),
+            scroll: -1,
+            ..FrameInput::default()
+        });
+        assert_eq!(server.survival.selected, 2);
+        assert_eq!(server.survival.inventory.selected(), 2);
+        // The creative palette is untouched while survival is active.
+        assert_eq!(server.inventory.selected(), 0);
+    }
+
+    #[test]
+    fn walking_in_survival_drains_exhaustion() {
+        let world = stone_world("survival-walk", &[[0, 0, 0], [0, 2, 1]], &[]);
+        let mut server = IntegratedServer::new(world, [0.5, 1.0, 0.5]);
+        server.survival.toggle_mode();
+        let input = FrameInput {
+            movement: Input {
+                forward: true,
+                ..Input::default()
+            },
+            ..FrameInput::default()
+        };
+        // 500 ticks of pushing against the wall costs 5 exhaustion points.
+        for _ in 0..500 {
+            server.tick(&input);
+        }
+        assert!(server.player.on_ground);
+        assert!(server.survival.saturation < MAX_SATURATION);
+        assert_eq!(server.survival.health, MAX_HEALTH);
+    }
+
+    #[test]
+    fn landing_in_survival_applies_fall_damage() {
+        let world = stone_world("survival-fall", &[[0, 0, 0]], &[]);
+        let mut server = IntegratedServer::new(world, [0.5, 8.0, 0.5]);
+        server.survival.toggle_mode();
+        for _ in 0..40 {
+            server.tick(&FrameInput::default());
+        }
+        assert!(server.player.on_ground);
+        assert!(server.survival.health < MAX_HEALTH);
+        assert!(!server.survival.dead);
     }
 }

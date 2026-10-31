@@ -3,8 +3,11 @@
 //! engine's block/registry types.
 
 use serde_json::Value;
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+
+use crate::inventory::ItemStack;
 
 pub type Properties = BTreeMap<String, String>;
 
@@ -220,6 +223,33 @@ impl BlockTable {
         self.first_state(name)
     }
 
+    /// The item a mined `block` drops when no loot table overrides it.
+    ///
+    /// In 1.16.5 most blocks drop themselves, so this is the block's own item
+    /// name. A name the table does not know drops nothing. This is the same
+    /// membership test [`BlockTable::first_state`] uses and needs no zip data.
+    pub fn loot_for(&self, block: &str) -> Vec<ItemStack> {
+        match self.first_state(block) {
+            Some(state) => vec![ItemStack::new(state.name, 1)],
+            None => Vec::new(),
+        }
+    }
+
+    /// The drops for a block broken while holding `holding`.
+    ///
+    /// `holding` is accepted for callers that already have the selected stack;
+    /// the block-table fallback does not vary with the tool, so it only feeds
+    /// loot-table aware callers. Either an owned stack or a reference to one
+    /// may be passed.
+    pub fn harvest_drop<T: Borrow<ItemStack>>(
+        &self,
+        block: &str,
+        holding: Option<T>,
+    ) -> Vec<ItemStack> {
+        let _ = holding;
+        self.loot_for(block)
+    }
+
     pub fn len(&self) -> usize {
         self.states.len()
     }
@@ -292,5 +322,39 @@ mod tests {
             assert!(BlockTable::load(&path).is_err());
             std::fs::remove_file(&path).unwrap();
         }
+    }
+
+    #[test]
+    fn block_table_loot_falls_back_to_the_block_item() {
+        let json = serde_json::json!({
+            "version": "1.16.5",
+            "blocks": {"entries": {
+                "minecraft:stone": {"states": [{"id": 0, "default": true}]},
+            }},
+        });
+        let path = std::env::temp_dir().join(format!(
+            "horizon-1-16-5-loot-table-{}-{}.json",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let table = BlockTable::load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let stone = vec![ItemStack::new("minecraft:stone", 1)];
+        assert_eq!(table.loot_for("minecraft:stone"), stone);
+        assert_eq!(table.loot_for("stone"), stone);
+        assert!(table.loot_for("minecraft:bedrock").is_empty());
+        assert_eq!(
+            table.harvest_drop("stone", Some(ItemStack::new("minecraft:iron_pickaxe", 1))),
+            stone
+        );
+        let pickaxe = ItemStack::new("minecraft:diamond_pickaxe", 1);
+        assert_eq!(table.harvest_drop("minecraft:stone", Some(&pickaxe)), stone);
+        assert!(
+            table
+                .harvest_drop("minecraft:bedrock", None::<ItemStack>)
+                .is_empty()
+        );
     }
 }

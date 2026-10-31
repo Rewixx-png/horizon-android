@@ -60,6 +60,8 @@ use horizon_world::compression::Compression;
 use horizon_world::nbt::{JavaString, Limits, NamedTag, Tag};
 use horizon_world::region::{ChunkRecord, RegionFile};
 
+use crate::inventory::ItemStack;
+use crate::loot::LootTables;
 use crate::{BlockSource, BlockState, BlockTable, Properties};
 
 /// Sections per chunk column: 16 sections of 16 blocks cover y 0..256.
@@ -81,6 +83,10 @@ pub struct World {
     chunks: HashMap<(i32, i32), ChunkColumn>,
     /// Chunk positions changed since the last successful save.
     dirty: HashSet<(i32, i32)>,
+    /// Block loot tables read from the server jar, when one was supplied.
+    loot: Option<LootTables>,
+    /// Counts block breaks so repeated drops roll different loot.
+    break_count: u64,
 }
 
 impl World {
@@ -125,7 +131,30 @@ impl World {
             air,
             chunks,
             dirty: HashSet::new(),
+            loot: None,
+            break_count: 0,
         })
+    }
+
+    /// Attaches the block loot tables of a 1.16.5 server jar.
+    pub fn load_loot(&mut self, server_jar: &Path) -> Result<(), String> {
+        self.loot = Some(LootTables::load(server_jar)?);
+        Ok(())
+    }
+
+    /// The items a freshly broken `block` leaves behind, rolled from the
+    /// real 1.16.5 loot tables when one is attached.
+    ///
+    /// Without loot tables this is the block-table fallback (the block's own
+    /// item, which is right for most blocks but not for e.g. stone, which
+    /// drops cobblestone, or glass, which drops nothing).
+    pub fn harvest_drop(&mut self, block: &str, tool: Option<&str>) -> Vec<ItemStack> {
+        let seed = self.break_count;
+        self.break_count += 1;
+        match &self.loot {
+            Some(loot) => loot.roll(block, seed, tool),
+            None => self.table.harvest_drop(block, None::<ItemStack>),
+        }
     }
 
     /// The loaded chunk column at chunk coordinates (x, z), if any.
@@ -1623,6 +1652,8 @@ mod tests {
             air,
             chunks: HashMap::from([((0, 0), column)]),
             dirty,
+            loot: None,
+            break_count: 0,
         };
         assert!(world.save(&dir).unwrap());
         assert!(!world.has_unsaved_changes());

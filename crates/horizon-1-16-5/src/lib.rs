@@ -12,15 +12,19 @@ pub mod blocks;
 pub mod chunk_mesh;
 pub mod interact;
 pub mod inventory;
+pub mod item_icons;
+pub mod loot;
 pub mod mesh;
 pub mod player;
 pub mod preview;
 pub mod render;
 pub mod server;
+pub mod survival;
 pub mod touch;
 mod types;
 pub mod world;
 
+pub use loot::LootTables;
 pub use types::{
     BakedModel, BlockSource, BlockState, BlockTable, Face, Mesh, ModelSource, Properties, Quad,
     Vertex,

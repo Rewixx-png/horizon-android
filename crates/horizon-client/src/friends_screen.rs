@@ -11,6 +11,7 @@ use crate::{
 };
 
 pub const TITLE: &str = "Play with Friends";
+pub const TITLE_KEY: &str = "horizon.friends.title";
 /// What the screen shows (game/friends.rs fills it).
 #[derive(Clone, Debug, Default)]
 pub struct FriendsView {
@@ -47,7 +48,7 @@ fn grey() -> u32 {
     rgba(160, 160, 160, 255)
 }
 const WHITE: u32 = u32::MAX;
-const HINT: &str = "Friends paste the code after the title screen's Friends button, in Direct Connection, or on the launcher's Play page.";
+const HINT_KEY: &str = "horizon.friends.hint";
 
 struct Button {
     x: f32,
@@ -68,6 +69,7 @@ fn layout(
     let cx = (w / 2.0).floor();
     let mut lines = Vec::new();
     let mut y = 40.0;
+    let hint = crate::lang::get(HINT_KEY);
     let add = |lines: &mut Vec<(String, u32, f32)>, text: &str, color: u32, y: &mut f32| {
         for line in wrap(text, width, atlas) {
             lines.push((line, color, *y));
@@ -76,7 +78,7 @@ fn layout(
     };
     let mut buttons = Vec::new();
     if view.sharing {
-        lines.push(("Invite Code".to_owned(), grey(), y));
+        lines.push((crate::lang::get("horizon.friends.invite_code"), grey(), y));
         y += 12.0;
         match &view.code {
             Some(code) => {
@@ -92,7 +94,11 @@ fn layout(
             x: cx - 154.0,
             y,
             w: 150.0,
-            label: if view.copied { "Copied" } else { "Copy Code" },
+            label: if view.copied {
+                "horizon.friends.copied"
+            } else {
+                "horizon.friends.copy_code"
+            },
             action: Action::Copy,
             active: view.code.is_some(),
         });
@@ -100,7 +106,7 @@ fn layout(
             x: cx + 4.0,
             y,
             w: 150.0,
-            label: "Stop Sharing",
+            label: "horizon.friends.stop_sharing",
             action: Action::Stop,
             active: true,
         });
@@ -113,32 +119,36 @@ fn layout(
             y += 4.0;
         }
         let here = if view.guests.is_empty() {
-            "No friends here yet.".to_owned()
+            crate::lang::get("horizon.friends.no_friends")
         } else {
-            format!("Here now: {}", view.guests.join(", "))
+            let guests = view.guests.join(", ");
+            crate::lang::tr(
+                "horizon.friends.here_now",
+                &[&guests as &dyn std::fmt::Display],
+            )
         };
         add(&mut lines, &here, grey(), &mut y);
         if let Some(notice) = &view.notice {
             add(&mut lines, notice, WHITE, &mut y);
         }
         // Where friends paste the code, while it fits above the footer.
-        if y + 10.0 * wrap(HINT, width, atlas).len() as f32 <= h - 33.0 {
-            add(&mut lines, HINT, grey(), &mut y);
+        if y + 10.0 * wrap(&hint, width, atlas).len() as f32 <= h - 33.0 {
+            add(&mut lines, &hint, grey(), &mut y);
         }
     } else {
         add(
             &mut lines,
-            "Share this world behind an invite code: it opens to LAN, and friends on the internet join with the code. No server of ours is involved.",
+            &crate::lang::get("horizon.friends.share_description"),
             WHITE,
             &mut y,
         );
         y += 4.0;
-        add(&mut lines, HINT, grey(), &mut y);
+        add(&mut lines, &hint, grey(), &mut y);
         buttons.push(Button {
             x: cx - 100.0,
             y: y + 8.0,
             w: 200.0,
-            label: "Start Sharing",
+            label: "horizon.friends.start_sharing",
             action: Action::Share,
             active: view.shown,
         });
@@ -150,7 +160,7 @@ fn layout(
             x: cx - 154.0,
             y: h - 27.0,
             w: 150.0,
-            label: "Troubleshooting...",
+            label: "horizon.friends.troubleshooting",
             action: Action::Help,
             active: true,
         });
@@ -189,11 +199,7 @@ fn code_lines(atlas: &HudAtlas, code: &str, width: f32) -> Vec<String> {
     lines
 }
 fn label(key: &str) -> Text {
-    if key.starts_with("gui.") {
-        Text::translate(key, &[])
-    } else {
-        Text::literal(key)
-    }
+    Text::translate(key, &[])
 }
 pub fn draw(
     batch: &mut HudBatch,
@@ -204,7 +210,7 @@ pub fn draw(
 ) {
     let (w, h) = (batch.width, batch.height);
     ui::menu_background(batch, atlas, 0.0, 0.0, w, h, in_world);
-    let title = Text::literal(TITLE);
+    let title = Text::translate(TITLE_KEY, &[]);
     let tw = atlas.font.width_text(&title);
     batch.text_styled(atlas, &title, ((w - tw) / 2.0).floor(), 15.0, WHITE, true);
     let (lines, buttons) = layout(atlas, (w, h), view);

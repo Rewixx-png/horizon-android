@@ -1825,13 +1825,13 @@ impl OptionsUi {
             Page::Font => "options.font.title",
             Page::Packs => "resourcePack.title",
             Page::Mods => "horizon.pages.mods",
-            Page::NativeMod(_) => "Mod Settings",
+            Page::NativeMod(_) => "horizon.pages.native_mod",
             Page::ShaderPacks => "horizon.pages.shader_packs",
             Page::Graphics | Page::GraphicsAdvanced | Page::GraphicsHdr => "options.videoTitle",
             Page::Controller => "horizon.pages.controller",
             Page::PadBinds => "horizon.pages.controller_binds",
             Page::Extras => "horizon.pages.extras",
-            Page::Touch => "Touch Controls",
+            Page::Touch => "horizon.pages.touch",
             Page::Credits => "credits_and_attribution.screen.title",
             Page::Horizon => "horizon.pages.settings",
             Page::Agent => "horizon.pages.agent",
@@ -2145,7 +2145,7 @@ impl OptionsUi {
                         } else {
                             310.0
                         },
-                        Text::literal("Controller Settings..."),
+                        tr("horizon.pages.open.controller"),
                         Act::Push(Page::Controller),
                     ),
                     {
@@ -2155,7 +2155,7 @@ impl OptionsUi {
                                 0.0,
                                 0.0,
                                 150.0,
-                                Text::literal("Touch Controls..."),
+                                tr("horizon.pages.open.touch"),
                                 Act::Push(Page::Touch),
                             ))
                         }
@@ -2197,7 +2197,7 @@ impl OptionsUi {
                         0.0,
                         0.0,
                         310.0,
-                        Text::literal("Customize layout..."),
+                        tr("horizon.pages.open.customize_touch"),
                         Act::TouchControls,
                     ),
                     None,

@@ -611,7 +611,8 @@ impl Game<'_> {
     fn export_test(&mut self, pos: Pos) {
         if self.save_test(pos).is_some() {
             self.system_message(
-                Text::literal("Test structure exporting is disabled").with_color(text::RED),
+                Text::translate("horizon.test_instances.export_disabled", &[])
+                    .with_color(text::RED),
             );
         }
     }

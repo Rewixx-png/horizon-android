@@ -1,15 +1,15 @@
 # Manual public-APK build and GitHub release. It downloads the pinned Mojang
 # client/server jars and assets on the runner, generates the private engine
 # tables, builds one public APK and attaches it to a GitHub release.
-name: Android APK release
+name: Android release
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag (for example v0.7.6-ui.2)
+        description: Release tag (for example v0.7.6-ui.1)
         required: true
-        default: v0.7.6-ui.2
+        default: v0.7.6-ui.1
       abi:
         description: APK ABI
         required: true

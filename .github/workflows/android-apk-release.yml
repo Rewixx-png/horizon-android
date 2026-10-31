@@ -1,0 +1,132 @@
+# Manual public-APK build and GitHub release. It downloads the pinned Mojang
+# client/server jars and assets on the runner, generates the private engine
+# tables, builds one public APK and attaches it to a GitHub release.
+name: Android APK release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (for example v0.7.6-ui.2)
+        required: true
+        default: v0.7.6-ui.2
+      abi:
+        description: APK ABI
+        required: true
+        default: arm64-v8a
+        type: choice
+        options:
+          - arm64-v8a
+          - x86_64
+          - armeabi-v7a
+          - x86
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      HORIZON_TELEMETRY_URL: "off"
+      CARGO_BUILD_JOBS: "4"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android/sdk/ndk/26.* /usr/local/lib/android/sdk/system-images
+          sudo apt-get clean
+          df -h /
+
+      - name: Install Rust host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libudev-dev
+
+      - name: Install Android SDK, build tools and NDK
+        run: |
+          sdk="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          manager="$sdk/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$manager" ]; then
+            manager="$(command -v sdkmanager)"
+          fi
+          yes | "$manager" --licenses >/dev/null
+          "$manager" --sdk_root="$sdk" "platforms;android-35" "build-tools;35.0.0" "ndk;28.2.13676358"
+          echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
+
+      - name: Install the pinned Rust toolchain and Android target
+        run: |
+          cargo --version
+          rustup target add aarch64-linux-android
+
+      - name: Install Gradle 8.14
+        run: |
+          curl -fsSL https://services.gradle.org/distributions/gradle-8.14-bin.zip -o "$RUNNER_TEMP/gradle.zip"
+          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
+          echo "GRADLE=$RUNNER_TEMP/gradle-8.14/bin/gradle" >> "$GITHUB_ENV"
+
+      - name: Restore an existing signing key when configured
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            mkdir -p .local/android
+            printf '%s' "$KEYSTORE_BASE64" | base64 -d > .local/android/debug.keystore
+          fi
+
+      - name: Download official Mojang inputs and prepare engine tables
+        run: python3 tools/android_prepare.py
+
+      - name: Drop raw Mojang inputs before the Rust build
+        run: |
+          rm -rf .local/android/minecraft .local/android/jdk .local/android/serve .local/android/prepare-*
+          df -h /
+
+      - name: Build the public APK
+        run: |
+          python3 tools/android_build.py \
+            --abi "${{ inputs.abi }}" \
+            --public \
+            --profile fast \
+            --sdk "$ANDROID_HOME" \
+            --java-home "$JAVA_HOME_17_X64" \
+            --gradle "$GRADLE"
+
+      - name: Name the release APK and write checksums
+        run: |
+          cd ".local/android/apk/${{ inputs.abi }}"
+          mv horizon-android-public.apk "horizon-android-${{ inputs.abi }}.apk"
+          sha256sum "horizon-android-${{ inputs.abi }}.apk" > SHA256SUMS.txt
+
+      - name: Upload the build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: horizon-android-${{ inputs.abi }}
+          path: |
+            .local/android/apk/${{ inputs.abi }}/horizon-android-${{ inputs.abi }}.apk
+            .local/android/apk/${{ inputs.abi }}/SHA256SUMS.txt
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ inputs.tag }}"
+          apk=".local/android/apk/${{ inputs.abi }}/horizon-android-${{ inputs.abi }}.apk"
+          sums=".local/android/apk/${{ inputs.abi }}/SHA256SUMS.txt"
+          notes="Public APK built from $GITHUB_SHA for ${{ inputs.abi }} with the optimized fast profile. The first run downloads original Minecraft resources from Mojang on the device. Signing uses ANDROID_KEYSTORE_BASE64 when configured, otherwise the build's development key; installing over a build with a different key requires uninstalling first."
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$apk" "$sums" --clobber
+          else
+            gh release create "$tag" "$apk" "$sums" LICENSE THIRD_PARTY_NOTICES.md \
+              --target "$GITHUB_SHA" \
+              --title "Horizon Android $tag" \
+              --notes "$notes"
+          fi

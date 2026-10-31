@@ -10,6 +10,8 @@
 //! rotation, face UV locking and element rotations.
 //!
 //! Quads carry texture *names* only; sprite lookup is outside this crate.
+//! Baked models are memoized per block state inside the pack, so selecting
+//! the same state repeatedly returns an equal clone instead of re-baking.
 //! Weighted variant lists pick their first entry deterministically (vanilla
 //! would roll the listed weights), and a texture variable that cannot be
 //! resolved becomes `minecraft:missingno`, as vanilla falls back to its
@@ -17,6 +19,7 @@
 
 use crate::{BakedModel, BlockState, Face, ModelSource, Quad, Vertex};
 use serde_json::Value;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
@@ -27,6 +30,10 @@ use std::path::Path;
 pub struct ModelPack {
     blockstates: HashMap<String, BlockstateDef>,
     models: HashMap<String, Option<ResolvedModel>>,
+    /// Baked results per state, `None` included, so a chunk mesher that asks
+    /// for the same state once per block does not re-bake its geometry.
+    /// Interior mutability keeps [`ModelSource::model`] a `&self` operation.
+    cache: RefCell<HashMap<BlockState, Option<BakedModel>>>,
 }
 
 /// One parsed blockstate definition: either an ordered variant list or a
@@ -234,12 +241,27 @@ impl ModelPack {
         Ok(Self {
             blockstates,
             models,
+            cache: RefCell::new(HashMap::new()),
         })
     }
 
     /// Bakes the model selected for `state`, or `None` when the block or its
     /// variant cannot be selected.
+    ///
+    /// Results are memoized per state, so repeated calls return equal clones
+    /// of the first bake. Selection itself still runs against the immutable
+    /// blockstate and model tables, so the cache is invisible to callers.
     pub fn model(&self, state: &BlockState) -> Option<BakedModel> {
+        let cached = self.cache.borrow().get(state).cloned();
+        if let Some(cached) = cached {
+            return cached;
+        }
+        let baked = self.bake(state);
+        self.cache.borrow_mut().insert(state.clone(), baked.clone());
+        baked
+    }
+
+    fn bake(&self, state: &BlockState) -> Option<BakedModel> {
         let name = namespaced(&state.name);
         let definition = self.blockstates.get(&name)?;
         if !definition.variants.is_empty() {
@@ -2077,5 +2099,37 @@ mod tests {
                 .is_none()
         );
         assert!(pack.pack.model(&pack.state("mod:stone", &[])).is_none());
+    }
+
+    #[test]
+    fn repeated_model_requests_return_the_cached_bake() {
+        let pack = Pack::new(STONE_PACK);
+        assert!(pack.pack.cache.borrow().is_empty());
+
+        let first = pack.pack.model(&pack.state("minecraft:stone", &[]));
+        assert_eq!(pack.pack.cache.borrow().len(), 1);
+        let second = pack.pack.model(&pack.state("minecraft:stone", &[]));
+        let third = pack.pack.model(&pack.state("minecraft:stone", &[]));
+        assert_eq!(first, second);
+        assert_eq!(second, third);
+        assert_eq!(first.as_ref().map(|model| model.quads.len()), Some(6));
+        // Still a single entry: hits do not re-bake or duplicate.
+        assert_eq!(pack.pack.cache.borrow().len(), 1);
+
+        // A state with different properties is a distinct cache key.
+        let other = pack.state("minecraft:stone", &[("axis", "y")]);
+        let _ = pack.pack.model(&other);
+        assert_eq!(pack.pack.cache.borrow().len(), 2);
+
+        // Unsupported states are cached as `None` and stay `None`.
+        let air = pack.state("minecraft:air", &[]);
+        assert!(pack.pack.model(&air).is_none());
+        assert!(pack.pack.model(&air).is_none());
+        assert!(pack.pack.cache.borrow().contains_key(&air));
+        assert_eq!(pack.pack.cache.borrow().len(), 3);
+
+        // Baked models are still equal to an independently baked clone.
+        let baked = first.expect("stone bakes");
+        assert_eq!(baked.quads.len(), 6);
     }
 }

@@ -23,7 +23,7 @@ use crate::render::{Camera, HudVertex, SurfaceRenderer, hud_rect};
 use crate::server::{FrameInput, IntegratedServer};
 use crate::touch::TouchControls;
 use crate::world::World;
-use crate::{BlockTable, Mesh};
+use crate::{BlockState, BlockTable, Mesh};
 
 /// One 1/20 s tick.
 const TICK: Duration = Duration::from_millis(50);
@@ -42,6 +42,14 @@ const CROSSHAIR_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.75];
 /// Half the crosshair arm length and its line thickness in pixels.
 const CROSSHAIR_ARM: f32 = 6.0;
 const CROSSHAIR_THICKNESS: f32 = 2.0;
+/// How often the running world is flushed to disk, in wall-clock time.
+const SAVE_INTERVAL: Duration = Duration::from_secs(30);
+/// Unselected hotbar slot background.
+const HOTBAR_SLOT_COLOR: [f32; 4] = [0.05, 0.05, 0.05, 0.45];
+/// Extra overlay on the selected hotbar slot.
+const HOTBAR_SELECTED_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.40];
+/// Fraction of a hotbar slot left free around the item swatch.
+const HOTBAR_SWATCH_INSET: f32 = 0.2;
 
 const USAGE: &str = "usage: horizon-1165 --world <dir> --tables <file> --client-jar <file> \
 --assets-index <file> --assets-objects <dir> [--width <px>] [--height <px>] \
@@ -184,6 +192,8 @@ where
 
 /// Everything opened from the world, tables and client jar.
 struct Loaded {
+    /// The world directory the chunks are saved back into.
+    world_root: PathBuf,
     server: IntegratedServer,
     models: ModelPack,
     assets: VanillaAssets,
@@ -205,7 +215,8 @@ impl Loaded {
         radius: i32,
     ) -> Result<Self, String> {
         let table = BlockTable::load(tables)?;
-        let world = World::open(&world, table)?;
+        let world_root = world;
+        let world = World::open(&world_root, table)?;
         let models = ModelPack::load_client_jar(client_jar)?;
         let mut assets = match (assets_index, assets_objects) {
             (Some(index), Some(objects)) => {
@@ -221,6 +232,7 @@ impl Loaded {
         let mesh = server.render_mesh(&models, radius);
         let atlas = TextureAtlas::load(&mut assets, mesh.textures.iter().cloned())?;
         Ok(Self {
+            world_root,
             server,
             models,
             assets,
@@ -232,6 +244,7 @@ impl Loaded {
 
 /// Everything loaded before the window exists.
 struct Pending {
+    world_root: PathBuf,
     server: IntegratedServer,
     models: ModelPack,
     assets: VanillaAssets,
@@ -248,6 +261,8 @@ struct PlayState {
     window: Arc<Window>,
     renderer: SurfaceRenderer,
     server: IntegratedServer,
+    /// The world directory chunks are saved into on the timer and on exit.
+    world_root: PathBuf,
     models: ModelPack,
     assets: VanillaAssets,
     atlas: TextureAtlas,
@@ -273,8 +288,33 @@ struct PlayState {
     select: Option<usize>,
     scroll: i32,
     last_tick: Instant,
+    /// When the world was last flushed by the periodic save timer.
+    last_save: Instant,
     /// The chunk the visible mesh was built around.
     last_chunk: [i32; 2],
+}
+
+impl PlayState {
+    /// Flushes dirty chunks under [`Self::world_root`] and stamps the periodic
+    /// timer.
+    ///
+    /// `has_unsaved_changes` keeps a clean world from touching the disk. A
+    /// failure is logged instead of propagated, so a broken save location
+    /// cannot kill the loop; whatever stays dirty is retried on the next
+    /// interval.
+    fn save(&mut self, now: Instant) -> bool {
+        self.last_save = now;
+        if !self.server.world.has_unsaved_changes() {
+            return false;
+        }
+        match self.server.world.save(&self.world_root) {
+            Ok(wrote) => wrote,
+            Err(error) => {
+                eprintln!("saving the world to {}: {error}", self.world_root.display());
+                false
+            }
+        }
+    }
 }
 
 /// The winit application: owns the play state and funnels errors out.
@@ -300,6 +340,7 @@ pub fn run() -> Result<(), String> {
 
     let mut app = PlayApp {
         pending: Some(Pending {
+            world_root: loaded.world_root,
             server: loaded.server,
             models: loaded.models,
             assets: loaded.assets,
@@ -352,6 +393,7 @@ pub fn run_android(
         .map_err(|error| format!("creating the event loop: {error}"))?;
     let mut play = PlayApp {
         pending: Some(Pending {
+            world_root: loaded.world_root,
             server: loaded.server,
             models: loaded.models,
             assets: loaded.assets,
@@ -394,7 +436,7 @@ impl PlayApp {
             ),
             break_block: state.break_block || touch.break_block,
             place_block: state.place_block || touch.place_block,
-            select: state.select.take(),
+            select: merge_select(state.select.take(), touch.select),
             scroll: std::mem::take(&mut state.scroll),
         };
         state.break_block = false;
@@ -418,9 +460,13 @@ impl PlayApp {
         };
         let camera = camera_for(&state.server.player);
         let size = state.window.inner_size();
+        // Keyboard digits, the wheel and touch all converge on the inventory,
+        // so mirror its selection into the touch HUD's highlight.
+        state.touch.set_selected(state.server.inventory.selected());
         fill_hud(
             &mut state.hud,
             &state.touch,
+            state.server.inventory.slots(),
             state.touch_active,
             size.width,
             size.height,
@@ -460,6 +506,7 @@ impl PlayApp {
                     state.window.set_cursor_visible(true);
                     state.cursor_grabbed = false;
                 } else {
+                    state.save(Instant::now());
                     event_loop.exit();
                 }
             }
@@ -534,6 +581,7 @@ impl ApplicationHandler for PlayApp {
             window,
             renderer,
             server: pending.server,
+            world_root: pending.world_root,
             models: pending.models,
             assets: pending.assets,
             atlas: pending.atlas,
@@ -553,6 +601,7 @@ impl ApplicationHandler for PlayApp {
             select: None,
             scroll: 0,
             last_tick: Instant::now(),
+            last_save: Instant::now(),
             last_chunk,
         };
         self.state = Some(state);
@@ -566,7 +615,12 @@ impl ApplicationHandler for PlayApp {
             return;
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                if let Some(state) = self.state.as_mut() {
+                    state.save(Instant::now());
+                }
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => {
                 let state = self.state.as_mut().unwrap();
                 state.renderer.resize(size.width, size.height);
@@ -647,13 +701,23 @@ impl ApplicationHandler for PlayApp {
                 return;
             }
         }
-        let Some(state) = self.state.as_ref() else {
+        let Some(state) = self.state.as_mut() else {
             return;
         };
+        if save_due(state.last_save, now) {
+            state.save(now);
+        }
         if ticks > 0 {
             state.window.request_redraw();
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(state.last_tick + TICK));
+    }
+
+    /// Last-chance flush when the event loop shuts down for any reason.
+    fn exiting(&mut self, _: &ActiveEventLoop) {
+        if let Some(state) = self.state.as_mut() {
+            state.save(Instant::now());
+        }
     }
 }
 
@@ -700,7 +764,7 @@ fn wheel_steps(y: f32) -> i32 {
     }
 }
 
-/// Combines held keyboard movement with held joystick movement.
+/// Combines keyboard movement with held joystick movement.
 fn merge_movement(keyboard: Input, touch: Input) -> Input {
     Input {
         forward: keyboard.forward || touch.forward,
@@ -711,6 +775,20 @@ fn merge_movement(keyboard: Input, touch: Input) -> Input {
         sneak: keyboard.sneak || touch.sneak,
         sprint: keyboard.sprint || touch.sprint,
     }
+}
+
+/// Combines a keyboard/mouse hotbar pick for this tick with a touch pick.
+///
+/// A digit key pressed since the last tick wins over a simultaneous tap; at
+/// most one selection reaches [`FrameInput`] so the inventory cannot apply
+/// two picks in one tick.
+fn merge_select(keyboard: Option<usize>, touch: Option<usize>) -> Option<usize> {
+    keyboard.or(touch)
+}
+
+/// Whether the 30 second periodic save is due.
+fn save_due(last_save: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_save) >= SAVE_INTERVAL
 }
 
 /// Applies a look delta in degrees to the pending mouse look, falling back to
@@ -731,12 +809,13 @@ fn apply_look_delta(base: [f32; 2], delta: [f32; 2]) -> [f32; 2] {
     [yaw, pitch]
 }
 
-/// Rebuilds `hud` for one frame: the touch controls when they are active,
-/// plus a small crosshair. An inactive HUD is left empty, so the desktop
-/// frame is identical to [`SurfaceRenderer::render`].
+/// Rebuilds `hud` for one frame: the touch controls and hotbar when they are
+/// active, plus a small crosshair. An inactive HUD is left empty, so the
+/// desktop frame is identical to [`SurfaceRenderer::render`].
 fn fill_hud(
     hud: &mut Vec<HudVertex>,
     touch: &TouchControls,
+    slots: &[Option<BlockState>; 9],
     active: bool,
     width: u32,
     height: u32,
@@ -748,7 +827,58 @@ fn fill_hud(
     for (rect, color) in touch.hud_rects() {
         hud.extend_from_slice(&hud_rect(rect[0], rect[1], rect[2], rect[3], color));
     }
+    let hotbar = touch.hotbar_rects();
+    for (rect, _) in &hotbar {
+        hud.extend_from_slice(&hud_rect(
+            rect[0],
+            rect[1],
+            rect[2],
+            rect[3],
+            HOTBAR_SLOT_COLOR,
+        ));
+    }
+    for (slot, (rect, _)) in hotbar.iter().enumerate() {
+        let Some(state) = slots[slot].as_ref() else {
+            continue;
+        };
+        let inset_x = rect[2] * HOTBAR_SWATCH_INSET;
+        let inset_y = rect[3] * HOTBAR_SWATCH_INSET;
+        hud.extend_from_slice(&hud_rect(
+            rect[0] + inset_x,
+            rect[1] + inset_y,
+            rect[2] - inset_x * 2.0,
+            rect[3] - inset_y * 2.0,
+            block_swatch_color(&state.name),
+        ));
+    }
+    // The brighter overlay goes last so it also tints the item swatch.
+    if let Some((rect, _)) = hotbar.iter().find(|(_, selected)| *selected) {
+        hud.extend_from_slice(&hud_rect(
+            rect[0],
+            rect[1],
+            rect[2],
+            rect[3],
+            HOTBAR_SELECTED_COLOR,
+        ));
+    }
     hud.extend_from_slice(&crosshair_vertices(width, height));
+}
+
+/// Swatch color for one hotbar block, keyed by its name without the
+/// `minecraft:` namespace. Unknown blocks use a neutral gray.
+fn block_swatch_color(name: &str) -> [f32; 4] {
+    match name.strip_prefix("minecraft:").unwrap_or(name) {
+        "stone" => [0.50, 0.50, 0.50, 1.0],
+        "dirt" => [0.55, 0.40, 0.24, 1.0],
+        "grass_block" => [0.34, 0.62, 0.30, 1.0],
+        "oak_planks" => [0.72, 0.60, 0.40, 1.0],
+        "oak_log" => [0.42, 0.32, 0.19, 1.0],
+        "glass" => [0.72, 0.86, 0.96, 1.0],
+        "bricks" => [0.62, 0.24, 0.20, 1.0],
+        "stone_bricks" => [0.45, 0.45, 0.45, 1.0],
+        "white_wool" => [0.93, 0.93, 0.93, 1.0],
+        _ => [0.65, 0.65, 0.65, 1.0],
+    }
 }
 
 /// Two thin quads forming a crosshair centred on the screen. Sizes are
@@ -996,12 +1126,14 @@ mod tests {
     fn touch_hud_is_hidden_until_touch_is_active() {
         let mut touch = TouchControls::new();
         touch.resize(800.0, 600.0);
+        let slots: [Option<BlockState>; 9] = std::array::from_fn(|_| None);
         let mut hud = Vec::new();
-        fill_hud(&mut hud, &touch, false, 800, 600);
+        fill_hud(&mut hud, &touch, &slots, false, 800, 600);
         assert!(hud.is_empty());
-        fill_hud(&mut hud, &touch, true, 800, 600);
-        // Every touch rectangle plus the two-quad crosshair.
-        assert_eq!(hud.len(), touch.hud_rects().len() * 6 + 12);
+        fill_hud(&mut hud, &touch, &slots, true, 800, 600);
+        // The four touch rectangles, nine hotbar backgrounds, the selected
+        // overlay and the two-quad crosshair.
+        assert_eq!(hud.len(), touch.hud_rects().len() * 6 + 9 * 6 + 6 + 12);
         for vertex in &hud {
             assert!(vertex.position[0].is_finite());
             assert!(vertex.position[1].is_finite());
@@ -1009,8 +1141,117 @@ mod tests {
             assert!((-1.0..=1.0).contains(&vertex.position[1]));
         }
         // The buffer is reused, not appended to, on the next frame.
-        fill_hud(&mut hud, &touch, false, 800, 600);
+        fill_hud(&mut hud, &touch, &slots, false, 800, 600);
         assert!(hud.is_empty());
+    }
+
+    #[test]
+    fn hotbar_swatch_colors_cover_the_creative_slots() {
+        let expected = [
+            ("minecraft:stone", [0.50, 0.50, 0.50, 1.0]),
+            ("minecraft:dirt", [0.55, 0.40, 0.24, 1.0]),
+            ("minecraft:grass_block", [0.34, 0.62, 0.30, 1.0]),
+            ("minecraft:oak_planks", [0.72, 0.60, 0.40, 1.0]),
+            ("minecraft:oak_log", [0.42, 0.32, 0.19, 1.0]),
+            ("minecraft:glass", [0.72, 0.86, 0.96, 1.0]),
+            ("minecraft:bricks", [0.62, 0.24, 0.20, 1.0]),
+            ("minecraft:stone_bricks", [0.45, 0.45, 0.45, 1.0]),
+            ("minecraft:white_wool", [0.93, 0.93, 0.93, 1.0]),
+        ];
+        for (name, color) in expected {
+            assert_eq!(block_swatch_color(name), color, "{name}");
+            // The namespace is optional.
+            assert_eq!(
+                block_swatch_color(name.trim_start_matches("minecraft:")),
+                color,
+                "{name}"
+            );
+        }
+        // Every creative slot maps to its own swatch, and unknown blocks get
+        // a neutral gray instead of disappearing.
+        let inventory = crate::inventory::Inventory::creative();
+        let colors: Vec<[f32; 4]> = inventory
+            .slots()
+            .iter()
+            .map(|slot| block_swatch_color(&slot.as_ref().unwrap().name))
+            .collect();
+        for (i, a) in colors.iter().enumerate() {
+            for b in &colors[i + 1..] {
+                assert_ne!(a, b, "creative slots must be distinguishable");
+            }
+        }
+        assert_eq!(
+            block_swatch_color("minecraft:emerald_block"),
+            [0.65, 0.65, 0.65, 1.0]
+        );
+    }
+
+    #[test]
+    fn keyboard_and_touch_selection_merge_into_one_pick() {
+        assert_eq!(merge_select(Some(2), None), Some(2));
+        assert_eq!(merge_select(None, Some(7)), Some(7));
+        // A digit pressed in the same tick wins, so only one pick is applied.
+        assert_eq!(merge_select(Some(2), Some(7)), Some(2));
+        assert_eq!(merge_select(None, None), None);
+    }
+
+    #[test]
+    fn save_timer_fires_every_thirty_seconds() {
+        let start = Instant::now();
+        assert!(!save_due(start, start));
+        assert!(!save_due(
+            start,
+            start + Duration::from_secs(29) + Duration::from_millis(999)
+        ));
+        assert!(save_due(start, start + SAVE_INTERVAL));
+        assert!(save_due(start, start + Duration::from_secs(75)));
+        // A clock that jumps backwards never reports a save as due.
+        assert!(!save_due(start, start - Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn hud_draws_hotbar_swatches_and_a_brighter_selection() {
+        let mut touch = TouchControls::new();
+        touch.resize(800.0, 600.0);
+        touch.set_selected(3);
+        let mut slots: [Option<BlockState>; 9] = std::array::from_fn(|_| None);
+        slots[3] = Some(BlockState::new("minecraft:grass_block"));
+        let mut hud = Vec::new();
+        fill_hud(&mut hud, &touch, &slots, true, 800, 600);
+
+        // Four controls, nine backgrounds and one swatch, then the selection.
+        let expected = 4 * 6 + 9 * 6 + 6 + 6 + 12;
+        assert_eq!(hud.len(), expected);
+        let selected = hud
+            .iter()
+            .filter(|vertex| vertex.color == HOTBAR_SELECTED_COLOR)
+            .count();
+        assert_eq!(selected, 6, "only the selected slot gets the overlay");
+        let swatch = hud
+            .iter()
+            .filter(|vertex| vertex.color == block_swatch_color("minecraft:grass_block"))
+            .count();
+        assert_eq!(swatch, 6);
+
+        // Moving the selection moves the brighter overlay: the six selected
+        // vertices sit inside the new slot's rect.
+        touch.set_selected(7);
+        fill_hud(&mut hud, &touch, &slots, true, 800, 600);
+        let rect = touch.hotbar_rects()[7].0;
+        let (left, top) = (rect[0] * 2.0 - 1.0, 1.0 - rect[1] * 2.0);
+        let (right, bottom) = (
+            (rect[0] + rect[2]) * 2.0 - 1.0,
+            1.0 - (rect[1] + rect[3]) * 2.0,
+        );
+        for vertex in hud
+            .iter()
+            .filter(|vertex| vertex.color == HOTBAR_SELECTED_COLOR)
+        {
+            assert!((-1.0..=1.0).contains(&vertex.position[0]));
+            assert!((-1.0..=1.0).contains(&vertex.position[1]));
+            assert!(vertex.position[0] >= left - 1e-5 && vertex.position[0] <= right + 1e-5);
+            assert!(vertex.position[1] >= bottom - 1e-5 && vertex.position[1] <= top + 1e-5);
+        }
     }
 
     #[test]

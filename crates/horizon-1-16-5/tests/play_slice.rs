@@ -9,7 +9,7 @@ use horizon_1_16_5::player::Input;
 use horizon_1_16_5::render::{Camera, OffscreenRenderer, RenderError};
 use horizon_1_16_5::server::{FrameInput, IntegratedServer};
 use horizon_1_16_5::world::World;
-use horizon_1_16_5::{BlockSource, BlockTable};
+use horizon_1_16_5::{BlockSource, BlockState, BlockTable};
 use std::path::{Path, PathBuf};
 
 fn root() -> PathBuf {
@@ -207,4 +207,54 @@ fn play_mesh_renders_a_first_person_frame() {
         &std::fs::read(&out).expect("png bytes")[..8],
         b"\x89PNG\r\n\x1a\n"
     );
+}
+
+#[test]
+#[ignore = "needs .local/versions/1.16.5/world and prepared inputs"]
+fn edits_survive_save_and_reopen() {
+    let inputs = inputs();
+    let source = inputs.world;
+    assert!(source.is_dir(), "missing {}", source.display());
+    let target = std::env::temp_dir().join(format!(
+        "horizon-1165-save-{}-{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("test")
+    ));
+    let _ = std::fs::remove_dir_all(&target);
+    copy_dir(&source, &target);
+    let world_dir = target.canonicalize().unwrap();
+
+    let table = BlockTable::load(&inputs.tables).expect("tables");
+    let mut world = World::open(&world_dir, table).expect("world");
+    let before = world.state_id_at(0, 9, 0).expect("fixture log");
+    let stone = BlockState::new("minecraft:stone");
+    world.set_state(0, 9, 0, &stone).expect("set block");
+    assert!(world.has_unsaved_changes());
+    assert!(world.save(&world_dir).expect("save"));
+    assert!(!world.has_unsaved_changes());
+    drop(world);
+
+    let reopened = World::open(
+        &world_dir,
+        BlockTable::load(&inputs.tables).expect("tables"),
+    )
+    .expect("reopen");
+    let after = reopened.state_id_at(0, 9, 0).expect("saved block");
+    assert_ne!(after, before);
+    let state = reopened.state_at(0, 9, 0).expect("saved state");
+    assert_eq!(state.name, "minecraft:stone");
+    std::fs::remove_dir_all(&target).unwrap();
+}
+
+fn copy_dir(source: &Path, target: &Path) {
+    std::fs::create_dir_all(target).unwrap();
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let destination = target.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &destination);
+        } else {
+            std::fs::copy(entry.path(), destination).unwrap();
+        }
+    }
 }

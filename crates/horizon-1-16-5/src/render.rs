@@ -8,8 +8,10 @@
 //! window.
 //!
 //! The frame is a diagnostic image, not the game renderer: lighting is a
-//! fixed directional term, there are no shadows, shaders, sky or entities,
-//! and transparent pixels are simply discarded rather than blended.
+//! fixed directional term, there are no shadows, sky or entities, and
+//! transparent pixels are simply discarded rather than blended. Grass and
+//! foliage textures get the fixed plains biome tint while the CPU mesh is
+//! expanded into GPU vertices.
 //! [`SurfaceRenderer`] can additionally draw a clip-space HUD overlay with
 //! alpha blending on top of the world.
 
@@ -142,6 +144,8 @@ struct GpuVertex {
     position: [f32; 3],
     uv: [f32; 2],
     normal: [f32; 3],
+    /// Linear RGB biome tint applied to the sampled texel.
+    tint: [f32; 3],
 }
 
 /// A screen-space HUD vertex: a clip-space position and a straight
@@ -191,11 +195,13 @@ struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) normal: vec3<f32>,
+    @location(3) tint: vec3<f32>,
 };
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) light: f32,
+    @location(2) tint: vec3<f32>,
 };
 
 @vertex
@@ -203,6 +209,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
     output.clip_position = camera.view_proj * vec4<f32>(input.position, 1.0);
     output.uv = input.uv;
+    output.tint = input.tint;
     let normal = normalize(input.normal);
     let sun = normalize(vec3<f32>(0.35, 1.0, 0.25));
     let diffuse = max(dot(normal, sun), 0.0);
@@ -217,7 +224,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     if (texel.a < 0.5) {
         discard;
     }
-    return vec4<f32>(texel.rgb * input.light, 1.0);
+    return vec4<f32>(texel.rgb * input.tint * input.light, 1.0);
 }
 "#;
 
@@ -525,6 +532,7 @@ fn create_pipeline(
         0 => Float32x3,
         1 => Float32x2,
         2 => Float32x3,
+        3 => Float32x3,
     ];
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(label),
@@ -625,6 +633,57 @@ fn create_hud_pipeline(
     })
 }
 
+/// Decodes a packed sRGB colour (`0xRRGGBB`) into linear RGB, as the atlas
+/// samples are linear after the sRGB texture decode.
+fn srgb_to_linear(color: u32) -> [f32; 3] {
+    let channel = |shift: u32| {
+        let srgb = ((color >> shift) & 0xff) as f32 / 255.0;
+        if srgb <= 0.04045 {
+            srgb / 12.92
+        } else {
+            ((srgb + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    [channel(16), channel(8), channel(0)]
+}
+
+/// The plains biome grass colour (`0x91BD59`) in linear RGB.
+static GRASS_TINT: std::sync::LazyLock<[f32; 3]> =
+    std::sync::LazyLock::new(|| srgb_to_linear(0x91BD59));
+
+/// The plains biome foliage colour (`0x59AE30`) in linear RGB.
+static FOLIAGE_TINT: std::sync::LazyLock<[f32; 3]> =
+    std::sync::LazyLock::new(|| srgb_to_linear(0x59AE30));
+
+/// The fixed plains biome tint for a quad's texture name.
+///
+/// Vanilla leaves grass and foliage sprites untinted and multiplies them by
+/// the biome colour while chunk meshing; this renderer applies the same
+/// colour when it expands a quad into GPU vertices. Names are matched after
+/// the namespace and `block/` folder, so `minecraft:block/oak_leaves`,
+/// `oak_leaves` and `block/oak_leaves` all tint alike. Every unrelated
+/// texture keeps `[1, 1, 1]`.
+pub fn tint_for_texture(name: &str) -> [f32; 3] {
+    let path = name.split_once(':').map_or(name, |(_, path)| path);
+    let sprite = path.strip_prefix("block/").unwrap_or(path);
+    if matches!(
+        sprite,
+        "grass_block_top"
+            | "grass_block_side_overlay"
+            | "grass"
+            | "fern"
+            | "tall_grass"
+            | "large_fern"
+            | "sugar_cane"
+    ) {
+        return *GRASS_TINT;
+    }
+    if sprite.ends_with("_leaves") || matches!(sprite, "vine" | "lily_pad") {
+        return *FOLIAGE_TINT;
+    }
+    [1.0, 1.0, 1.0]
+}
+
 /// Validates a mesh and expands it into GPU vertices, mapping each quad's
 /// per-face UVs (sixteenths of a tile) into its atlas region.
 fn build_vertices(mesh: &Mesh, atlas: &TextureAtlas) -> Result<Vec<GpuVertex>, RenderError> {
@@ -650,6 +709,7 @@ fn build_vertices(mesh: &Mesh, atlas: &TextureAtlas) -> Result<Vec<GpuVertex>, R
     let mut vertices = Vec::with_capacity(mesh.vertices.len());
     for (quad_index, quad) in mesh.vertices.chunks_exact(4).enumerate() {
         let uv_rect = atlas.uv(&mesh.textures[quad_index]).unwrap_or(missing_uv);
+        let tint = tint_for_texture(&mesh.textures[quad_index]);
         for vertex in quad {
             let local = [vertex.uv[0] / 16.0, vertex.uv[1] / 16.0];
             vertices.push(GpuVertex {
@@ -659,6 +719,7 @@ fn build_vertices(mesh: &Mesh, atlas: &TextureAtlas) -> Result<Vec<GpuVertex>, R
                     uv_rect[1] + local[1] * (uv_rect[3] - uv_rect[1]),
                 ],
                 normal: vertex.normal,
+                tint,
             });
         }
     }
@@ -1318,6 +1379,91 @@ mod tests {
             .render(&mesh, &atlas, Camera::framing(&mesh, 0.0, 1.4, 2.5), 64, 64)
             .unwrap();
         assert_ne!(front.rgba, top.rgba);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn texture_tints_match_the_plains_biome() {
+        fn close(actual: [f32; 3], expected: [f32; 3]) {
+            for (actual, expected) in actual.into_iter().zip(expected) {
+                assert!(
+                    (actual - expected).abs() < 5e-4,
+                    "expected {expected}, got {actual} (whole value {actual:?} vs {expected:?})"
+                );
+            }
+        }
+
+        // Plains grass colour 0x91BD59 and foliage colour 0x59AE30, decoded
+        // from sRGB to linear RGB.
+        let grass = [0.2831, 0.5088, 0.0999];
+        let foliage = [0.0999, 0.4232, 0.0296];
+        for name in [
+            "minecraft:block/grass_block_top",
+            "minecraft:block/grass_block_side_overlay",
+            "minecraft:block/grass",
+            "minecraft:block/fern",
+            "minecraft:block/tall_grass",
+            "minecraft:block/large_fern",
+            "minecraft:block/sugar_cane",
+            "grass",
+            "block/tall_grass",
+        ] {
+            close(tint_for_texture(name), grass);
+        }
+        for name in [
+            "minecraft:block/oak_leaves",
+            "minecraft:block/dark_oak_leaves",
+            "minecraft:block/jungle_leaves",
+            "minecraft:block/vine",
+            "minecraft:block/lily_pad",
+            "oak_leaves",
+        ] {
+            close(tint_for_texture(name), foliage);
+        }
+        for name in [
+            "minecraft:block/stone",
+            "minecraft:block/oak_planks",
+            "minecraft:block/red",
+            "minecraft:entity/zombie",
+            "minecraft:item/stick",
+        ] {
+            assert_eq!(tint_for_texture(name), [1.0, 1.0, 1.0], "{name}");
+        }
+        assert_ne!(grass, foliage);
+    }
+
+    #[test]
+    fn gpu_vertices_carry_a_tint() {
+        let root = temp_pack([255, 0, 0, 255], [0, 0, 255, 255]);
+        let mesh = Mesh {
+            vertices: vec![
+                Vertex {
+                    position: [0.0, 0.0, 0.0],
+                    uv: [0.0, 0.0],
+                    normal: [0.0, 1.0, 0.0],
+                };
+                4
+            ],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            textures: vec!["minecraft:block/grass_block_top".to_owned()],
+        };
+        let atlas = TextureAtlas::from_directory(
+            &root,
+            [
+                "minecraft:block/red".to_owned(),
+                "minecraft:block/blue".to_owned(),
+            ],
+        )
+        .unwrap();
+        let vertices = build_vertices(&mesh, &atlas).unwrap();
+        assert_eq!(vertices.len(), 4);
+        for vertex in &vertices {
+            assert_eq!(
+                vertex.tint,
+                tint_for_texture("minecraft:block/grass_block_top")
+            );
+        }
+        assert_eq!(std::mem::size_of::<GpuVertex>(), 44);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

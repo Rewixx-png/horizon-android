@@ -70,8 +70,24 @@ fn android_main(app: AndroidApp) {
     std::process::exit(0);
 }
 
+/// Whether the extracted tree is complete and should not be overwritten.
+///
+/// The world is writable after the first launch; re-extracting the bundled
+/// zip on every start would silently discard saved blocks. `.ready` is
+/// written only after a complete extraction, so a crash halfway through is
+/// retried on the next launch.
+fn extracted_tree_is_ready(root: &Path) -> bool {
+    root.join(".ready").is_file()
+        && root.join("tables.json").is_file()
+        && root.join("client.jar").is_file()
+        && root.join("world/level.dat").is_file()
+}
+
 /// Streams `assets/1165.zip` out of the APK and unpacks it into `root`.
 fn unpack_assets(app: &AndroidApp, root: &Path) -> Result<(), String> {
+    if extracted_tree_is_ready(root) {
+        return Ok(());
+    }
     let mut asset = app
         .asset_manager()
         .open(c"1165.zip")
@@ -95,7 +111,9 @@ fn unpack_assets(app: &AndroidApp, root: &Path) -> Result<(), String> {
             .map_err(|error| format!("opening {}: {error}", staging.display()))?;
         let mut archive = zip::ZipArchive::new(archive)
             .map_err(|error| format!("reading {ASSET_NAME}: {error}"))?;
-        extract_archive(&mut archive, root)
+        extract_archive(&mut archive, root)?;
+        fs::write(root.join(".ready"), b"1\n")
+            .map_err(|error| format!("marking {} ready: {error}", root.display()))
     })();
 
     // Only needed while the archive is being read; the extracted tree is the

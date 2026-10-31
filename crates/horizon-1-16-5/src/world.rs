@@ -1,10 +1,16 @@
-//! Direct 1.16.5 Anvil world loading.
+//! Direct 1.16.5 Anvil world loading and saving.
 //!
 //! [`World::open`] reads every `region/r.<x>.<z>.mca` of a world directory and
 //! decodes its chunks into [`ChunkColumn`]s: up to 16 block sections (height
 //! 256) plus the 1024-entry biome grid. A chunk column whose `Level` compound
 //! carries no `Sections` (or an empty list) is empty and skipped, exactly like
 //! a chunk the region header does not list at all.
+//!
+//! [`World::save`] writes only the chunks changed since opening (or the last
+//! save) back in place. Each one is re-encoded as a fresh root with
+//! `DataVersion` 2586, `Level.Status` `full`, a local palette per section and
+//! the same packing and biome layout described below, so the crate's own
+//! reader round-trips it.
 //!
 //! # 1.16.5 section storage
 //!
@@ -40,13 +46,15 @@
 //! zero-fill the rest, like vanilla ignoring them; a longer array keeps the
 //! first 1024 ids.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use horizon_core::position::ChunkPos;
-use horizon_world::nbt::{Limits, NamedTag, Tag};
-use horizon_world::region::RegionFile;
+use horizon_world::compression::Compression;
+use horizon_world::nbt::{JavaString, Limits, NamedTag, Tag};
+use horizon_world::region::{ChunkRecord, RegionFile};
 
 use crate::{BlockSource, BlockState, BlockTable, Properties};
 
@@ -67,6 +75,8 @@ pub struct World {
     /// section (or the whole y range) is absent.
     air: u16,
     chunks: HashMap<(i32, i32), ChunkColumn>,
+    /// Chunk positions changed since the last successful save.
+    dirty: HashSet<(i32, i32)>,
 }
 
 impl World {
@@ -106,7 +116,12 @@ impl World {
                 }
             }
         }
-        Ok(Self { table, air, chunks })
+        Ok(Self {
+            table,
+            air,
+            chunks,
+            dirty: HashSet::new(),
+        })
     }
 
     /// The loaded chunk column at chunk coordinates (x, z), if any.
@@ -163,13 +178,19 @@ impl World {
             return Err(format!("block y {y} is outside 0..256"));
         }
         let air = self.air;
+        let position = (x >> 4, z >> 4);
         let column = self
             .chunks
-            .get_mut(&(x >> 4, z >> 4))
-            .ok_or_else(|| format!("no chunk loaded at ({}, {})", x >> 4, z >> 4))?;
+            .get_mut(&position)
+            .ok_or_else(|| format!("no chunk loaded at ({}, {})", position.0, position.1))?;
         let section = column.sections[(y >> 4) as usize]
             .get_or_insert_with(|| Box::new([air; SECTION_BLOCKS]));
-        section[(((y & 15) << 8) | ((z & 15) << 4) | (x & 15)) as usize] = id;
+        let index = (((y & 15) << 8) | ((z & 15) << 4) | (x & 15)) as usize;
+        let changed = section[index] != id;
+        section[index] = id;
+        if changed {
+            self.dirty.insert(position);
+        }
         Ok(())
     }
 
@@ -184,6 +205,138 @@ impl World {
             .state_id(state)
             .ok_or_else(|| format!("{} is not in the 1.16.5 block table", describe(state)))?;
         self.set_state_id(x, y, z, id)
+    }
+
+    /// Whether any chunk changed since the world was opened or last saved.
+    pub fn has_unsaved_changes(&self) -> bool {
+        !self.dirty.is_empty()
+    }
+
+    /// Writes every dirty chunk in place under `root/region/`, creating the
+    /// directory and region files as needed.
+    ///
+    /// Each chunk is rebuilt as a fresh 1.16.5 `Level` root (`DataVersion`
+    /// 2586, `Status` `full`, local section palettes, packed `BlockStates`
+    /// and the column's `Biomes`), so the result is exactly what this crate's
+    /// [`World::open`] reads back. Clean and unloaded chunks are not touched.
+    ///
+    /// The dirty set loses only the chunks written successfully; a failure
+    /// returns an error naming the chunk and its region file, and the chunks
+    /// from that point on stay dirty for a later retry. Returns whether any
+    /// chunk was written.
+    pub fn save(&mut self, root: &Path) -> Result<bool, String> {
+        if self.dirty.is_empty() {
+            return Ok(false);
+        }
+        let region_dir = root.join("region");
+        fs::create_dir_all(&region_dir)
+            .map_err(|error| format!("creating {}: {error}", region_dir.display()))?;
+        // Vanilla stores the chunk's last-modified time as a u32 epoch second.
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0)
+            .min(u64::from(u32::MAX)) as u32;
+
+        let mut positions: Vec<(i32, i32)> = self.dirty.iter().copied().collect();
+        positions.sort_unstable();
+        let mut wrote = false;
+        for (cx, cz) in positions {
+            // Only loaded chunks can be dirty through the public API; a
+            // stale entry has nothing to encode and stays dirty.
+            let Some(column) = self.chunks.get(&(cx, cz)) else {
+                continue;
+            };
+            let region = ChunkPos::new(cx >> 5, cz >> 5);
+            let path = region_dir.join(format!("r.{}.{}.mca", region.x, region.z));
+            let nbt = self
+                .column_nbt(column)
+                .map_err(|error| format!("chunk ({cx}, {cz}) in {}: {error}", path.display()))?;
+            let record = ChunkRecord::from_nbt(&nbt, Compression::Gzip, timestamp, Limits::saved())
+                .map_err(|error| format!("chunk ({cx}, {cz}) in {}: {error}", path.display()))?;
+            let mut file = RegionFile::open_writable(&path, true)
+                .map_err(|error| format!("chunk ({cx}, {cz}) in {}: {error}", path.display()))?;
+            file.write(ChunkPos::new(cx, cz), &record)
+                .map_err(|error| format!("chunk ({cx}, {cz}) in {}: {error}", path.display()))?;
+            // A later failure leaves only the chunks not yet written dirty.
+            self.dirty.remove(&(cx, cz));
+            wrote = true;
+        }
+        Ok(wrote)
+    }
+
+    /// Builds the 1.16.5 chunk NBT root for one loaded column.
+    fn column_nbt(&self, column: &ChunkColumn) -> Result<NamedTag, String> {
+        let at = format!("chunk ({}, {})", column.x, column.z);
+        let mut sections = Vec::new();
+        for (y, section) in column.sections.iter().enumerate() {
+            let Some(blocks) = section else {
+                continue;
+            };
+            sections.push(self.section_nbt(blocks, y, &at)?);
+        }
+        Ok(NamedTag {
+            name: JavaString::default(),
+            tag: Tag::compound([
+                ("DataVersion", Tag::Int(2586)),
+                (
+                    "Level",
+                    Tag::compound([
+                        ("xPos", Tag::Int(column.x)),
+                        ("zPos", Tag::Int(column.z)),
+                        ("Status", Tag::String(JavaString::from("full"))),
+                        ("Sections", Tag::List(sections)),
+                        ("Biomes", Tag::IntArray(column.biomes.to_vec())),
+                    ]),
+                ),
+            ]),
+        })
+    }
+
+    /// Encodes one section with its own local palette and 1.16.5 packing.
+    fn section_nbt(
+        &self,
+        blocks: &[u16; SECTION_BLOCKS],
+        y: usize,
+        at: &str,
+    ) -> Result<Tag, String> {
+        // 1.16.5 re-enumerates the distinct states of the section on save.
+        let mut palette: Vec<u16> = Vec::new();
+        let mut indices: HashMap<u16, u64> = HashMap::new();
+        let mut values = Vec::with_capacity(SECTION_BLOCKS);
+        for &id in blocks.iter() {
+            let index = match indices.get(&id) {
+                Some(&index) => index,
+                None => {
+                    let index = palette.len() as u64;
+                    palette.push(id);
+                    indices.insert(id, index);
+                    index
+                }
+            };
+            values.push(index);
+        }
+        let bits = bits_per_entry(palette.len());
+        let values_per_long = 64usize / bits as usize;
+        let mut longs = vec![0i64; SECTION_BLOCKS.div_ceil(values_per_long)];
+        for (index, &value) in values.iter().enumerate() {
+            longs[index / values_per_long] |=
+                (value << ((index % values_per_long) * bits as usize)) as i64;
+        }
+        let entries = palette
+            .iter()
+            .map(|&id| {
+                let state = self.table.state(id).ok_or_else(|| {
+                    format!("{at}: section {y} holds block-state id {id}, which is not in the 1.16.5 block table")
+                })?;
+                Ok(palette_entry_nbt(state))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Tag::compound([
+            ("Y", Tag::Byte(y as i8)),
+            ("Palette", Tag::List(entries)),
+            ("BlockStates", Tag::LongArray(longs)),
+        ]))
     }
 }
 
@@ -498,6 +651,22 @@ fn describe(state: &BlockState) -> String {
     out
 }
 
+/// One `Palette` entry from a block table state: `Name` plus an optional
+/// `Properties` compound.
+fn palette_entry_nbt(state: &BlockState) -> Tag {
+    let name = Tag::String(JavaString::from(state.name.as_str()));
+    if state.properties.is_empty() {
+        return Tag::compound([("Name", name)]);
+    }
+    let properties = Tag::compound(
+        state
+            .properties
+            .iter()
+            .map(|(key, value)| (key.as_str(), Tag::String(JavaString::from(value.as_str())))),
+    );
+    Tag::compound([("Name", name), ("Properties", properties)])
+}
+
 /// The 1.16.5 `ChunkBiomeContainer` cell index for block coordinates:
 /// 4×4×4-block cells ordered Y (64 cells), then Z (4), then X (4), with y
 /// clamped to 0..63 like vanilla.
@@ -553,7 +722,7 @@ mod tests {
     use super::*;
     use horizon_world::compression::Compression;
     use horizon_world::nbt::JavaString;
-    use horizon_world::region::{ChunkRecord, RegionWriter};
+    use horizon_world::region::{ChunkRecord, RegionFile, RegionWriter};
 
     fn tag(value: &str) -> Tag {
         Tag::String(JavaString::from(value))
@@ -652,6 +821,67 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// A 1.16.5 table with air (id 0) and 17 distinct `test_block` states
+    /// (ids 1..=17), so a section can exceed the 16-entry 4-bit palette.
+    fn wide_table() -> BlockTable {
+        let states: Vec<_> = (0..17u16)
+            .map(|index| {
+                serde_json::json!({
+                    "id": index + 1,
+                    "properties": {"variant": index.to_string()},
+                })
+            })
+            .collect();
+        let json = serde_json::json!({
+            "version": "1.16.5",
+            "blocks": {"entries": {
+                "minecraft:air": {"states": [{"id": 0}]},
+                "minecraft:test_block": {"states": states},
+            }},
+        });
+        let path = std::env::temp_dir().join(format!(
+            "horizon-1-16-5-world-wide-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("world")
+        ));
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let table = BlockTable::load(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        table
+    }
+
+    /// Writes one chunk (Zlib, timestamp 0) into its region file.
+    fn write_chunk(dir: &Path, root: NamedTag, x: i32, z: i32) {
+        let path = dir
+            .join("region")
+            .join(format!("r.{}.{}.mca", x >> 5, z >> 5));
+        let record = ChunkRecord::from_nbt(&root, Compression::Zlib, 0, Limits::saved()).unwrap();
+        match RegionFile::open_writable(&path, true) {
+            Ok(mut region) => region.write(ChunkPos::new(x, z), &record).unwrap(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // No region directory yet: let RegionWriter create it.
+                let mut writer = RegionWriter::create(&path).unwrap();
+                writer.write(ChunkPos::new(x, z), &record).unwrap();
+                writer.finish().unwrap();
+            }
+            Err(error) => panic!("opening {}: {error}", path.display()),
+        }
+    }
+
+    /// The chunk NBT root read back from `dir`'s region file.
+    fn read_chunk(dir: &Path, x: i32, z: i32) -> NamedTag {
+        let path = dir
+            .join("region")
+            .join(format!("r.{}.{}.mca", x >> 5, z >> 5));
+        let mut region = RegionFile::open(&path).unwrap();
+        region
+            .read(ChunkPos::new(x, z))
+            .unwrap()
+            .unwrap()
+            .nbt(Limits::saved())
+            .unwrap()
     }
 
     #[test]
@@ -1071,6 +1301,208 @@ mod tests {
         );
         let error = ChunkColumn::from_nbt(&root, position, &table).unwrap_err();
         assert!(error.contains("minecraft:oak_log{axis=z}"), "{error}");
+    }
+
+    #[test]
+    fn save_round_trips_changed_blocks_and_writes_a_1_16_5_root() {
+        let table = test_table();
+        let air = table.state_id(&BlockState::new("minecraft:air")).unwrap();
+        let stone = table.state_id(&BlockState::new("minecraft:stone")).unwrap();
+        let dir = temp_dir("save-roundtrip");
+        // Chunk (0, 0), all air, section 0 only, with a recognisable biome.
+        let root = chunk_root(
+            vec![section_tag(0, vec![entry("minecraft:air", None)], None)],
+            Some(vec![7; BIOMES]),
+            0,
+            0,
+        );
+        write_chunk(&dir, root, 0, 0);
+
+        let mut world = World::open(&dir, table.clone()).unwrap();
+        assert!(!world.has_unsaved_changes());
+        assert_eq!(world.state_id_at(3, 2, 1), Some(air));
+        world
+            .set_state(3, 2, 1, &BlockState::new("minecraft:stone"))
+            .unwrap();
+        // Section 12 is created for the high-y block.
+        world
+            .set_state(3, 200, 1, &BlockState::new("minecraft:stone"))
+            .unwrap();
+        assert!(world.has_unsaved_changes());
+        assert!(world.save(&dir).unwrap());
+        assert!(!world.has_unsaved_changes());
+
+        // The fresh root carries the 1.16.5 data version, a full status, a
+        // local section palette and the column's biome array.
+        let saved = read_chunk(&dir, 0, 0);
+        assert_eq!(saved.tag.get("DataVersion"), Some(&Tag::Int(2586)));
+        let level = saved.tag.get("Level").unwrap();
+        assert_eq!(
+            level.get("Status"),
+            Some(&Tag::String(JavaString::from("full")))
+        );
+        let sections = match level.get("Sections") {
+            Some(Tag::List(sections)) => sections,
+            other => panic!("Level.Sections: {other:?}"),
+        };
+        assert_eq!(sections.len(), 2);
+        assert!(
+            sections
+                .iter()
+                .any(|section| section.get("Y") == Some(&Tag::Byte(12)))
+        );
+        let section0 = sections
+            .iter()
+            .find(|section| section.get("Y") == Some(&Tag::Byte(0)))
+            .unwrap();
+        match section0.get("Palette") {
+            Some(Tag::List(palette)) => assert_eq!(palette.len(), 2),
+            other => panic!("section 0 Palette: {other:?}"),
+        }
+        assert!(matches!(
+            section0.get("BlockStates"),
+            Some(Tag::LongArray(longs)) if longs.len() == 256
+        ));
+        assert!(matches!(
+            level.get("Biomes"),
+            Some(Tag::IntArray(biomes)) if biomes.len() == BIOMES && biomes.iter().all(|&b| b == 7)
+        ));
+
+        // The crate's own reader must see every changed state.
+        let world = World::open(&dir, table).unwrap();
+        assert_eq!(world.state_id_at(3, 2, 1), Some(stone));
+        assert_eq!(world.state_id_at(3, 200, 1), Some(stone));
+        assert_eq!(
+            world.state_at(3, 200, 1),
+            Some(BlockState::new("minecraft:stone"))
+        );
+        assert_eq!(world.state_id_at(4, 200, 1), Some(air));
+        assert_eq!(world.chunk(0, 0).unwrap().biome(3, 2, 1), 7);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_tracks_dirty_chunks_and_skips_clean_ones() {
+        let table = test_table();
+        let air = table.state_id(&BlockState::new("minecraft:air")).unwrap();
+        let stone = table.state_id(&BlockState::new("minecraft:stone")).unwrap();
+        let dir = temp_dir("save-dirty");
+        // Two chunks in the same region, both all air.
+        for x in [0, 1] {
+            write_chunk(
+                &dir,
+                chunk_root(
+                    vec![section_tag(0, vec![entry("minecraft:air", None)], None)],
+                    None,
+                    x,
+                    0,
+                ),
+                x,
+                0,
+            );
+        }
+        let mut world = World::open(&dir, table).unwrap();
+        assert!(!world.has_unsaved_changes());
+        // Writing the value already there is not a change.
+        world.set_state_id(0, 0, 0, air).unwrap();
+        assert!(!world.has_unsaved_changes());
+        assert!(!world.save(&dir).unwrap());
+
+        world.set_state_id(0, 0, 0, stone).unwrap();
+        assert!(world.has_unsaved_changes());
+        assert!(world.save(&dir).unwrap());
+        assert!(!world.has_unsaved_changes());
+        // Nothing left to write.
+        assert!(!world.save(&dir).unwrap());
+
+        // The dirty chunk was rewritten (fresh timestamp); the clean chunk
+        // keeps the fixture's timestamp 0.
+        let timestamps: Vec<_> = RegionFile::open(dir.join("region").join("r.0.0.mca"))
+            .unwrap()
+            .chunks()
+            .collect();
+        let (dirty, clean): (Vec<_>, Vec<_>) = timestamps
+            .into_iter()
+            .partition(|(position, _)| *position == ChunkPos::new(0, 0));
+        assert_eq!(dirty.len(), 1);
+        assert!(dirty[0].1 > 0);
+        assert_eq!(clean, vec![(ChunkPos::new(1, 0), 0)]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn save_round_trips_a_wide_palette_and_a_high_section() {
+        let table = wide_table();
+        let dir = temp_dir("save-wide");
+        // Chunk (-1, 2) lives in r.-1.0.mca.
+        write_chunk(
+            &dir,
+            chunk_root(
+                vec![section_tag(0, vec![entry("minecraft:air", None)], None)],
+                None,
+                -1,
+                2,
+            ),
+            -1,
+            2,
+        );
+        let mut world = World::open(&dir, table.clone()).unwrap();
+        // 17 distinct non-air states in section 0 (plus implicit air = an
+        // 18-entry palette, past the 16-state 4-bit floor), at unique cells.
+        for id in 1u16..=17 {
+            world
+                .set_state_id(-16 + i32::from(id % 16), 0, 32 + i32::from(id / 16), id)
+                .unwrap();
+        }
+        // Section 15, i.e. y 240..256, still inside chunk (-1, 2).
+        world.set_state_id(-11, 250, 39, 17).unwrap();
+        assert!(world.has_unsaved_changes());
+        assert!(world.save(&dir).unwrap());
+
+        let saved = read_chunk(&dir, -1, 2);
+        let sections = match saved
+            .tag
+            .get("Level")
+            .and_then(|level| level.get("Sections"))
+        {
+            Some(Tag::List(sections)) => sections,
+            other => panic!("Level.Sections: {other:?}"),
+        };
+        let section0 = sections
+            .iter()
+            .find(|section| section.get("Y") == Some(&Tag::Byte(0)))
+            .unwrap();
+        let palette = match section0.get("Palette") {
+            Some(Tag::List(palette)) => palette.len(),
+            other => panic!("section 0 Palette: {other:?}"),
+        };
+        assert_eq!(palette, 18);
+        assert!(palette > 16, "palette {palette} must exceed 16 states");
+        assert!(matches!(
+            section0.get("BlockStates"),
+            Some(Tag::LongArray(longs)) if longs.len() == 342
+        ));
+        assert!(
+            sections
+                .iter()
+                .any(|section| section.get("Y") == Some(&Tag::Byte(15)))
+        );
+
+        // Everything survives a reopen through the crate's own reader.
+        let world = World::open(&dir, table).unwrap();
+        let air = world.state_id_at(-16, 0, 32).unwrap();
+        for id in 1u16..=17 {
+            assert_eq!(
+                world.state_id_at(-16 + i32::from(id % 16), 0, 32 + i32::from(id / 16)),
+                Some(id),
+                "state {id}"
+            );
+        }
+        assert_eq!(world.state_id_at(-11, 250, 39), Some(17));
+        assert_eq!(world.state_id_at(-11, 251, 39), Some(air));
+        assert_eq!(world.state_id_at(-12, 250, 39), Some(air));
+        assert!(world.chunk(-1, 2).unwrap().section(15).is_some());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

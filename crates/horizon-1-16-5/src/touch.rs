@@ -11,12 +11,16 @@
 //!   in the desktop mouse convention (`yaw -= look[0]`, `pitch += look[1]`),
 //!   and a short tap breaks the targeted block;
 //! - a square place button in the bottom-right corner places the held block on
-//!   press and never starts a look drag.
+//!   press and never starts a look drag;
+//! - a nine-slot hotbar sits centred just above the joystick and place button.
+//!   Tapping a slot selects it; because the hotbar is hit-tested first, such a
+//!   touch never starts a look drag, breaks a block or jumps.
 //!
 //! [`TouchControls::frame`] drains the one-shot actions and the accumulated
 //! look delta for one tick while held movement keeps being reported, so it can
-//! be called unconditionally every frame. [`TouchControls::hud_rects`] exposes
-//! the same layout as normalized rectangles for the HUD renderer.
+//! be called unconditionally every frame. [`TouchControls::hud_rects`] and
+//! [`TouchControls::hotbar_rects`] expose the same layout as normalized
+//! rectangles for the HUD renderer.
 //!
 //! Coordinates are physical pixels from winit with a top-left origin.
 
@@ -42,6 +46,16 @@ const PLACE_SIZE: f32 = 0.18;
 const PLACE_MARGIN: f32 = 0.03;
 /// Height of the faint break-zone hint at the top of the look zone.
 const BREAK_HINT_HEIGHT: f32 = 0.07;
+/// Number of hotbar slots.
+pub const HOTBAR_SLOTS: usize = 9;
+/// Side of one hotbar slot as a fraction of the smaller screen side.
+const HOTBAR_SLOT_SIZE: f32 = 0.085;
+/// Gap between two hotbar slots, as a fraction of the smaller screen side.
+const HOTBAR_GAP: f32 = 0.007;
+/// Distance from the bottom edge to the hotbar, as a fraction of the smaller
+/// screen side. Larger than the joystick's `STICK_MARGIN + 2 * STICK_RADIUS`
+/// so the bar always clears the joystick and the place button.
+const HOTBAR_BOTTOM: f32 = 0.335;
 
 /// Longest press that still counts as a tap instead of a hold.
 const TAP_TIME: Duration = Duration::from_millis(250);
@@ -78,6 +92,8 @@ pub struct TouchFrame {
     pub place_block: bool,
     /// Set once for a short joystick-zone tap.
     pub jump: bool,
+    /// Hotbar slot selected by a touch on the hotbar, if any.
+    pub select: Option<usize>,
 }
 
 /// Which gesture a finger owns.
@@ -86,6 +102,8 @@ enum Role {
     Stick,
     Look,
     Place,
+    /// A hotbar press; the slot was selected at press time.
+    Hotbar,
 }
 
 /// State kept for a finger that is still touching the screen.
@@ -100,7 +118,7 @@ struct Finger {
     travel: f32,
 }
 
-/// Virtual joystick, look area and place button for one touch screen.
+/// Virtual joystick, look area, place button and hotbar for one touch screen.
 #[derive(Clone, Debug, Default)]
 pub struct TouchControls {
     width: f32,
@@ -115,6 +133,10 @@ pub struct TouchControls {
     jump: bool,
     break_block: bool,
     place_block: bool,
+    /// Hotbar slot highlighted by the touch HUD.
+    selected: usize,
+    /// Slot picked since the last [`TouchControls::frame`].
+    select: Option<usize>,
 }
 
 impl TouchControls {
@@ -156,12 +178,42 @@ impl TouchControls {
             break_block: self.break_block,
             place_block: self.place_block,
             jump: self.jump,
+            select: self.select.take(),
         };
         self.look = [0.0; 2];
         self.break_block = false;
         self.place_block = false;
         self.jump = false;
         frame
+    }
+
+    /// The hotbar slot the touch HUD highlights.
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+
+    /// Highlights `slot` without queueing a selection. Out-of-range slots are
+    /// ignored. The app uses this to mirror the inventory's selection (which
+    /// keyboard digits and the mouse wheel also change) into the touch HUD.
+    pub fn set_selected(&mut self, slot: usize) {
+        if slot < HOTBAR_SLOTS {
+            self.selected = slot;
+        }
+    }
+
+    /// The nine hotbar slots as normalized `(rect, selected)` pairs.
+    ///
+    /// Rects use the same top-left `0..=1` convention as
+    /// [`TouchControls::hud_rects`]; the bar is centred horizontally and sits
+    /// above the joystick and place button.
+    pub fn hotbar_rects(&self) -> [([f32; 4], bool); HOTBAR_SLOTS] {
+        std::array::from_fn(|slot| {
+            let rect = self.hotbar_slot_rect(slot);
+            (
+                self.normalize(rect[0], rect[1], rect[2], rect[3]),
+                slot == self.selected,
+            )
+        })
     }
 
     /// The visible controls as `(rect, color)` pairs in normalized `0..=1`
@@ -238,6 +290,19 @@ impl TouchControls {
         ]
     }
 
+    /// `(x, y, width, height)` of hotbar `slot` in pixels.
+    ///
+    /// The side is capped against the screen width so the bar still fits on
+    /// unusually narrow surfaces.
+    fn hotbar_slot_rect(&self, slot: usize) -> [f32; 4] {
+        let side = (self.min_side() * HOTBAR_SLOT_SIZE).min(self.width * 0.11);
+        let gap = side * (HOTBAR_GAP / HOTBAR_SLOT_SIZE);
+        let total = side * HOTBAR_SLOTS as f32 + gap * (HOTBAR_SLOTS - 1) as f32;
+        let left = (self.width - total) * 0.5;
+        let y = self.height - self.min_side() * HOTBAR_BOTTOM - side;
+        [left + slot as f32 * (side + gap), y, side, side]
+    }
+
     /// Converts a pixel rectangle into normalized screen coordinates.
     fn normalize(&self, x: f32, y: f32, w: f32, h: f32) -> [f32; 4] {
         if self.width <= 0.0 || self.height <= 0.0 {
@@ -302,7 +367,29 @@ impl TouchControls {
             travel: 0.0,
         };
 
-        // The button is checked first so a touch on it can never become a
+        // The hotbar is checked first: a slot tap must never become a look
+        // drag, a block break or a jump, even though the bar overlays the
+        // tail of the look zone. Selection takes effect immediately and is
+        // queued for the next tick.
+        let side = self.hotbar_slot_rect(0)[2];
+        if side > 0.0 {
+            for slot in 0..HOTBAR_SLOTS {
+                if contains(self.hotbar_slot_rect(slot), point) {
+                    self.selected = slot;
+                    self.select = Some(slot);
+                    self.fingers.insert(
+                        id,
+                        Finger {
+                            role: Role::Hotbar,
+                            ..finger
+                        },
+                    );
+                    return;
+                }
+            }
+        }
+
+        // The button is checked next so a touch on it can never become a
         // look drag, even though it sits inside the look zone.
         if contains(self.place_rect(), point) {
             if self.has_role(Role::Place) {
@@ -361,6 +448,8 @@ impl TouchControls {
                 self.look[1] += delta[1] * LOOK_DEGREES_PER_PIXEL;
             }
             Role::Place => {}
+            // A hotbar finger owns the slot; dragging must not look or act.
+            Role::Hotbar => {}
         }
     }
 
@@ -385,6 +474,8 @@ impl TouchControls {
             Role::Stick => self.jump = true,
             Role::Look => self.break_block = true,
             Role::Place => {}
+            // Selection already happened on press; releasing never acts.
+            Role::Hotbar => {}
         }
     }
 }
@@ -772,5 +863,164 @@ mod tests {
         assert!(controls.frame().place_block);
         controls.touch(42, TouchPhase::Ended, point[0], point[1]);
         assert!(!controls.frame().break_block);
+    }
+
+    /// Centre of hotbar `slot` in physical pixels.
+    fn slot_center(controls: &TouchControls, slot: usize) -> [f32; 2] {
+        let rect = controls.hotbar_slot_rect(slot);
+        [rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0]
+    }
+
+    #[test]
+    fn hotbar_tap_selects_without_any_other_action() {
+        let mut controls = controls();
+        let now = Instant::now();
+        let point = slot_center(&controls, 0);
+        // Slot 0 sits inside the joystick zone; the hotbar must win there.
+        assert!(point[0] < W * STICK_ZONE);
+
+        controls.touch_at(11, TouchPhase::Started, point, now);
+        let frame = controls.frame();
+        assert_eq!(frame.select, Some(0));
+        assert_eq!(controls.selected(), 0);
+        assert_eq!(frame.movement, Input::default());
+        assert!(!frame.jump);
+        assert!(!frame.break_block);
+        assert!(!frame.place_block);
+        assert_eq!(frame.look, [0.0, 0.0]);
+
+        // Releasing is inert: no jump, no break.
+        controls.touch_at(11, TouchPhase::Ended, point, at(now, 80));
+        let frame = controls.frame();
+        assert_eq!(frame.select, None);
+        assert!(!frame.jump);
+        assert!(!frame.break_block);
+        assert!(!frame.place_block);
+
+        // The rightmost slot lives in the look zone and behaves the same.
+        let point = slot_center(&controls, 8);
+        assert!(point[0] > W * STICK_ZONE);
+        controls.touch_at(12, TouchPhase::Started, point, at(now, 200));
+        assert_eq!(controls.frame().select, Some(8));
+        controls.touch_at(12, TouchPhase::Ended, point, at(now, 260));
+        assert!(!controls.frame().break_block);
+    }
+
+    #[test]
+    fn hotbar_drag_never_looks_or_breaks() {
+        let mut controls = controls();
+        let now = Instant::now();
+        let start = slot_center(&controls, 4);
+        assert!(start[0] > W * STICK_ZONE);
+
+        controls.touch_at(21, TouchPhase::Started, start, now);
+        let dragged = [start[0] + 40.0, start[1] - 30.0];
+        controls.touch_at(21, TouchPhase::Moved, dragged, at(now, 16));
+        let frame = controls.frame();
+        assert_eq!(frame.look, [0.0, 0.0]);
+        assert_eq!(frame.movement, Input::default());
+        assert!(!frame.break_block);
+
+        controls.touch_at(21, TouchPhase::Ended, dragged, at(now, 30));
+        assert!(!controls.frame().break_block);
+
+        // The same spot is a look tap again once no hotbar finger owns it.
+        let look = [W * 0.72, H * 0.5];
+        controls.touch_at(22, TouchPhase::Started, look, at(now, 100));
+        controls.touch_at(22, TouchPhase::Ended, look, at(now, 180));
+        assert!(controls.frame().break_block);
+    }
+
+    #[test]
+    fn hotbar_works_alongside_a_held_joystick() {
+        let mut controls = controls();
+        let now = Instant::now();
+        let center = controls.stick_center();
+        let radius = controls.stick_radius();
+
+        controls.touch_at(
+            30,
+            TouchPhase::Started,
+            [center[0], center[1] - radius * 0.8],
+            now,
+        );
+        assert!(controls.frame().movement.forward);
+
+        let point = slot_center(&controls, 3);
+        controls.touch_at(31, TouchPhase::Started, point, at(now, 5));
+        controls.touch_at(31, TouchPhase::Ended, point, at(now, 40));
+        let frame = controls.frame();
+        assert_eq!(frame.select, Some(3));
+        // The joystick keeps driving and the tap never jumps.
+        assert!(frame.movement.forward);
+        assert!(!frame.jump);
+        assert!(!frame.break_block);
+        assert_eq!(frame.look, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn hotbar_rects_are_centred_above_the_lower_controls() {
+        let controls = controls();
+        let rects = controls.hotbar_rects();
+        assert_eq!(rects.iter().filter(|(_, selected)| *selected).count(), 1);
+        assert!(rects[0].1, "slot 0 is the default selection");
+
+        let first = rects[0].0;
+        for (slot, (rect, _)) in rects.iter().enumerate() {
+            assert_eq!(rect[1], first[1], "slot {slot} shares the row");
+            assert_eq!(rect[2], first[2], "slot {slot} shares the size");
+            assert_eq!(rect[3], first[3], "slot {slot} shares the size");
+            if slot > 0 {
+                assert!(rects[slot - 1].0[0] < rect[0], "slot {slot} moves right");
+            }
+            for value in rect {
+                assert!(value.is_finite(), "{value}");
+                assert!((0.0..=1.0).contains(value), "{value}");
+            }
+            assert!(rect[0] + rect[2] <= 1.0 + 1e-4);
+            assert!(rect[1] + rect[3] <= 1.0 + 1e-4);
+        }
+        let last = rects[HOTBAR_SLOTS - 1].0;
+        assert!(
+            (first[0] - (1.0 - last[0] - last[2])).abs() < 1e-4,
+            "the bar is centred"
+        );
+        assert!(first[1] + first[3] < 0.9, "above the bottom of the screen");
+
+        // In pixels the bar clears the joystick base and the place button.
+        let rect = controls.hotbar_slot_rect(4);
+        let center = controls.stick_center();
+        let radius = controls.stick_radius();
+        assert!(rect[1] + rect[3] < center[1] - radius);
+        assert!(rect[1] + rect[3] < controls.place_rect()[1]);
+    }
+
+    #[test]
+    fn hotbar_selection_highlight_follows_taps_and_syncs() {
+        let mut controls = controls();
+        let now = Instant::now();
+        assert!(controls.hotbar_rects()[0].1);
+
+        let point = slot_center(&controls, 6);
+        controls.touch_at(40, TouchPhase::Started, point, now);
+        controls.touch_at(40, TouchPhase::Ended, point, at(now, 60));
+        assert_eq!(controls.selected(), 6);
+        assert_eq!(controls.frame().select, Some(6));
+        let rects = controls.hotbar_rects();
+        for (slot, (_, selected)) in rects.iter().enumerate() {
+            assert_eq!(*selected, slot == 6, "slot {slot}");
+        }
+
+        // Mirroring an external (keyboard) selection only moves the highlight
+        // and never queues another selection for the server.
+        controls.set_selected(8);
+        assert_eq!(controls.selected(), 8);
+        assert!(controls.hotbar_rects()[8].1);
+        assert!(!controls.hotbar_rects()[6].1);
+        assert_eq!(controls.frame().select, None);
+
+        // Out-of-range slots are ignored.
+        controls.set_selected(HOTBAR_SLOTS);
+        assert_eq!(controls.selected(), 8);
     }
 }

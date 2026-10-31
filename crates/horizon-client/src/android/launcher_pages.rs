@@ -1570,26 +1570,6 @@ impl Launcher {
         self.feedback = action.map(|action| (action, std::time::Instant::now()));
         self.focus = None;
         let language = self.catalog.config.language;
-        if action.is_some() && horizon_client::official_install::ready(&self.home) {
-            let audio = self.audio.get_or_insert_with(|| {
-                let mut audio = horizon_client::audio::Audio::new(
-                    &self.home.join(".local/horizon-client/26.3"),
-                );
-                let settings = horizon_client::settings::Settings::load(
-                    &self
-                        .catalog
-                        .config
-                        .game_home(&self.home)
-                        .join("options.txt"),
-                );
-                audio.master = settings.volumes[0];
-                let mut volumes = settings.volumes;
-                volumes[0] = 1.0;
-                horizon_client::settings::set_source_volumes(volumes);
-                audio
-            });
-            audio.play_button_click();
-        }
         match action {
             Some(Action::Immersive) => {
                 self.catalog.config.screen.immersive ^= true;

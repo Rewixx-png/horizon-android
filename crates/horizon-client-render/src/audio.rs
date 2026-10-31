@@ -821,7 +821,11 @@ impl Audio {
             return true;
         }
         self.device_ticks += 1;
-        if self._stream.is_none() || self.device_ticks < 20 {
+        // Vanilla checks the device list once a second (20 ticks). On Android
+        // enumerating output devices is expensive and shows up as a regular
+        // frame hitch, so check every ten seconds instead.
+        let interval = if cfg!(target_os = "android") { 200 } else { 20 };
+        if self._stream.is_none() || self.device_ticks < interval {
             return false;
         }
         self.device_ticks = 0;

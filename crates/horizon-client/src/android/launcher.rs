@@ -43,7 +43,6 @@ pub(super) struct Launcher {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     gui: Option<game::UiResources>,
-    pub(super) audio: Option<horizon_client::audio::Audio>,
     game: Option<Box<dyn ApplicationHandler>>,
     cursor: (f64, f64),
     mouse_down: bool,
@@ -92,7 +91,6 @@ impl Launcher {
             window: None,
             renderer: None,
             gui: None,
-            audio: None,
             game: None,
             cursor: (0.0, 0.0),
             mouse_down: false,
@@ -290,7 +288,6 @@ impl Launcher {
             self.session_ready = false;
             std::fs::create_dir_all(&game_home)?;
             std::env::set_current_dir(game_home)?;
-            self.audio = None;
             self.error = None;
             let _ = std::fs::remove_file(self.home.join("android-error.txt"));
             if self.catalog.config.record_performance || self.catalog.config.device.gpu_profile {
@@ -555,9 +552,6 @@ impl ApplicationHandler for Launcher {
             }
             self.catalog.edit(out, &self.home);
         }
-        if let Some(audio) = &mut self.audio {
-            audio.tick(false, &Default::default());
-        }
         self.catalog.poll(&self.home);
         if let Some(notice) = crate::documents::poll() {
             self.catalog.status = notice.text;
@@ -609,10 +603,6 @@ impl ApplicationHandler for Launcher {
         } else if self.update.checking() {
             events.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(250),
-            ));
-        } else if self.audio.is_some() {
-            events.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(50),
             ));
         } else {
             events.set_control_flow(ControlFlow::Wait);

@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag (for example v0.7.6-ui.2)
+        description: Release tag (for example v0.7.6-ui.3)
         required: true
-        default: v0.7.6-ui.2
+        default: v0.7.6-ui.3
       abi:
         description: APK ABI
         required: true

@@ -121,7 +121,7 @@ impl Game<'_> {
         if sharing.opened_lan {
             self.lan_close(true);
         } else {
-            self.system_message(Text::literal("Stopped sharing the invite code."));
+            self.system_message(Text::translate("horizon.friends.stopped_sharing", &[]));
         }
     }
 
@@ -142,9 +142,9 @@ impl Game<'_> {
             match event {
                 HostEvent::Code(code) => {
                     if sharing.code.is_some() && sharing.wrong >= horizon_friends::host::MAX_WRONG {
-                        sharing.notice = Some(
-                            "Someone kept trying a wrong short code, so it changed.".to_owned(),
-                        );
+                        sharing.notice = Some(horizon_client::lang::get(
+                            "horizon.friends.wrong_code_changed",
+                        ));
                         sharing.wrong = 0;
                     }
                     announce = sharing.code.is_none();
@@ -152,7 +152,7 @@ impl Game<'_> {
                 }
                 HostEvent::WrongCode { count } => {
                     sharing.wrong = count;
-                    sharing.notice = Some("Someone tried a wrong code.".to_owned());
+                    sharing.notice = Some(horizon_client::lang::get("horizon.friends.wrong_code"));
                 }
                 HostEvent::Connected { direct: true, .. } => sharing.paths.0 += 1,
                 HostEvent::Connected { direct: false, .. } => sharing.paths.1 += 1,
@@ -160,9 +160,7 @@ impl Game<'_> {
             }
         }
         if announce {
-            self.system_message(Text::literal(
-                "Your invite code is ready: Game Menu, Play with Friends. Copy it and send it to your friends.",
-            ));
+            self.system_message(Text::translate("horizon.friends.code_ready", &[]));
         }
     }
 
@@ -195,7 +193,10 @@ impl Game<'_> {
         match action {
             Action::Share => {
                 if let Err(e) = self.friends_start() {
-                    self.system_message(Text::literal(format!("Couldn't share the world: {e}")));
+                    self.system_message(Text::translate(
+                        "horizon.friends.share_failed",
+                        &[Text::literal(e.to_string())],
+                    ));
                 }
             }
             Action::Copy => self.friends_copy(),
@@ -231,12 +232,15 @@ impl Game<'_> {
         };
         let state = s.host.state();
         let mut status = if s.code.is_none() {
-            "Finding how friends can reach you…".to_owned()
+            horizon_client::lang::get("horizon.friends.status_finding")
         } else {
             state.summary.clone()
         };
         if let Some(short) = &state.short {
-            status.push_str(&format!(" Short code for the relay: {short}."));
+            status.push_str(&horizon_client::lang::tr(
+                "horizon.friends.short_code",
+                &[short as &dyn std::fmt::Display],
+            ));
         }
         if let Some(problem) = &state.relay_problem {
             status.push(' ');

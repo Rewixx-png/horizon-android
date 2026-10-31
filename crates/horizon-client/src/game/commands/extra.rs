@@ -1137,7 +1137,7 @@ impl Game<'_> {
         let Some((started, ticks, stamp)) = self.cmds.jfr.take() else {
             return Err(tr_error(
                 "commands.jfr.dump.failed",
-                &[Text::literal("Not currently profiling")],
+                &[Text::translate("horizon.command.extra.not_profiling", &[])],
             ));
         };
         let relative = format!("debug/client-{stamp}.json");

@@ -650,7 +650,9 @@ impl Game<'_> {
             self.list_mods();
             self.sync_mod_commands();
             if self.options.execution_role.is_client() {
-                self.system_message(Text::literal("Mods reloaded").with_color(text::GRAY));
+                self.system_message(
+                    Text::translate("horizon.mods.reloaded", &[]).with_color(text::GRAY),
+                );
             } else {
                 log::info!("Horizon: mods reloaded");
             }
@@ -1134,7 +1136,7 @@ impl Game<'_> {
             batch.height - 27.0,
             200.0,
             20.0,
-            &Text::literal("Done"),
+            &Text::translate("gui.done", &[]),
             true,
             hover,
         );

@@ -476,9 +476,8 @@ impl H {
                 ),
             ),
             H::HdrUiBrightness => labelled("UI Brightness", format!("{}%", g.hdr_ui_brightness)),
-            H::HdrKey => {
-                Text::literal("Shortcut: ").append(crate::keybinds::display_name(&g.hdr_key))
-            }
+            H::HdrKey => Text::literal(lang::get("horizon.graphics.shortcut"))
+                .append(crate::keybinds::display_name(&g.hdr_key)),
             H::BatteryMode => labelled("Battery Mode", on_off(g.battery)),
             H::GraphicsApi => labelled("Graphics API", g.api.label()),
             H::Overlay => labelled(
@@ -879,7 +878,7 @@ impl GraphicsUi {
                     let mut label = item.label(s);
                     if item == Item::Horizon(H::HdrKey) && self.binding.is_some() {
                         // KeyBindsScreen: "> key <" while it waits.
-                        label = Text::literal("Shortcut: > ")
+                        label = Text::literal(lang::get("horizon.graphics.shortcut_waiting"))
                             .append(crate::keybinds::display_name(&s.horizon.hdr_key))
                             .append(" <");
                     }

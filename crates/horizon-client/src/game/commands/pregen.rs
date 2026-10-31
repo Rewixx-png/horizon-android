@@ -155,7 +155,10 @@ impl Game<'_> {
                 if self.dim == task.dim {
                     self.streaming.set_band(None);
                 }
-                self.feedback(Text::literal("Cancelled. ").append(task.progress()));
+                self.feedback(
+                    Text::translate("horizon.command.pregen.cancelled", &[])
+                        .append(task.progress()),
+                );
                 Ok(task.pregen.done as i32)
             }
             _ => {
@@ -217,7 +220,7 @@ impl Game<'_> {
             task.reported = Instant::now();
             let (owner, mut message) = (task.owner, task.progress());
             if finished {
-                message = Text::literal("Done. ")
+                message = Text::translate("horizon.command.pregen.done", &[])
                     .append(message)
                     .with_color(text::GREEN);
                 self.cmds.pregen = None;

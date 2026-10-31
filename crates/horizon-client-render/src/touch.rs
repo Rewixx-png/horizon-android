@@ -439,15 +439,15 @@ impl TouchControls {
                     Control::Offhand | Control::Shield => {
                         menu_frame(b, a, bounds, color);
                         let label = if control == Control::Offhand {
-                            "Swap"
+                            crate::lang::get("horizon.touch.swap")
                         } else {
-                            "Shield"
+                            crate::lang::get("horizon.touch.shield")
                         };
                         let start = b.vertices.len();
-                        let width = HudBatch::text_width(a, label);
+                        let width = HudBatch::text_width(a, &label);
                         b.text(
                             a,
-                            label,
+                            &label,
                             x + (size - width) / 2.0,
                             y + (size - 8.0) / 2.0,
                             color,

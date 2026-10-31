@@ -46,6 +46,11 @@ jobs:
           sudo apt-get clean
           df -h /
 
+      - name: Install Rust host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libudev-dev
+
       - name: Install Android SDK, build tools and NDK
         run: |
           yes | sdkmanager --licenses >/dev/null

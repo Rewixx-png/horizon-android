@@ -371,16 +371,83 @@ pub fn open_url(url: &str) -> bool {
     })
     .is_some()
 }
+/// Open the per-app "install unknown apps" screen, falling back to the app's
+/// details page where the same switch lives on older/OEM builds.
+fn open_unknown_sources(
+    env: &mut JNIEnv<'_>,
+    activity: &JObject<'_>,
+    package: &str,
+) -> jni::errors::Result<()> {
+    let address = JObject::from(env.new_string(format!("package:{package}"))?);
+    let uri = env
+        .call_static_method(
+            "android/net/Uri",
+            "parse",
+            "(Ljava/lang/String;)Landroid/net/Uri;",
+            &[JValue::Object(&address)],
+        )?
+        .l()?;
+    for action in [
+        "android.settings.MANAGE_UNKNOWN_APP_SOURCES",
+        "android.settings.APPLICATION_DETAILS_SETTINGS",
+    ] {
+        let action = JObject::from(env.new_string(action)?);
+        let intent = env.new_object(
+            "android/content/Intent",
+            "(Ljava/lang/String;Landroid/net/Uri;)V",
+            &[JValue::Object(&action), JValue::Object(&uri)],
+        )?;
+        // FLAG_ACTIVITY_NEW_TASK
+        env.call_method(
+            &intent,
+            "addFlags",
+            "(I)Landroid/content/Intent;",
+            &[JValue::Int(0x1000_0000)],
+        )?;
+        if env
+            .call_method(
+                activity,
+                "startActivity",
+                "(Landroid/content/Intent;)V",
+                &[JValue::Object(&intent)],
+            )
+            .is_ok()
+        {
+            return Ok(());
+        }
+        let _ = env.exception_clear();
+    }
+    // The caller reports that the installer did not open; a missing settings
+    // activity is rare and must not turn into a second exception.
+    Ok(())
+}
+
 /// Open the system package installer for the verified APK in app storage.
+/// When the per-app unknown-sources switch is off, open that settings screen
+/// instead and return false.
 pub fn install_update() -> bool {
     with_context(|env, activity| {
         let package = env
             .call_method(activity, "getPackageName", "()Ljava/lang/String;", &[])?
             .l()?;
         let package: String = env.get_string((&package).into())?.into();
-        let address = JObject::from(env.new_string(format!(
-            "content://{package}.updates/update.apk"
-        ))?);
+        let manager = env
+            .call_method(
+                activity,
+                "getPackageManager",
+                "()Landroid/content/pm/PackageManager;",
+                &[],
+            )?
+            .l()?;
+        let allowed = env
+            .call_method(&manager, "canRequestPackageInstalls", "()Z", &[])?
+            .z()?;
+        if !allowed {
+            open_unknown_sources(env, activity, &package)?;
+            return Ok(false);
+        }
+        let address =
+            JObject::from(env.new_string(format!("content://{package}.updates/update.apk"))?);
         let uri = env
             .call_static_method(
                 "android/net/Uri",
@@ -402,33 +469,6 @@ pub fn install_update() -> bool {
             "(Landroid/net/Uri;Ljava/lang/String;)Landroid/content/Intent;",
             &[JValue::Object(&uri), JValue::Object(&mime)],
         )?;
-        let resolver = env
-            .call_method(
-                activity,
-                "getContentResolver",
-                "()Landroid/content/ContentResolver;",
-                &[],
-            )?
-            .l()?;
-        let label = JObject::from(env.new_string("Horizon update")?);
-        let clip = env
-            .call_static_method(
-                "android/content/ClipData",
-                "newUri",
-                "(Landroid/content/ContentResolver;Ljava/lang/CharSequence;Landroid/net/Uri;)Landroid/content/ClipData;",
-                &[
-                    JValue::Object(&resolver),
-                    JValue::Object(&label),
-                    JValue::Object(&uri),
-                ],
-            )?
-            .l()?;
-        env.call_method(
-            &intent,
-            "setClipData",
-            "(Landroid/content/ClipData;)Landroid/content/Intent;",
-            &[JValue::Object(&clip)],
-        )?;
         // FLAG_GRANT_READ_URI_PERMISSION | FLAG_ACTIVITY_NEW_TASK
         env.call_method(
             &intent,
@@ -436,15 +476,22 @@ pub fn install_update() -> bool {
             "(I)Landroid/content/Intent;",
             &[JValue::Int(0x1000_0001)],
         )?;
-        env.call_method(
-            activity,
-            "startActivity",
-            "(Landroid/content/Intent;)V",
-            &[JValue::Object(&intent)],
-        )?;
-        Ok(())
+        if env
+            .call_method(
+                activity,
+                "startActivity",
+                "(Landroid/content/Intent;)V",
+                &[JValue::Object(&intent)],
+            )
+            .is_err()
+        {
+            let _ = env.exception_clear();
+            open_unknown_sources(env, activity, &package)?;
+            return Ok(false);
+        }
+        Ok(true)
     })
-    .is_some()
+    .unwrap_or(false)
 }
 
 /// Public Android power/thermal status; no device identifiers or sysfs access.

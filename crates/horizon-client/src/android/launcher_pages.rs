@@ -64,6 +64,7 @@ pub(super) enum Action {
     Language,
     ChooseLanguage(Language),
     DownloadUpdate,
+    RetryInstall,
 }
 
 /// The phone gutter from the design system: 16 dp, 32 dp on tablets.
@@ -429,11 +430,11 @@ impl Launcher {
             let tight = h < 560.0;
             let error = self.update.error().map(|error| {
                 if error
-                    == "The installer could not be opened. Allow installs from Horizon and try again."
+                    == "Allow installs from Horizon in Android settings, then tap Retry installation."
                 {
                     translate(
                         language,
-                        "The installer could not be opened. Allow installs from Horizon and try again.",
+                        "Allow installs from Horizon in Android settings, then tap Retry installation.",
                     )
                 } else {
                     error
@@ -519,6 +520,81 @@ impl Launcher {
                             translate(language, "Download and install")
                         },
                         Action::DownloadUpdate,
+                        false,
+                    );
+                }
+                top += card_h + 10.0;
+            } else if self.update.downloaded().is_some() {
+                let card_h = if tight {
+                    52.0
+                } else if compact {
+                    100.0
+                } else {
+                    92.0
+                };
+                ui.rounded(margin, top, content_w, card_h, 10.0, color::RAISED);
+                ui.rounded(
+                    margin + 14.0,
+                    top + 16.0,
+                    6.0,
+                    6.0,
+                    3.0,
+                    if error.is_some() {
+                        color::DANGER
+                    } else {
+                        color::ACCENT
+                    },
+                );
+                let title = translate(language, "Update downloaded");
+                if tight {
+                    let title = ui.fit_text(Face::Medium, 13.0, title, content_w - 190.0);
+                    ui.text(
+                        Face::Medium,
+                        13.0,
+                        margin + 30.0,
+                        top + (card_h - 13.0 * 1.45) / 2.0,
+                        color::TEXT,
+                        &title,
+                    );
+                    button(
+                        &mut ui,
+                        &mut self.targets,
+                        [w - margin - 152.0, top + 8.0, 138.0, 36.0],
+                        translate(language, "Install"),
+                        Action::RetryInstall,
+                        false,
+                    );
+                } else {
+                    let title = ui.fit_text(Face::Medium, 16.0, title, content_w - 56.0);
+                    ui.text(
+                        Face::Medium,
+                        16.0,
+                        margin + 30.0,
+                        top + 10.0,
+                        color::TEXT,
+                        &title,
+                    );
+                    let caption = match error {
+                        Some(error) => {
+                            tr!(language, "Update failed: {error}", { error = error })
+                        }
+                        None => translate(language, "Ready to install").to_owned(),
+                    };
+                    let caption = ui.fit_text(Face::Regular, 13.0, &caption, content_w - 56.0);
+                    ui.text(
+                        Face::Regular,
+                        13.0,
+                        margin + 30.0,
+                        top + 34.0,
+                        color::MUTED,
+                        &caption,
+                    );
+                    button(
+                        &mut ui,
+                        &mut self.targets,
+                        [margin + 20.0, top + card_h - 46.0, content_w - 40.0, 36.0],
+                        translate(language, "Install"),
+                        Action::RetryInstall,
                         false,
                     );
                 }
@@ -1751,6 +1827,7 @@ impl Launcher {
                 self.catalog.search(&self.home);
             }
             Some(Action::DownloadUpdate) => self.update.start_download(&self.home),
+            Some(Action::RetryInstall) => self.update.retry_install(),
             Some(Action::Language) => self.open_chooser(chooser::Kind::Language),
             Some(Action::ChooseLanguage(language)) => {
                 self.catalog.config.language = language;

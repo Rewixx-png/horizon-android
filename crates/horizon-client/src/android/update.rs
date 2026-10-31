@@ -27,7 +27,7 @@ enum State {
     Checking,
     Available(Release),
     Downloading { release: Release, progress: f32 },
-    Ready,
+    Downloaded(Release),
 }
 
 enum DownloadEvent {
@@ -89,6 +89,30 @@ impl Update {
         match &self.state {
             State::Downloading { progress, .. } => Some(*progress),
             _ => None,
+        }
+    }
+
+    pub(super) fn downloaded(&self) -> Option<&Release> {
+        match &self.state {
+            State::Downloaded(release) => Some(release),
+            _ => None,
+        }
+    }
+
+    pub(super) fn retry_install(&mut self) {
+        let State::Downloaded(release) = &self.state else {
+            return;
+        };
+        let release = release.clone();
+        if crate::platform::install_update() {
+            self.state = State::Downloaded(release);
+            self.error = None;
+        } else {
+            self.state = State::Downloaded(release);
+            self.error = Some(
+                "Allow installs from Horizon in Android settings, then tap Retry installation."
+                    .into(),
+            );
         }
     }
 
@@ -174,12 +198,12 @@ impl Update {
                     match result {
                         Ok(()) => {
                             if crate::platform::install_update() {
-                                self.state = State::Ready;
+                                self.state = State::Downloaded(release);
                                 self.error = None;
                             } else {
-                                self.state = State::Available(release);
+                                self.state = State::Downloaded(release);
                                 self.error = Some(
-                                    "The installer could not be opened. Allow installs from Horizon and try again."
+                                    "Allow installs from Horizon in Android settings, then tap Retry installation."
                                         .into(),
                                 );
                             }

@@ -386,12 +386,12 @@ impl Launcher {
             ui.rounded(tune_x + 8.0 + knob, y - 3.0, 4.0, 8.0, 2.0, tune);
         }
         targets.push((
-            [settings_x, settings_y, icon, icon],
+            [settings_x - 4.0, settings_y - 4.0, 48.0, 48.0],
             Action::Page(Page::Settings),
         ));
 
         let avatar = 32.0;
-        let avatar_x = settings_x - 8.0 - avatar;
+        let avatar_x = settings_x - 12.0 - avatar;
         let avatar_y = 16.0;
         ui.rounded(
             avatar_x,
@@ -416,7 +416,10 @@ impl Launcher {
             color::ON_PRIMARY_CONTAINER,
             &initial,
         );
-        targets.push(([avatar_x, avatar_y, avatar, avatar], Action::Account));
+        targets.push((
+            [avatar_x - 8.0, avatar_y - 8.0, 48.0, 48.0],
+            Action::Account,
+        ));
         let status = ui.fit_text(
             Face::Regular,
             md3::LABEL_SMALL,

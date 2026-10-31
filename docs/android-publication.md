@@ -73,6 +73,16 @@ Increment `versionCode` for every public Android update and preserve its signing
 certificate. A source commit or development version is not a compatibility or
 performance guarantee; list the architectures and device checks actually completed.
 
+### Manual GitHub release
+
+**Actions → Android release → Run workflow** builds one public APK for the
+chosen ABI, downloads the pinned official Mojang inputs on the runner, and
+creates or updates the release for the given tag. It runs only on manual
+dispatch; a push never publishes an APK. Add an `ANDROID_KEYSTORE_BASE64`
+repository secret to keep a stable signing identity across releases, otherwise
+the workflow signs with the generated development key and a later build with a
+different key cannot update an installed APK.
+
 ## Source checks
 
 ```sh
@@ -95,7 +105,9 @@ inputs, caches, saves, build products and signing material. Upstream workflows
 remain under `.github/upstream-workflows/*.disabled`; the Android source workflow
 runs source checks on pushes and pull requests to `android`, with read-only
 permissions. A manual run with `native_checks` enabled also type-checks all four
-Android ABIs. It does not build APKs, use signing keys or publish releases.
+Android ABIs. It does not build APKs, use signing keys or publish releases. The
+separate manual release workflow above is excluded from source exports and is
+the only workflow that publishes artifacts.
 
 ## Upstream maintenance
 

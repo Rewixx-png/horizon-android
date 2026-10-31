@@ -4,7 +4,9 @@
 //! does not reuse the 26.3 packet enums or packet ids.
 //!
 //! Scope: a local/offline 1.16.5 server. Online-mode encryption and the
-//! 1.16.5 play packet set beyond keep-alive are the next milestones.
+//! rest of the 1.16.5 play packet set are the next milestones; beyond
+//! keep-alive this slice also parses the movement, chat and disconnect
+//! packets and encodes Teleport Confirm.
 
 use crate::{
     Error, Result,
@@ -43,6 +45,12 @@ pub const PLAY_CHUNK_DATA: i32 = 0x20;
 pub const PLAY_KEEP_ALIVE: i32 = 0x1F;
 pub const PLAY_KEEP_ALIVE_RESPONSE: i32 = 0x10;
 pub const PLAY_DISCONNECT: i32 = 0x19;
+/// Play/clientbound Chat Message.
+pub const PLAY_CHAT_MESSAGE: i32 = 0x0E;
+/// Play/clientbound Player Position And Look.
+pub const PLAY_PLAYER_POSITION_AND_LOOK: i32 = 0x34;
+/// Play/serverbound Teleport Confirm.
+pub const PLAY_TELEPORT_CONFIRM: i32 = 0x00;
 
 pub const STATUS: i32 = 1;
 pub const LOGIN: i32 = 2;
@@ -411,6 +419,109 @@ impl ChunkData {
     }
 }
 
+/// Flag bits of a [`PositionAndLook`]: a set bit means the matching field is
+/// a delta to apply to the current position or rotation, not an absolute
+/// value. Bits verified against the archived wiki.vg protocol 754 page.
+pub const POSITION_FLAG_X: u8 = 0x01;
+pub const POSITION_FLAG_Y: u8 = 0x02;
+pub const POSITION_FLAG_Z: u8 = 0x04;
+pub const POSITION_FLAG_Y_ROT: u8 = 0x08;
+pub const POSITION_FLAG_X_ROT: u8 = 0x10;
+
+/// The clientbound Player Position And Look packet (0x34). `x`/`y`/`z` are
+/// absolute (or relative, per the [`POSITION_FLAG_X`] bits) and `yaw`/`pitch`
+/// are in degrees. The client must answer with a Teleport Confirm carrying
+/// the same `teleport_id`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PositionAndLook {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub flags: u8,
+    pub teleport_id: i32,
+}
+
+pub fn parse_position_and_look(payload: &[u8]) -> Result<PositionAndLook> {
+    let mut reader = Reader::new(payload);
+    let position = PositionAndLook {
+        x: reader.f64()?,
+        y: reader.f64()?,
+        z: reader.f64()?,
+        yaw: reader.f32()?,
+        pitch: reader.f32()?,
+        flags: reader.u8()?,
+        teleport_id: reader.varint()?,
+    };
+    if reader.remaining() != 0 {
+        return Err(Error::new(format!(
+            "1.16.5 Player Position And Look has {} trailing bytes",
+            reader.remaining()
+        )));
+    }
+    Ok(position)
+}
+
+/// Where a clientbound Chat Message is displayed (its `position` byte).
+pub const CHAT_POSITION_CHAT: u8 = 0;
+pub const CHAT_POSITION_SYSTEM: u8 = 1;
+pub const CHAT_POSITION_GAME_INFO: u8 = 2;
+
+/// The clientbound Chat Message packet (0x0E): a JSON chat component, the
+/// HUD slot it belongs in, and the sender's UUID in network (big-endian)
+/// order. In 1.16.5 the sender is always present; the optional-sender
+/// variant is newer than protocol 754.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatMessage {
+    pub json: String,
+    pub position: u8,
+    pub sender: u128,
+}
+
+pub fn parse_chat_message(payload: &[u8]) -> Result<ChatMessage> {
+    let mut reader = Reader::new(payload);
+    let message = ChatMessage {
+        json: reader.string(262_144)?,
+        position: reader.u8()?,
+        sender: reader.uuid()?,
+    };
+    if reader.remaining() != 0 {
+        return Err(Error::new(format!(
+            "1.16.5 Chat Message has {} trailing bytes",
+            reader.remaining()
+        )));
+    }
+    Ok(message)
+}
+
+/// The clientbound Disconnect (play) packet (0x19): the JSON reason shown
+/// before the connection is closed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Disconnect {
+    pub reason: String,
+}
+
+pub fn parse_disconnect(payload: &[u8]) -> Result<Disconnect> {
+    let mut reader = Reader::new(payload);
+    let reason = reader.string(262_144)?;
+    if reader.remaining() != 0 {
+        return Err(Error::new(format!(
+            "1.16.5 Disconnect has {} trailing bytes",
+            reader.remaining()
+        )));
+    }
+    Ok(Disconnect { reason })
+}
+
+/// The serverbound Teleport Confirm packet (0x00), acknowledging a
+/// [`PositionAndLook`] with the same teleport id.
+pub fn teleport_confirm_payload(teleport_id: i32) -> Vec<u8> {
+    let mut body = Writer::new();
+    body.varint(teleport_id);
+    body.data
+}
+
 /// The M0 block table, indexed by 1.16.5 global block-state id.
 pub struct Tables {
     blocks: Vec<String>,
@@ -560,6 +671,15 @@ impl Client {
         Ok(true)
     }
 
+    /// Acknowledge a clientbound Player Position And Look with a Teleport
+    /// Confirm carrying the same teleport id.
+    pub fn send_teleport_confirm(&mut self, teleport_id: i32) -> Result<()> {
+        self.send(
+            PLAY_TELEPORT_CONFIRM,
+            &teleport_confirm_payload(teleport_id),
+        )
+    }
+
     /// Read play packets until `duration` elapses, answering keep-alives. This
     /// is the M1 hold-a-connection probe; M2 replaces it with the play state.
     pub fn hold(&mut self, duration: Duration) -> Result<Hold> {
@@ -575,7 +695,7 @@ impl Client {
                     if self.answer_keep_alive(id, &payload)? {
                         hold.keep_alives += 1;
                     } else if id == PLAY_DISCONNECT {
-                        let (reason, _) = read_string(&payload, 32_767)?;
+                        let reason = parse_disconnect(&payload)?.reason;
                         return Err(Error::new(format!("1.16.5 server disconnected: {reason}")));
                     }
                 }
@@ -944,5 +1064,124 @@ mod tests {
         };
         assert!(client.answer_keep_alive(PLAY_KEEP_ALIVE, b"short").is_err());
         assert!(!client.answer_keep_alive(0, &[]).unwrap());
+    }
+
+    #[test]
+    fn player_position_and_look_decodes_the_verified_754_layout() {
+        // x=1.5, y=64.0, z=-2.25, yaw=90.0, pitch=-45.0, flags=0, id=5.
+        let payload = [
+            0x3f, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // x
+            0x40, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // y
+            0xc0, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // z
+            0x42, 0xb4, 0x00, 0x00, // yaw
+            0xc2, 0x34, 0x00, 0x00, // pitch
+            0x00, // flags
+            0x05, // teleport id
+        ];
+        let position = parse_position_and_look(&payload).unwrap();
+        assert_eq!(position.x, 1.5);
+        assert_eq!(position.y, 64.0);
+        assert_eq!(position.z, -2.25);
+        assert_eq!(position.yaw, 90.0);
+        assert_eq!(position.pitch, -45.0);
+        assert_eq!(position.flags, 0);
+        assert_eq!(position.teleport_id, 5);
+        assert!(parse_position_and_look(&payload[..33]).is_err());
+        let mut trailing = payload.to_vec();
+        trailing.push(0);
+        assert!(parse_position_and_look(&trailing).is_err());
+    }
+
+    #[test]
+    fn relative_flags_and_multi_byte_teleport_id_are_kept() {
+        let payload = [
+            0x40, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // x
+            0x40, 0x54, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // y
+            0x40, 0x30, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, // z
+            0xc2, 0xb4, 0x00, 0x00, // yaw
+            0x42, 0x34, 0x00, 0x00, // pitch
+            0x1f, // all five relative bits
+            0xac, 0x02, // teleport id 300
+        ];
+        let position = parse_position_and_look(&payload).unwrap();
+        assert_eq!(position.flags, 0x1f);
+        assert_eq!(
+            position.flags,
+            POSITION_FLAG_X
+                | POSITION_FLAG_Y
+                | POSITION_FLAG_Z
+                | POSITION_FLAG_Y_ROT
+                | POSITION_FLAG_X_ROT
+        );
+        assert_eq!(position.teleport_id, 300);
+    }
+
+    #[test]
+    fn chat_message_decodes_json_position_and_sender_uuid() {
+        let payload = [
+            0x0d, // 13-byte string
+            0x7b, 0x22, 0x74, 0x65, 0x78, 0x74, 0x22, 0x3a, 0x22, 0x68, 0x69, 0x22, 0x7d,
+            0x01, // system message
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // sender UUID
+            0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+        ];
+        let chat = parse_chat_message(&payload).unwrap();
+        assert_eq!(chat.json, r#"{"text":"hi"}"#);
+        assert_eq!(chat.position, CHAT_POSITION_SYSTEM);
+        assert_eq!(chat.sender, 0x0102030405060708090a0b0c0d0e0f10);
+        assert!(parse_chat_message(&payload[..payload.len() - 16]).is_err());
+    }
+
+    #[test]
+    fn disconnect_decodes_the_json_reason() {
+        let payload = [
+            0x0e, // 14-byte string
+            0x7b, 0x22, 0x74, 0x65, 0x78, 0x74, 0x22, 0x3a, 0x22, 0x62, 0x79, 0x65, 0x22, 0x7d,
+        ];
+        let disconnect = parse_disconnect(&payload).unwrap();
+        assert_eq!(disconnect.reason, r#"{"text":"bye"}"#);
+        assert!(parse_disconnect(b"").is_err());
+    }
+
+    #[test]
+    fn teleport_confirm_varint_round_trip() {
+        for id in [0, 127, 128, -1, i32::MAX] {
+            let payload = teleport_confirm_payload(id);
+            let mut reader = Reader::new(&payload);
+            assert_eq!(reader.varint().unwrap(), id);
+            assert_eq!(reader.remaining(), 0);
+        }
+        // Exact 1.16.5 VarInt wire forms.
+        assert_eq!(teleport_confirm_payload(0), [0x00]);
+        assert_eq!(teleport_confirm_payload(127), [0x7f]);
+        assert_eq!(teleport_confirm_payload(128), [0x80, 0x01]);
+        assert_eq!(teleport_confirm_payload(-1), [0xff, 0xff, 0xff, 0xff, 0x0f]);
+        assert_eq!(
+            teleport_confirm_payload(i32::MAX),
+            [0xff, 0xff, 0xff, 0xff, 0x07]
+        );
+    }
+
+    #[test]
+    fn send_teleport_confirm_writes_packet_id_then_varint() {
+        let (client_pipe, server_pipe) = Pipe::pair();
+        let server = thread::spawn(move || {
+            let mut connection = Connection::local(server_pipe);
+            let (id, payload) = connection.recv().unwrap();
+            assert_eq!(id, PLAY_TELEPORT_CONFIRM);
+            let mut reader = Reader::new(&payload);
+            assert_eq!(reader.varint().unwrap(), 300);
+            assert_eq!(reader.remaining(), 0);
+        });
+        let mut client = Client {
+            connection: Connection::local(client_pipe),
+            profile: Profile {
+                uuid: [0; 16],
+                name: "TestBot".into(),
+            },
+            threshold: None,
+        };
+        client.send_teleport_confirm(300).unwrap();
+        server.join().unwrap();
     }
 }

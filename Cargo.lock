@@ -1410,6 +1410,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "horizon-1-16-5"
+version = "0.1.0"
+dependencies = [
+ "horizon-core",
+ "horizon-protocol",
+ "horizon-world",
+ "serde_json",
+]
+
+[[package]]
 name = "horizon-android"
 version = "0.1.0"
 dependencies = [

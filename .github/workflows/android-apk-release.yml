@@ -73,6 +73,13 @@ jobs:
           unzip -q "$RUNNER_TEMP/gradle.zip" -d "$RUNNER_TEMP"
           echo "GRADLE=$RUNNER_TEMP/gradle-8.14/bin/gradle" >> "$GITHUB_ENV"
 
+      - name: Restore an existing signing key when configured
+        run: |
+          if [ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
+            mkdir -p .local/android
+            printf '%s' "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > .local/android/debug.keystore
+          fi
+
       - name: Download official Mojang inputs and prepare engine tables
         run: python3 tools/android_prepare.py
 

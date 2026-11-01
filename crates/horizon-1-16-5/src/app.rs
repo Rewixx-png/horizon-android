@@ -1348,10 +1348,20 @@ fn merge_movement(keyboard: Input, touch: Input) -> Input {
     }
 }
 
-/// Height of the vanilla hotbar strip as a fraction of the screen height.
-const HOTBAR_GUI_HEIGHT: f32 = 0.115;
-/// Gap between the hotbar strip and the bottom screen edge, in pixels.
-const HOTBAR_GUI_MARGIN_PX: f32 = 20.0;
+/// The vanilla hotbar sheet: 182x22 pixels, nine 20x20 slots and a 1-pixel
+/// border, with a 24x24 selection frame.
+const HOTBAR_SHEET: (f32, f32) = (182.0, 22.0);
+/// GUI pixels per screen pixel step: one vanilla GUI pixel is `gui_scale`
+/// screen pixels, derived from the height like vanilla's own scaling.
+const GUI_BASE_HEIGHT: f32 = 240.0;
+/// The strip sits this many GUI pixels above the bottom edge.
+const HOTBAR_BOTTOM_GUI: f32 = 8.0;
+
+/// Vanilla's GUI scale for a screen height in physical pixels, clamped to
+/// the range the sheets were drawn for.
+fn gui_scale(screen_height: f32) -> f32 {
+    (screen_height / GUI_BASE_HEIGHT).floor().clamp(1.0, 4.0)
+}
 
 /// The block and item sprites the touch hotbar draws.
 ///
@@ -1531,22 +1541,30 @@ fn fill_gui(
         return;
     }
     // The vanilla sheet is 182x22 pixels (nine 20x20 slots plus a 1-pixel
-    // border). Its aspect is fixed, so the on-screen height decides the
-    // width — never the other way round.
+    // border). Its aspect is fixed, so a single GUI scale derives both axes:
+    // stretching it across normalized coordinates would distort it on a wide
+    // phone screen.
     let screen_h = height.max(1) as f32;
     let screen_w = width.max(1) as f32;
-    let mut strip_h = screen_h * HOTBAR_GUI_HEIGHT;
-    let mut strip_w = strip_h * (182.0 / 22.0);
-    if strip_w > screen_w * 0.98 {
-        // A narrow window shrinks the strip by width, keeping the aspect.
-        strip_w = screen_w * 0.98;
-        strip_h = strip_w * (22.0 / 182.0);
+    let (sheet_w, sheet_h) = HOTBAR_SHEET;
+    let mut bar_h = sheet_h * gui_scale(screen_h);
+    let mut bar_w = sheet_w * gui_scale(screen_h);
+    if bar_w > screen_w {
+        // A viewport narrower than the unscaled strip shrinks it by width and
+        // keeps the aspect; the scale never grows past the screen.
+        bar_w = screen_w;
+        bar_h = sheet_h * (screen_w / sheet_w);
     }
-    // Pinned to the bottom edge, 10 px above it, centred.
-    let margin = (HOTBAR_GUI_MARGIN_PX / screen_h).min(0.06);
-    let x = 0.5 - (strip_w / screen_w) * 0.5;
-    let y = 1.0 - margin - strip_h / screen_h;
-    let strip = [x, y, strip_w / screen_w, strip_h / screen_h];
+    let scale = bar_h / sheet_h;
+    // Centred horizontally, pinned `8 * scale` pixels above the bottom edge.
+    let x = (screen_w - bar_w) * 0.5;
+    let y = screen_h - bar_h - HOTBAR_BOTTOM_GUI * scale;
+    let strip = [
+        x / screen_w,
+        y / screen_h,
+        bar_w / screen_w,
+        bar_h / screen_h,
+    ];
     if let Some(uv) = gui.uv("hotbar") {
         gui_sprites.push(HudSprite {
             rect: strip,
@@ -1554,19 +1572,17 @@ fn fill_gui(
             color: [1.0; 4],
         });
     }
-    // One slot is 20x20 of the 182 pixels; the selection frame is 24x24 and
-    // must stay square, so both axes scale identically.
-    let scale = strip_h / 22.0;
-    let slot_w = 20.0 * scale / screen_w;
+    // The selection frame is 24x24 GUI pixels, centred on the selected slot:
+    // slot 0 starts after the 1-pixel border and each slot is 20 pixels wide.
     let frame_w = 24.0 * scale / screen_w;
     let frame_h = 24.0 * scale / screen_h;
-    let slot_x = x + 1.0 * scale / screen_w + slot_w * (selected as f32 + 0.5);
-    let slot_y = y + strip[3] * 0.5;
+    let slot_x = x + scale + 20.0 * scale * (selected as f32 + 0.5);
+    let slot_y = y + bar_h * 0.5;
     if let Some(uv) = gui.uv("hotbar_selected") {
         gui_sprites.push(HudSprite {
             rect: [
-                slot_x - frame_w * 0.5,
-                slot_y - frame_h * 0.5,
+                (slot_x - frame_w * screen_w * 0.5) / screen_w,
+                (slot_y - frame_h * screen_h * 0.5) / screen_h,
                 frame_w,
                 frame_h,
             ],

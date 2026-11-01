@@ -1,4 +1,9 @@
 use super::*;
+// `super` is the `tests` module inside `browser`, so the items under test come from its parent.
+use crate::browser::{
+    DATAPACK_SUPPORT, FileRef, GAME, Kind, Query, SourceId, Support, Version, curseforge, download,
+    modrinth, pick, portable_version, safe_name, source, sources, support,
+};
 use serde_json::json;
 use sha2::Digest;
 

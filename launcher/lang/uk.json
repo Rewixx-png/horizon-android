@@ -461,5 +461,7 @@
   "Use an access token…": "Використати токен доступу…",
   "Make an invitation": "Створити запрошення",
   "One invitation per friend. With an email Tailscale sends it; without, send them the link. They accept it in their own Tailscale account.": "Одне запрошення на друга. Якщо вказати email, Tailscale надішле його сам; інакше надішліть посилання вручну. Друг приймає його у власному обліковому записі Tailscale.",
-  "Forget the access token": "Забути токен доступу"
+  "Forget the access token": "Забути токен доступу",
+  "Working on {step}…": "Працюю над {step}…",
+  "Installed {name} {version} into horizon-mods and turned it on (Options > Mods in the game).": "{name} {version} встановлено в horizon-mods і ввімкнено (Налаштування > Моди в грі)."
 }

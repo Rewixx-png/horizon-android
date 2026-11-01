@@ -420,6 +420,14 @@ impl Launcher {
             ),
             (None, _) => self.prepare_log.back().cloned().unwrap_or_default(),
         };
+        // A step that says nothing for a while is not stuck: say what it is doing.
+        let doing = if self.preparing && !doing.is_empty() {
+            doing
+        } else if self.preparing {
+            trf("Working on {step}…", &[("step", now.name())]).to_string()
+        } else {
+            doing
+        };
         let left = left.map(|d| match d.as_secs().div_ceil(60) {
             0 | 1 => tr("about a minute left").to_string(),
             m => trf("about {n} min left", &[("n", &m.to_string())]),

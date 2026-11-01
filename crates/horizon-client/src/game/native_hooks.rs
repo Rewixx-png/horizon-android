@@ -1376,6 +1376,22 @@ impl Game<'_> {
         }
         fs::read(self.options.resources.join(path)).ok()
     }
+    /// The state id a block name describes (`dynamictrees:oak_branch[axis=y]`,
+    /// or a bare `minecraft:oak_log` for its default state); none for a
+    /// block the registry doesn't have. API 37.
+    pub(super) fn native_state_of(&self, name: &str) -> Option<BlockStateId> {
+        super::render_control::parse_state(self.pack.assets.registry, name).ok()
+    }
+    /// The server's tick counter as `native_server_tick`'s context carries
+    /// it: one a tick, for a tree's growth. API 37.
+    pub(super) fn native_tick_count(&self, context: &NativeLifecycleContext) -> u64 {
+        let _ = self;
+        context.tick.get()
+    }
+    /// The dimension this game's level is, as `minecraft:overworld`.
+    pub(super) fn native_dimension(&self) -> String {
+        self.dim.id().to_owned()
+    }
     /// The block at `pos` (`mymod:cable`; air where nothing is loaded).
     /// API 20.
     pub(super) fn native_block(&self, pos: [i32; 3]) -> String {

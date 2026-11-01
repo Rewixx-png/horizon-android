@@ -461,5 +461,7 @@
   "Use an access token…": "使用访问令牌…",
   "Make an invitation": "生成邀请",
   "One invitation per friend. With an email Tailscale sends it; without, send them the link. They accept it in their own Tailscale account.": "每位好友对应一个邀请。填写邮箱后由 Tailscale 发送；不填则将链接发给对方。好友在自己的 Tailscale 账号中接受邀请。",
-  "Forget the access token": "忘记访问令牌"
+  "Forget the access token": "忘记访问令牌",
+  "Working on {step}…": "正在处理 {step}…",
+  "Installed {name} {version} into horizon-mods and turned it on (Options > Mods in the game).": "已将 {name} {version} 安装到 horizon-mods 并启用（游戏内：选项 > 模组）。"
 }

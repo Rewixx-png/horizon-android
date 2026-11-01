@@ -71,6 +71,29 @@ impl Launcher {
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(mut paths))) = paths.await {
                 if let Some(path) = paths.pop() {
+                    // A content mod is not a pack: it installs as a mod, at once.
+                    if !folder && modpacks::is_content_mod(&path) {
+                        let home = this
+                            .read_with(cx, |this, _| this.mods.home())
+                            .unwrap_or_else(|_| backend::game_home());
+                        let _ = this.update(cx, |this, cx| {
+                            match modpacks::install_content_mod(&path, &home) {
+                                Ok(m) => {
+                                    let said = crate::i18n::trf(
+                                        "Installed {name} {version} into horizon-mods and turned \
+                                         it on (Options > Mods in the game).",
+                                        &[("name", &m.name), ("version", &m.version)],
+                                    );
+                                    this.mods.message = Some(Ok(said));
+                                    this.mods.kind = horizon_launcher::browser::Kind::Mod;
+                                }
+                                Err(e) => this.pack_error = Some(e),
+                            }
+                            this.mods.reset_lists();
+                            cx.notify();
+                        });
+                        return;
+                    }
                     let _ = this.update(cx, |this, cx| {
                         this.pack_job(move |log| modpacks::import(&path, log));
                         cx.notify();

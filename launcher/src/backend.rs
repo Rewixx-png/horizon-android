@@ -2909,16 +2909,40 @@ pub fn spawn(job: Job, mut cmd: Command, tx: Sender<Msg>) -> Result<Running, Str
     }
     let child = Arc::new(Mutex::new(child));
     let waited = child.clone();
-    std::thread::spawn(move || {
-        for r in readers {
+    let done = std::sync::Arc::new(std::sync::Condvar::new());
+    let flag = std::sync::Arc::new(Mutex::new(false));
+    for r in readers {
+        let done = done.clone();
+        let flag = flag.clone();
+        std::thread::spawn(move || {
             let _ = r.join();
-        }
+            *flag.lock().unwrap() = true;
+            done.notify_all();
+        });
+    }
+    std::thread::spawn(move || {
         let status = loop {
             if let Some(s) = waited.lock().unwrap().try_wait().transpose() {
                 break s;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         };
+        // The process is gone, so its work is over: report that even when a child it
+        // left behind still holds its output open. Waiting for the readers first left
+        // the launcher on the last step of a preparation that had already finished,
+        // until the window was restarted.
+        let flag = flag.clone();
+        let done = done.clone();
+        let waited = std::time::Instant::now();
+        let mut finished = flag.lock().unwrap();
+        let only = std::time::Duration::from_secs(2);
+        while !*finished && waited.elapsed() < only {
+            let (guard, _) = done
+                .wait_timeout(finished, std::time::Duration::from_millis(50))
+                .unwrap_or_else(|e| e.into_inner());
+            finished = guard;
+        }
+        drop(finished);
         let result = match status {
             Ok(s) if s.success() => Ok(()),
             Ok(s) => Err(format!("Exited with {s}")),

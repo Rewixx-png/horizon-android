@@ -20,21 +20,23 @@ import java.util.TreeMap;
 import java.util.TreeSet;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.component.TypedDataComponent;
+import net.minecraft.world.item.component.Tool;
+import net.minecraft.world.item.enchantment.Enchantable;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
-import net.minecraft.resources.ResourceLocation;
+import net.minecraft.resources.Identifier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.sounds.SoundEvent;
 import net.minecraft.world.InteractionHand;
-import net.minecraft.world.item.ArmorItem;
-import net.minecraft.world.item.ArmorMaterial;
+import net.minecraft.world.item.equipment.ArmorType;
+import net.minecraft.world.item.equipment.ArmorMaterial;
 import net.minecraft.world.item.BlockItem;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
-import net.minecraft.world.item.TieredItem;
 import net.minecraft.world.item.component.ItemAttributeModifiers;
 import net.minecraft.world.item.context.BlockPlaceContext;
 import net.minecraft.world.item.crafting.Ingredient;
@@ -110,8 +112,8 @@ public final class FactsExporter {
             ItemStack silk = new ItemStack(Items.DIAMOND_PICKAXE);
             silk.enchant(
                     server.registryAccess()
-                            .registryOrThrow(Registries.ENCHANTMENT)
-                            .getHolderOrThrow(Enchantments.SILK_TOUCH),
+                            .lookupOrThrow(Registries.ENCHANTMENT)
+                            .getOrThrow(Enchantments.SILK_TOUCH),
                     1);
             tool("silk_touch_pickaxe", silk);
         }
@@ -121,14 +123,14 @@ public final class FactsExporter {
             tools.add(stack);
         }
 
-        boolean ours(ResourceLocation id) {
+        boolean ours(Identifier id) {
             return namespaces.contains(id.getNamespace());
         }
 
         void run() throws IOException {
             json.beginObject();
             json.name("schema").value(1);
-            json.name("minecraft").value(net.minecraft.SharedConstants.getCurrentVersion().getName());
+            json.name("minecraft").value(net.minecraft.SharedConstants.getCurrentVersion().name());
             json.name("namespaces");
             json.beginArray();
             for (String n : namespaces) json.value(n);
@@ -142,7 +144,7 @@ public final class FactsExporter {
             json.name("vanilla_items");
             json.beginArray();
             for (Item item : BuiltInRegistries.ITEM) {
-                ResourceLocation id = BuiltInRegistries.ITEM.getKey(item);
+                Identifier id = BuiltInRegistries.ITEM.getKey(item);
                 if (id.getNamespace().equals("minecraft")) json.value(id.toString());
             }
             json.endArray();
@@ -157,7 +159,7 @@ public final class FactsExporter {
             json.name("blocks");
             json.beginObject();
             for (Block block : BuiltInRegistries.BLOCK) {
-                ResourceLocation id = BuiltInRegistries.BLOCK.getKey(block);
+                Identifier id = BuiltInRegistries.BLOCK.getKey(block);
                 boolean mod = ours(id);
                 if (!mod && !id.getNamespace().equals("minecraft")) continue;
                 json.name(id.toString());
@@ -253,7 +255,7 @@ public final class FactsExporter {
             for (Direction face : new Direction[] {Direction.UP, Direction.NORTH}) {
                 BlockPos clicked = face == Direction.UP ? FLOOR : at.relative(face.getOpposite());
                 level.setBlock(clicked, Blocks.STONE.defaultBlockState(), 3);
-                Vec3 hit = Vec3.atCenterOf(clicked).add(Vec3.atLowerCornerOf(face.getNormal()).scale(0.5));
+                Vec3 hit = Vec3.atCenterOf(clicked).add(Vec3.atLowerCornerOf(new net.minecraft.core.Vec3i(face.getStepX(), face.getStepY(), face.getStepZ())).scale(0.5));
                 // A player-less context (the constructor is protected, hence the subclass).
                 BlockPlaceContext ctx =
                         new BlockPlaceContext(
@@ -319,7 +321,7 @@ public final class FactsExporter {
         }
 
         void event(String name, SoundEvent e) throws IOException {
-            json.name(name).value(e.getLocation().toString());
+            json.name(name).value(e.location().toString());
         }
 
         void boxes(VoxelShape shape) throws IOException {
@@ -336,7 +338,7 @@ public final class FactsExporter {
             json.name("items");
             json.beginObject();
             for (Item item : BuiltInRegistries.ITEM) {
-                ResourceLocation id = BuiltInRegistries.ITEM.getKey(item);
+                Identifier id = BuiltInRegistries.ITEM.getKey(item);
                 if (!ours(id)) continue;
                 ItemStack stack = new ItemStack(item);
                 json.name(id.toString());
@@ -374,41 +376,46 @@ public final class FactsExporter {
                 }
             }
             json.endObject();
-            // Armor's come from ArmorItem.getDefaultAttributeModifiers, not a component.
+            // 26.1 puts armour and tools in components: Equippable, Tool, Repairable, MaxDamage.
             raw("attribute_modifiers", ItemAttributeModifiers.CODEC.encodeStart(ops, stack.getAttributeModifiers()));
-            json.name("enchantment_value").value(item.getEnchantmentValue());
-            Ingredient repair = null;
-            if (item instanceof TieredItem tiered) {
-                repair = tiered.getTier().getRepairIngredient();
-            } else if (item instanceof ArmorItem armor) {
-                repair = armor.getMaterial().value().repairIngredient().get();
-            }
-            if (repair != null) {
+            json.name("enchantment_value").value((stack.get(DataComponents.ENCHANTABLE) == null ? 0 : stack.get(DataComponents.ENCHANTABLE).value()));
+            var repairable = stack.get(DataComponents.REPAIRABLE);
+            if (repairable != null) {
                 json.name("repair_items");
                 json.beginArray();
-                for (ItemStack s : repair.getItems()) json.value(BuiltInRegistries.ITEM.getKey(s.getItem()).toString());
+                for (var h : repairable.items()) h.unwrapKey().ifPresent(k -> { try { json.value(k.identifier().toString()); } catch (IOException e) { throw new java.io.UncheckedIOException(e); } });
                 json.endArray();
             }
-            if (item instanceof ArmorItem armor) {
-                ArmorMaterial material = armor.getMaterial().value();
-                json.name("armor");
+            var maxDamage = stack.get(DataComponents.MAX_DAMAGE);
+            if (maxDamage != null) json.name("max_damage").value(maxDamage);
+            var tool = stack.get(DataComponents.TOOL);
+            if (tool != null) {
+                json.name("tool");
                 json.beginObject();
-                json.name("slot").value(armor.getEquipmentSlot().getName());
-                json.name("material").value(armor.getMaterial().unwrapKey().map(k -> k.location().toString()).orElse(""));
-                json.name("defense").value(armor.getDefense());
-                json.name("toughness").value(armor.getToughness());
-                json.name("knockback_resistance").value(material.knockbackResistance());
-                json.name("equip_sound").value(BuiltInRegistries.SOUND_EVENT.getKey(material.equipSound().value()).toString());
-                json.name("layers");
+                json.name("damage_per_block").value(tool.damagePerBlock());
+                json.name("rules");
                 json.beginArray();
-                for (ArmorMaterial.Layer layer : material.layers()) {
+                for (var rule : tool.rules()) {
                     json.beginObject();
-                    json.name("texture").value(layer.texture(false).toString());
-                    json.name("texture_legs").value(layer.texture(true).toString());
-                    json.name("dyeable").value(layer.dyeable());
+                    json.name("correct_state");
+                    json.value(String.valueOf(rule));
+                    json.name("speed").value(rule.speed().orElse(-1f));
+                    json.name("correct_for_drops").value(rule.correctForDrops().orElse(false));
                     json.endObject();
                 }
                 json.endArray();
+                json.endObject();
+            }
+            var equippable = stack.get(DataComponents.EQUIPPABLE);
+            if (equippable != null) {
+                json.name("armor");
+                json.beginObject();
+                json.name("slot").value(equippable.slot().getName());
+                json.name("equip_sound").value(equippable.equipSound().unwrapKey().map(k -> k.identifier().toString()).orElse(""));
+                json.name("asset");
+                json.value(equippable.assetId().map(k -> k.identifier().toString()).orElse(""));
+                json.name("armor_points").value(stack.getOrDefault(DataComponents.ATTRIBUTE_MODIFIERS, ItemAttributeModifiers.EMPTY)
+                        .compute(net.minecraft.world.entity.ai.attributes.Attributes.ARMOR, 0.0, equippable.slot()));
                 json.endObject();
             }
         }
@@ -425,20 +432,27 @@ public final class FactsExporter {
             json.name("recipes");
             json.beginObject();
             for (RecipeHolder<?> holder : server.getRecipeManager().getRecipes()) {
-                if (!ours(holder.id())) continue;
+                if (!ours(holder.id().identifier())) continue;
                 var recipe = holder.value();
                 json.name(holder.id().toString());
                 json.beginObject();
                 json.name("type").value(BuiltInRegistries.RECIPE_TYPE.getKey(recipe.getType()).toString());
                 json.name("serializer").value(BuiltInRegistries.RECIPE_SERIALIZER.getKey(recipe.getSerializer()).toString());
-                ItemStack result = recipe.getResultItem(server.registryAccess());
+                var placement = recipe.placementInfo();
+                var displays = recipe.display();
+                var ctx = net.minecraft.world.item.crafting.display.SlotDisplayContext.fromLevel(level);
+                ItemStack result = ItemStack.EMPTY;
+                for (var d : displays) {
+                    result = d.result().resolveForFirstStack(ctx);
+                    if (!result.isEmpty()) break;
+                }
                 json.name("result").value(BuiltInRegistries.ITEM.getKey(result.getItem()).toString());
                 json.name("count").value(result.getCount());
                 json.name("ingredients");
                 json.beginArray();
-                for (Ingredient ing : recipe.getIngredients()) {
+                for (Ingredient ing : placement.ingredients()) {
                     Set<String> ids = new TreeSet<>();
-                    for (ItemStack s : ing.getItems()) ids.add(BuiltInRegistries.ITEM.getKey(s.getItem()).toString());
+                    ing.items().forEach(h -> h.unwrapKey().ifPresent(k -> ids.add(k.identifier().toString())));
                     json.beginArray();
                     for (String i : ids) json.value(i);
                     json.endArray();
@@ -459,12 +473,12 @@ public final class FactsExporter {
                 Map<String, Set<String>> out = new TreeMap<>();
                 var registry = kind.equals("block") ? BuiltInRegistries.BLOCK : BuiltInRegistries.ITEM;
                 registry.getTags().forEach(pair -> {
-                    String tag = pair.getFirst().location().toString();
-                    boolean convention = pair.getFirst().location().getNamespace().equals("c");
+                    String tag = pair.key().location().toString();
+                    boolean convention = pair.key().location().getNamespace().equals("c");
                     Set<String> members = new LinkedHashSet<>();
-                    for (var holder : pair.getSecond()) {
-                        ResourceLocation id = holder.unwrapKey().orElseThrow().location();
-                        if (convention || ours(id) || ours(pair.getFirst().location())) members.add(id.toString());
+                    for (var holder : pair.contents()) {
+                        Identifier id = holder.unwrapKey().orElseThrow().identifier();
+                        if (convention || ours(id) || ours(pair.key().location())) members.add(id.toString());
                     }
                     if (!members.isEmpty()) out.put(tag, new TreeSet<>(members));
                 });

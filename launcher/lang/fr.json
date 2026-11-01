@@ -461,5 +461,7 @@
   "Use an access token…": "Utiliser un jeton d'accès…",
   "Make an invitation": "Créer une invitation",
   "One invitation per friend. With an email Tailscale sends it; without, send them the link. They accept it in their own Tailscale account.": "Une invitation par ami. Avec un e-mail, Tailscale l'envoie ; sans, envoyez-leur le lien. Ils l'acceptent dans leur propre compte Tailscale.",
-  "Forget the access token": "Oublier le jeton d'accès"
+  "Forget the access token": "Oublier le jeton d'accès",
+  "Working on {step}…": "Traitement de {step}…",
+  "Installed {name} {version} into horizon-mods and turned it on (Options > Mods in the game).": "{name} {version} installé dans horizon-mods et activé (Options > Mods dans le jeu)."
 }

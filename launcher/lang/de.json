@@ -461,5 +461,7 @@
   "Use an access token…": "Zugriffstoken verwenden…",
   "Make an invitation": "Einladung erstellen",
   "One invitation per friend. With an email Tailscale sends it; without, send them the link. They accept it in their own Tailscale account.": "Eine Einladung pro Freund. Mit E-Mail-Adresse versendet Tailscale sie; ohne schickst du ihnen den Link. Sie nehmen sie in ihrem eigenen Tailscale-Konto an.",
-  "Forget the access token": "Zugriffstoken vergessen"
+  "Forget the access token": "Zugriffstoken vergessen",
+  "Working on {step}…": "Arbeite an {step}…",
+  "Installed {name} {version} into horizon-mods and turned it on (Options > Mods in the game).": "{name} {version} in horizon-mods installiert und aktiviert (Optionen > Mods im Spiel)."
 }

@@ -27,6 +27,13 @@ pub(super) struct NativeWorldEpoch(u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct NativeTickId(u64);
 
+impl NativeTickId {
+    /// The server's tick count it names.
+    pub(super) fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Internal state for deciding which events can fire.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OpenState {

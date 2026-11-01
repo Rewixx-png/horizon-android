@@ -1364,9 +1364,8 @@ pub fn launch(
             pass.offline = said;
         }
         let after = serde_json::to_string(&secrets).ok();
-        if after != before
-            && let Some(text) = after
-        {
+        let renewed = after.as_deref() != before.as_deref();
+        if let Some(text) = after.filter(|_| renewed) {
             // The game still starts; the player hears why the next launch may ask again.
             if let Err(e) = store.set(&account.uuid, &text) {
                 let said = format!(

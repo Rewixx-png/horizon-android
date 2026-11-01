@@ -63,10 +63,12 @@ mod shader_catalog;
 mod skins;
 // The shared account protocol needs only the launcher's version and data path.
 mod backend {
+    // One place: the version the APK's manifest carries (`packaging/android/build.gradle`).
+    // The launcher's About row and every diagnostic read it from here.
     pub const VERSION: &str = if crate::PUBLIC_BUILD {
-        "0.7.6-ui.6"
+        "0.7.7-ui.2"
     } else {
-        "0.7.6-ui.6-dev"
+        "0.7.7-ui.2-dev"
     };
     static HOME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     pub fn initialize(home: std::path::PathBuf) {

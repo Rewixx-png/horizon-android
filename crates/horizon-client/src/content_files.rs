@@ -37,6 +37,8 @@ impl Kind {
     }
 }
 pub const MAX_INPUT: u64 = 256 << 20;
+/// A mod file's own size: code mods and content mods both fit in it.
+pub const MAX_MOD: u64 = 64 << 20;
 const MAX_EXPANDED: u64 = 512 << 20;
 pub fn plain_name(name: &str) -> bool {
     !name.is_empty()
@@ -63,8 +65,8 @@ pub fn validate(
         );
     }
     let file = std::fs::File::open(path)?;
-    if kind == Kind::Mods && file.metadata()?.len() > 32 << 20 {
-        return Err("Horizon mod exceeds 32 MiB".into());
+    if kind == Kind::Mods && file.metadata()?.len() > MAX_MOD {
+        return Err(format!("Horizon mod exceeds {} MiB", MAX_MOD >> 20).into());
     }
     if file.metadata()?.len() > MAX_INPUT {
         return Err("Import exceeds 256 MiB".into());
@@ -147,10 +149,12 @@ pub fn validate(
             return Err("Resource pack metadata has no pack object".into());
         }
     }
+    // A content mod carries data only (`assets/`, `data/`): no `mod.wasm`. A
+    // code mod has both. Either is a `.hmod`; a plain zip with neither is not.
     if !match kind {
         Kind::Packs => pack,
         Kind::Shaders => shader,
-        Kind::Mods => manifest && wasm,
+        Kind::Mods => manifest,
     } {
         return Err(format!(
             "Archive is not a {} package (required files must be at the ZIP root)",
@@ -239,7 +243,25 @@ mod tests {
         assert!(validate(&path, Kind::Packs, "Test.zip", || false).is_err());
         std::fs::write(&path, archive(&[("horizon-shaders.toml", b"manifest")])).unwrap();
         assert!(validate(&path, Kind::Shaders, "Test.zip", || false).unwrap());
-        std::fs::write(&path, archive(&[("horizon-mod.toml", b"manifest")])).unwrap();
+        // A content mod carries data only: its manifest at the root is enough.
+        std::fs::write(
+            &path,
+            archive(&[
+                ("horizon-mod.toml", b"id = \"ruby\""),
+                ("data/ruby/horizon/block/ruby.json", b"{}"),
+            ]),
+        )
+        .unwrap();
+        assert!(validate(&path, Kind::Mods, "Test.hmod", || false).is_ok());
+        // A code mod has both the manifest and its component.
+        std::fs::write(
+            &path,
+            archive(&[("horizon-mod.toml", b"manifest"), ("mod.wasm", b"\0asm")]),
+        )
+        .unwrap();
+        assert!(validate(&path, Kind::Mods, "Test.hmod", || false).is_ok());
+        // A plain zip with neither stays refused.
+        std::fs::write(&path, archive(&[("README.md", b"hello")])).unwrap();
         assert!(validate(&path, Kind::Mods, "Test.hmod", || false).is_err());
         let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
         writer

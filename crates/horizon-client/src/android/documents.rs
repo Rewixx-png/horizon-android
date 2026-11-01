@@ -73,6 +73,12 @@ pub fn conflict() -> bool {
 }
 fn notice(text: impl Into<String>, changed: bool) {
     let text = text.into();
+    // Every import outcome reaches the device's own log, so a failure on a phone
+    // can be read in Settings > Diagnostics without a debugger attached.
+    log::info!("content import: {}", text);
+    if !changed {
+        crate::diagnostics::record_error(&text);
+    }
     let mut s = STATE.lock().unwrap_or_else(|e| e.into_inner());
     s.toast = Some((text.clone(), std::time::Instant::now()));
     s.notice = Some(Notice {

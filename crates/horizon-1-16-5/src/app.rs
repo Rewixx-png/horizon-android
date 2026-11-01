@@ -19,7 +19,9 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 use crate::assets::ModelPack;
 use crate::atlas::{TextureAtlas, VanillaAssets};
 use crate::chunk_mesh::{MeshWorker, WorldSnapshot, chunks_around};
-use crate::inventory::{Inventory, ItemStack};
+use crate::crafting::Recipes;
+use crate::inventory::{Inventory, ItemStack, icon_texture_for_item};
+use crate::inventory_ui::{self, InventoryScreen};
 use crate::player::{Input, Player};
 use crate::render::{Camera, HudVertex, SurfaceRenderer, hud_rect};
 use crate::server::{FrameInput, IntegratedServer};
@@ -71,6 +73,14 @@ const VITAL_CELL_HEIGHT: f32 = 0.34;
 const VITAL_GAP: f32 = 0.07;
 /// Full-screen tint shown while the survival player is dead.
 const DEATH_TINT_COLOR: [f32; 4] = [0.55, 0.03, 0.03, 0.45];
+/// Translucent backdrop of the inventory and crafting panel.
+const INVENTORY_PANEL_COLOR: [f32; 4] = [0.07, 0.07, 0.09, 0.90];
+/// One empty inventory slot.
+const INVENTORY_SLOT_COLOR: [f32; 4] = [0.20, 0.20, 0.23, 0.95];
+/// Highlight on the slot under the pointer.
+const INVENTORY_HOVER_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.30];
+/// Backdrop behind the stack carried by the pointer.
+const INVENTORY_CURSOR_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.55];
 
 const USAGE: &str = "usage: horizon-1165 --world <dir> --tables <file> --client-jar <file> \
 --assets-index <file> --assets-objects <dir> [--width <px>] [--height <px>] \
@@ -252,8 +262,8 @@ impl Loaded {
             .parent()
             .map(|directory| directory.join("server.jar"))
             .filter(|path| path.is_file());
-        if let Some(server_jar) = server_jar
-            && let Err(error) = world.load_loot(&server_jar)
+        if let Some(server_jar) = server_jar.as_deref()
+            && let Err(error) = world.load_loot(server_jar)
         {
             eprintln!("loot tables from {}: {error}", server_jar.display());
         }
@@ -268,10 +278,17 @@ impl Loaded {
             // Android bundles only the client jar: no index and no objects.
             _ => VanillaAssets::from_jar(client_jar)?,
         };
-        let server = match spawn {
+        let mut server = match spawn {
             Some(spawn) => IntegratedServer::new(world, spawn),
             None => IntegratedServer::open(world),
         };
+        // Recipes are optional too: without them the inventory screen still
+        // opens, but the result slot never fills.
+        if let Some(server_jar) = server_jar.as_deref()
+            && let Err(error) = server.survival.load_recipes(server_jar)
+        {
+            eprintln!("recipes from {}: {error}", server_jar.display());
+        }
         // The first mesh stays synchronous so the first presented frame has
         // world geometry; every later remesh runs on the worker.
         let mesh = server.render_mesh(models.as_ref(), radius);
@@ -341,6 +358,11 @@ struct PlayState {
     touch_active: bool,
     /// Reused clip-space HUD vertices, refilled every frame.
     hud: Vec<HudVertex>,
+    /// The inventory and crafting screen: open flag, carried stack, grid.
+    screen: InventoryScreen,
+    /// Pointer position in normalized screen coordinates, so a mouse click
+    /// can be mapped to an inventory slot.
+    pointer: [f32; 2],
     /// Absolute yaw/pitch in degrees, updated by the mouse and by touch look
     /// deltas, and consumed each tick by [`FrameInput`].
     look: Option<[f32; 2]>,
@@ -603,6 +625,16 @@ impl PlayApp {
         if survival.mode == GameMode::Survival {
             survival_hud(&mut state.hud, &state.touch, survival);
         }
+        inventory_hud(
+            &mut state.hud,
+            &state.screen,
+            inventory,
+            survival.recipes.as_ref(),
+            Some(&state.atlas),
+            size.width,
+            size.height,
+            state.pointer,
+        );
         state
             .renderer
             .render_with_hud(&state.mesh, &state.atlas, camera, &state.hud)
@@ -637,8 +669,18 @@ impl PlayApp {
                 state.server.survival.toggle_mode();
                 eprintln!("mode: {:?}", state.server.survival.mode);
             }
+            // E opens and closes the inventory/crafting screen.
+            KeyCode::KeyE if pressed && !event.repeat => {
+                if state.screen.open {
+                    close_screen(state);
+                } else {
+                    open_screen(state);
+                }
+            }
             KeyCode::Escape if pressed && !event.repeat => {
-                if state.cursor_grabbed {
+                if state.screen.open {
+                    close_screen(state);
+                } else if state.cursor_grabbed {
                     let _ = state.window.set_cursor_grab(CursorGrabMode::None);
                     state.window.set_cursor_visible(true);
                     state.cursor_grabbed = false;
@@ -737,6 +779,8 @@ impl ApplicationHandler for PlayApp {
             touch_active: cfg!(target_os = "android")
                 || std::env::var_os("HORIZON_1165_TOUCH_HUD").is_some(),
             hud: Vec::new(),
+            screen: InventoryScreen::default(),
+            pointer: [0.5, 0.5],
             look: None,
             break_block: false,
             place_block: false,
@@ -782,6 +826,21 @@ impl ApplicationHandler for PlayApp {
                 ..
             } => {
                 let state = self.state.as_mut().unwrap();
+                if state.screen.open {
+                    // Clicks drive the screen; break/place stay suppressed.
+                    if button == MouseButton::Left {
+                        let size = state.window.inner_size();
+                        let (_, rects) =
+                            inventory_ui::layout(size.width as f32, size.height as f32);
+                        state.screen.hovered =
+                            inventory_ui::hit(&rects, state.pointer[0], state.pointer[1]);
+                        let shift = state.movement.sprint;
+                        if let Some(index) = state.screen.hovered {
+                            click_screen_slot(state, index, shift);
+                        }
+                    }
+                    return;
+                }
                 match button {
                     MouseButton::Left => {
                         // Left click attacks; `break_block` stays set so
@@ -793,7 +852,22 @@ impl ApplicationHandler for PlayApp {
                     _ => {}
                 }
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                let state = self.state.as_mut().unwrap();
+                let size = state.window.inner_size();
+                let width = size.width.max(1) as f32;
+                let height = size.height.max(1) as f32;
+                state.pointer = [position.x as f32 / width, position.y as f32 / height];
+                if state.screen.open {
+                    let (_, rects) = inventory_ui::layout(width, height);
+                    state.screen.hovered =
+                        inventory_ui::hit(&rects, state.pointer[0], state.pointer[1]);
+                }
+            }
             WindowEvent::MouseWheel { delta, .. } => {
+                if self.state.as_ref().unwrap().screen.open {
+                    return;
+                }
                 let steps = match delta {
                     MouseScrollDelta::LineDelta(_, y) => wheel_steps(y),
                     MouseScrollDelta::PixelDelta(position) => wheel_steps(position.y as f32),
@@ -805,6 +879,38 @@ impl ApplicationHandler for PlayApp {
             WindowEvent::Touch(touch) => {
                 let state = self.state.as_mut().unwrap();
                 state.touch_active = true;
+                let size = state.window.inner_size();
+                let width = size.width.max(1) as f32;
+                let height = size.height.max(1) as f32;
+                let point = [
+                    touch.location.x as f32 / width,
+                    touch.location.y as f32 / height,
+                ];
+                let started = touch.phase == winit::event::TouchPhase::Started;
+                if state.screen.open {
+                    // The screen owns the surface while it is open: taps pick
+                    // slots, and a tap outside the panel closes it.
+                    if started {
+                        let (panel, rects) = inventory_ui::layout(width, height);
+                        state.screen.hovered = inventory_ui::hit(&rects, point[0], point[1]);
+                        if let Some(index) = state.screen.hovered {
+                            click_screen_slot(state, index, false);
+                        } else if !inventory_ui::inside(panel, point[0], point[1]) {
+                            close_screen(state);
+                        }
+                    }
+                    return;
+                }
+                if started
+                    && inventory_ui::inside(
+                        inventory_ui::button_rect(width, height),
+                        point[0],
+                        point[1],
+                    )
+                {
+                    open_screen(state);
+                    return;
+                }
                 state.touch.touch(
                     touch.id,
                     touch.phase,
@@ -1224,9 +1330,312 @@ fn crosshair_vertices(width: u32, height: u32) -> [HudVertex; 12] {
     vertices
 }
 
+/// Opens the inventory screen and releases the pointer so it can click.
+fn open_screen(state: &mut PlayState) {
+    if !state.screen.open {
+        state.screen.toggle();
+    }
+    let _ = state.window.set_cursor_grab(CursorGrabMode::None);
+    state.window.set_cursor_visible(true);
+    state.cursor_grabbed = false;
+}
+
+/// Closes the screen, handing the carried stack and the craft grid back to
+/// the active inventory, then grabs the pointer again.
+fn close_screen(state: &mut PlayState) {
+    let creative = state.server.survival.is_creative();
+    let inventory = if creative {
+        &mut state.server.inventory
+    } else {
+        &mut state.server.survival.inventory
+    };
+    state.screen.close_into(inventory);
+    let _ = state.window.set_cursor_grab(CursorGrabMode::Locked);
+    state.window.set_cursor_visible(false);
+    state.cursor_grabbed = true;
+}
+
+/// Applies one click on rectangle `index` of the open screen.
+fn click_screen_slot(state: &mut PlayState, index: usize, shift: bool) {
+    if index == inventory_ui::RESULT_SLOT {
+        craft_result(state);
+        return;
+    }
+    let creative = state.server.survival.is_creative();
+    let inventory = if creative {
+        &mut state.server.inventory
+    } else {
+        &mut state.server.survival.inventory
+    };
+    if index >= Inventory::SLOTS {
+        state
+            .screen
+            .click_craft(inventory, index - Inventory::SLOTS);
+    } else {
+        // Layout draws the storage rows first; map the rectangle back to the
+        // inventory's hotbar-first slot order.
+        let storage = Inventory::SLOTS - inventory_ui::HOTBAR_SLOTS;
+        let slot = if index < storage {
+            index + inventory_ui::HOTBAR_SLOTS
+        } else {
+            index - storage
+        };
+        state.screen.click(inventory, slot, shift);
+    }
+}
+
+/// Crafts the current grid once, consuming one item from every occupied cell
+/// like a vanilla result-slot click.
+fn craft_result(state: &mut PlayState) {
+    let grid = state.screen.craft.clone();
+    // Only consume when a recipe matches; the result slot previews the same
+    // match.
+    let Some(preview) = state
+        .server
+        .survival
+        .recipes
+        .as_ref()
+        .and_then(|recipes| recipes.craft(&grid))
+    else {
+        return;
+    };
+    // `Survival::craft` takes its ingredients out of the inventory, while the
+    // ingredients physically sit in the grid. Fold the grid back in first so
+    // the two views agree and nothing is spent twice, remembering whatever did
+    // not fit.
+    let mut overflow = [0u32; inventory_ui::CRAFT_SLOTS];
+    for (index, stack) in grid.iter().enumerate() {
+        if let Some(stack) = stack {
+            overflow[index] = state.server.survival.inventory.add(stack.clone()) as u32;
+        }
+    }
+    // The recipe book adds the result itself and drops whatever does not fit;
+    // size the capacity after folding so the surplus can stay in the grid.
+    let surplus = preview
+        .count
+        .saturating_sub(fitting_capacity(&state.server.survival.inventory, &preview.item));
+    if let Some(produced) = state.server.survival.craft(&grid)
+        && state.server.survival.is_creative()
+    {
+        // The survival recipe book adds to its own inventory; the creative
+        // HUD shows the palette inventory, so mirror the result there too.
+        let _ = state.server.inventory.add(produced);
+    }
+    // Every grid stack now lives in the inventory minus the crafted
+    // ingredients, so only the overflow stays behind in the grid.
+    for (index, cell) in state.screen.craft.iter_mut().enumerate() {
+        let Some(stack) = cell.as_ref() else {
+            continue;
+        };
+        let item = stack.item.clone();
+        *cell = if overflow[index] == 0 {
+            None
+        } else {
+            Some(ItemStack::new(item, overflow[index]))
+        };
+    }
+    if surplus > 0 {
+        match state.screen.craft.iter_mut().find(|cell| cell.is_none()) {
+            Some(cell) => *cell = Some(ItemStack::new(preview.item, surplus)),
+            None => {
+                if state.screen.cursor.is_none() {
+                    state.screen.cursor = Some(ItemStack::new(preview.item, surplus));
+                }
+            }
+        }
+    }
+}
+
+/// How many `item` the inventory can still take: [`MAX_STACK_SIZE`] per empty
+/// slot plus the room left in matching stacks.
+fn fitting_capacity(inventory: &Inventory, item: &str) -> u32 {
+    (0..Inventory::SLOTS).fold(0u32, |total, index| match inventory.slot(index) {
+        None => total + MAX_STACK_SIZE,
+        Some(stack) if stack.item == item => total + (MAX_STACK_SIZE - stack.count),
+        Some(_) => total,
+    })
+}
+
+/// Appends the inventory and crafting panel while the screen is open. A
+/// closed screen adds no vertices, so the creative frame is unchanged.
+#[allow(clippy::too_many_arguments)]
+fn inventory_hud(
+    hud: &mut Vec<HudVertex>,
+    screen: &InventoryScreen,
+    inventory: &Inventory,
+    recipes: Option<&Recipes>,
+    atlas: Option<&TextureAtlas>,
+    width: u32,
+    height: u32,
+    pointer: [f32; 2],
+) {
+    if !screen.open {
+        return;
+    }
+    let (panel, rects) = InventoryScreen::layout(width as f32, height as f32);
+    hud.extend_from_slice(&hud_rect(
+        panel[0],
+        panel[1],
+        panel[2],
+        panel[3],
+        INVENTORY_PANEL_COLOR,
+    ));
+    let result = screen.result(recipes);
+    for (index, rect) in rects.iter().enumerate() {
+        let color = if screen.hovered == Some(index) {
+            INVENTORY_HOVER_COLOR
+        } else {
+            INVENTORY_SLOT_COLOR
+        };
+        hud.extend_from_slice(&hud_rect(rect[0], rect[1], rect[2], rect[3], color));
+        let stack = match index {
+            // Storage rows come first and start after the hotbar slots.
+            i if i < 27 => inventory.slot(i + inventory_ui::HOTBAR_SLOTS),
+            i if i < 36 => inventory.slot(i - 27),
+            i if i < inventory_ui::RESULT_SLOT => screen.craft[i - 36].as_ref(),
+            _ => result.as_ref(),
+        };
+        let Some(stack) = stack.filter(|stack| !stack.is_empty()) else {
+            continue;
+        };
+        draw_stack(hud, atlas, stack, *rect);
+    }
+    // The carried stack follows the pointer.
+    if let Some(stack) = screen.cursor.as_ref().filter(|stack| !stack.is_empty()) {
+        let slot = rects[0][2];
+        let cell = [pointer[0] - slot * 0.5, pointer[1] - slot * 0.5, slot, slot];
+        hud.extend_from_slice(&hud_rect(
+            cell[0],
+            cell[1],
+            cell[2],
+            cell[3],
+            INVENTORY_CURSOR_COLOR,
+        ));
+        draw_stack(hud, atlas, stack, cell);
+    }
+}
+
+/// Draws one stack's atlas icon, or a flat swatch when no sprite exists.
+fn draw_stack(
+    hud: &mut Vec<HudVertex>,
+    atlas: Option<&TextureAtlas>,
+    stack: &ItemStack,
+    rect: [f32; 4],
+) {
+    let inset_x = rect[2] * HOTBAR_SWATCH_INSET;
+    let inset_y = rect[3] * HOTBAR_SWATCH_INSET;
+    let icon = icon_texture_for_item(&stack.item)
+        .and_then(|texture| hud_icon_quads(atlas, &texture, rect, inset_x, inset_y));
+    match icon {
+        Some(quads) => hud.extend(quads),
+        None => hud.extend_from_slice(&hud_rect(
+            rect[0] + inset_x,
+            rect[1] + inset_y,
+            rect[2] - inset_x * 2.0,
+            rect[3] - inset_y * 2.0,
+            block_swatch_color(&stack.item),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closed_inventory_screen_leaves_the_hud_unchanged() {
+        let mut touch = TouchControls::new();
+        touch.resize(800.0, 600.0);
+        let inventory = Inventory::creative();
+        let mut hud = Vec::new();
+        fill_hud(
+            &mut hud,
+            &touch,
+            inventory.slots(),
+            &inventory,
+            None,
+            true,
+            800,
+            600,
+        );
+        let baseline = hud.clone();
+        let screen = InventoryScreen::default();
+        inventory_hud(
+            &mut hud,
+            &screen,
+            &inventory,
+            None,
+            None,
+            800,
+            600,
+            [0.5, 0.5],
+        );
+        assert_eq!(hud, baseline, "a closed screen must draw nothing");
+    }
+
+    #[test]
+    fn open_inventory_screen_draws_a_panel_and_every_slot() {
+        let inventory = Inventory::creative();
+        let mut screen = InventoryScreen::default();
+        screen.toggle();
+        let mut hud = Vec::new();
+        inventory_hud(
+            &mut hud,
+            &screen,
+            &inventory,
+            None,
+            None,
+            800,
+            600,
+            [0.5, 0.5],
+        );
+        // One panel rectangle plus one background per slot (six vertices
+        // each), before any item icons.
+        assert!(hud.len() >= (inventory_ui::SLOT_RECTS + 1) * 6);
+        assert!(
+            hud.iter()
+                .any(|vertex| vertex.color == INVENTORY_PANEL_COLOR)
+        );
+        // Every vertex stays inside the surface.
+        for vertex in &hud {
+            assert!((-1.0..=1.0).contains(&vertex.position[0]));
+            assert!((-1.0..=1.0).contains(&vertex.position[1]));
+        }
+    }
+
+    #[test]
+    fn open_screen_marks_the_hovered_slot() {
+        let inventory = Inventory::empty();
+        let mut screen = InventoryScreen::default();
+        screen.toggle();
+        let (_, rects) = InventoryScreen::layout(800.0, 600.0);
+        let rect = rects[5];
+        let point = [rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0];
+        screen.hovered = inventory_ui::hit(&rects, point[0], point[1]);
+        let mut hud = Vec::new();
+        inventory_hud(&mut hud, &screen, &inventory, None, None, 800, 600, point);
+        assert_eq!(screen.hovered, Some(5));
+        assert!(
+            hud.iter()
+                .any(|vertex| vertex.color == INVENTORY_HOVER_COLOR)
+        );
+    }
+
+    #[test]
+    fn fitting_capacity_counts_empty_and_partial_slots() {
+        let mut inventory = Inventory::empty();
+        assert_eq!(
+            fitting_capacity(&inventory, "minecraft:stone"),
+            Inventory::SLOTS as u32 * MAX_STACK_SIZE
+        );
+        inventory.set(0, Some(ItemStack::new("minecraft:stone", 60)));
+        inventory.set(1, Some(ItemStack::new("minecraft:dirt", 1)));
+        let empties = (Inventory::SLOTS - 2) as u32;
+        assert_eq!(
+            fitting_capacity(&inventory, "minecraft:stone"),
+            empties * MAX_STACK_SIZE + (MAX_STACK_SIZE - 60)
+        );
+    }
 
     /// A pack holding one flat texture per creative hotbar block, enough for
     /// the icon grid to sample.

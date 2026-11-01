@@ -7,6 +7,9 @@
 //! the neutral state: no damage, no hunger and a free block palette, so the
 //! windowed loop keeps its old behaviour until the mode is toggled.
 
+use std::path::Path;
+
+use crate::crafting::Recipes;
 use crate::inventory::{Inventory, ItemStack};
 
 /// Full health, in half-hearts.
@@ -58,6 +61,8 @@ pub struct Survival {
     pub food: i32,
     pub saturation: f32,
     pub inventory: Inventory,
+    /// The crafting recipes loaded from the server jar, when crafting is on.
+    pub recipes: Option<Recipes>,
     pub selected: usize,
     pub dead: bool,
     /// Exhaustion accumulated since the last saturation/hunger point.
@@ -84,6 +89,7 @@ impl Survival {
             food: MAX_FOOD,
             saturation: MAX_SATURATION,
             inventory: Inventory::empty(),
+            recipes: None,
             selected: 0,
             dead: false,
             exhaustion: 0.0,
@@ -275,6 +281,27 @@ impl Survival {
         self.starve_ticks = 0;
         self.drown_ticks = 0;
     }
+
+    /// Crafts `grid`, consuming one item per non-empty grid cell and adding
+    /// the result to the inventory. Returns the produced stack.
+    ///
+    /// The 3x3 grid is row-major, exactly like [`Recipes::craft`]. The grid
+    /// itself is only read here, so the matching ingredients are taken back
+    /// out of this player's inventory. Creative players craft the same way.
+    pub fn craft(&mut self, grid: &[Option<ItemStack>; 9]) -> Option<ItemStack> {
+        let produced = self.recipes.as_ref()?.craft(grid)?;
+        for stack in grid.iter().flatten() {
+            self.inventory.remove_one(&stack.item);
+        }
+        self.inventory.add(produced.clone());
+        Some(produced)
+    }
+
+    /// Loads the crafting recipes from a 1.16.5 `server.jar`.
+    pub fn load_recipes(&mut self, server_jar: &Path) -> Result<(), String> {
+        self.recipes = Some(Recipes::load(server_jar)?);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -462,5 +489,104 @@ mod tests {
         survival.scroll(6);
         assert_eq!(survival.selected, 1);
         assert_eq!(survival.inventory.selected(), 1);
+    }
+
+    fn recipe_jar(name: &str) -> std::path::PathBuf {
+        use std::io::Write;
+
+        let path = std::env::temp_dir().join(format!(
+            "horizon-survival-{}-{name}.zip",
+            std::process::id()
+        ));
+        let file = std::fs::File::create(&path).expect("create recipe jar");
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        writer
+            .start_file("data/minecraft/recipes/stick.json", options)
+            .expect("zip entry");
+        writer
+            .write_all(
+                br####"{"type":"minecraft:crafting_shaped","pattern":["#","#"],
+                     "key":{"#":{"item":"minecraft:oak_planks"}},
+                     "result":{"item":"minecraft:stick","count":4}}"####,
+            )
+            .expect("zip body");
+        writer.finish().expect("finish zip");
+        path
+    }
+
+    fn grid(cells: &[(usize, &str, u32)]) -> [Option<ItemStack>; 9] {
+        let mut grid: [Option<ItemStack>; 9] = std::array::from_fn(|_| None);
+        for (slot, item, count) in cells {
+            grid[*slot] = Some(ItemStack::new(*item, *count));
+        }
+        grid
+    }
+
+    #[test]
+    fn craft_consumes_the_grid_and_adds_the_result() {
+        let path = recipe_jar("craft");
+        let mut survival = Survival::new();
+        survival.load_recipes(&path).expect("load recipes");
+        let _ = std::fs::remove_file(&path);
+        assert!(survival.recipes.is_some());
+
+        survival
+            .inventory
+            .add(ItemStack::new("minecraft:oak_planks", 3));
+        let grid = grid(&[
+            (0, "minecraft:oak_planks", 1),
+            (3, "minecraft:oak_planks", 1),
+        ]);
+
+        let produced = survival.craft(&grid).expect("craft a stick");
+        assert_eq!(produced, ItemStack::new("minecraft:stick", 4));
+        // One plank per occupied cell was consumed...
+        assert_eq!(
+            survival
+                .inventory
+                .slot(0)
+                .map(|stack| (stack.item.as_str(), stack.count)),
+            Some(("minecraft:oak_planks", 1))
+        );
+        // ...and the four sticks landed in the next free slot.
+        assert_eq!(
+            survival
+                .inventory
+                .slot(1)
+                .map(|stack| (stack.item.as_str(), stack.count)),
+            Some(("minecraft:stick", 4))
+        );
+    }
+
+    #[test]
+    fn craft_without_recipes_or_a_match_is_none() {
+        let mut survival = Survival::new();
+        let empty: [Option<ItemStack>; 9] = std::array::from_fn(|_| None);
+        assert_eq!(survival.craft(&empty), None);
+
+        let path = recipe_jar("nomatch");
+        survival.load_recipes(&path).expect("load recipes");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(survival.craft(&grid(&[(4, "minecraft:stone", 1)])), None);
+    }
+
+    #[test]
+    fn creative_can_craft_too() {
+        let path = recipe_jar("creative");
+        let mut survival = Survival::creative();
+        survival.load_recipes(&path).expect("load recipes");
+        let _ = std::fs::remove_file(&path);
+        survival
+            .inventory
+            .add(ItemStack::new("minecraft:oak_planks", 2));
+        let produced = survival
+            .craft(&grid(&[
+                (0, "minecraft:oak_planks", 1),
+                (3, "minecraft:oak_planks", 1),
+            ]))
+            .expect("creative craft");
+        assert_eq!(produced, ItemStack::new("minecraft:stick", 4));
     }
 }

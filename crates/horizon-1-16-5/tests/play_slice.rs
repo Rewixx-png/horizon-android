@@ -5,6 +5,7 @@
 use horizon_1_16_5::assets::ModelPack;
 use horizon_1_16_5::atlas::TextureAtlas;
 use horizon_1_16_5::atlas::VanillaAssets;
+use horizon_1_16_5::inventory::ItemStack;
 use horizon_1_16_5::player::Input;
 use horizon_1_16_5::render::{Camera, OffscreenRenderer, RenderError};
 use horizon_1_16_5::server::{FrameInput, IntegratedServer};
@@ -317,4 +318,45 @@ fn survival_break_uses_the_real_loot_tables() {
         "glass must not add an item: {:?}",
         glass_server.survival.inventory.slots()
     );
+}
+
+#[test]
+#[ignore = "needs .local/versions/1.16.5 inputs (server.jar for recipes)"]
+fn survival_crafts_oak_planks_from_logs() {
+    let inputs = inputs();
+    let server_jar = inputs.client_jar.with_file_name("server.jar");
+    assert!(server_jar.is_file(), "missing {}", server_jar.display());
+    let world = load_world(&inputs);
+    let mut server = IntegratedServer::open(world);
+    server.survival.toggle_mode();
+    server.survival.load_recipes(&server_jar).expect("recipes");
+    for slot in 0..9 {
+        server.survival.inventory.set(slot, None);
+    }
+    server
+        .survival
+        .inventory
+        .add_to_storage(ItemStack::new("minecraft:oak_log", 1));
+
+    // Logs are a shapeless ring recipe: one log in the grid.
+    let mut grid: [Option<ItemStack>; 9] = std::array::from_fn(|_| None);
+    grid[4] = Some(ItemStack::new("minecraft:oak_log", 1));
+    let result = server.survival.craft(&grid).expect("planks craft");
+    assert_eq!(result.item, "minecraft:oak_planks");
+    assert_eq!(result.count, 4);
+    let count = |item: &str| -> u32 {
+        server
+            .survival
+            .inventory
+            .all_slots()
+            .iter()
+            .flatten()
+            .filter(|stack| stack.item == item)
+            .map(|stack| stack.count)
+            .sum()
+    };
+    let planks = count("minecraft:oak_planks");
+    assert_eq!(planks, 4);
+    let logs = count("minecraft:oak_log");
+    assert_eq!(logs, 0, "the grid log was consumed");
 }

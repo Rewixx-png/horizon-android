@@ -41,9 +41,16 @@ impl ItemStack {
     }
 }
 
+/// Total inventory slots: a nine-slot hotbar followed by twenty-seven
+/// storage slots, like vanilla's player inventory.
+pub const SLOTS: usize = 36;
+/// Hotbar slots, the only ones the hotbar API selects or writes.
+const HOTBAR_SLOTS: usize = 9;
+
+/// A nine-slot hotbar backed by twenty-seven storage slots.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Inventory {
-    slots: [Option<ItemStack>; 9],
+    slots: [Option<ItemStack>; SLOTS],
     selected: usize,
 }
 
@@ -54,46 +61,53 @@ impl Default for Inventory {
 }
 
 impl Inventory {
-    /// Nine empty slots.
+    /// Total slots, hotbar and storage together.
+    pub const SLOTS: usize = crate::inventory::SLOTS;
+
+    /// Every slot empty, with the first hotbar slot selected.
     pub fn empty() -> Self {
         Self {
-            slots: Default::default(),
+            slots: std::array::from_fn(|_| None),
             selected: 0,
         }
     }
 
-    /// Stone, dirt, grass, planks, log, glass, bricks, stone bricks and wool.
+    /// Stone, dirt, grass, planks, log, glass, bricks, stone bricks and wool
+    /// in the hotbar; storage starts empty.
     pub fn creative() -> Self {
-        Self {
-            slots: [
-                Some(ItemStack::new("minecraft:stone", 1)),
-                Some(ItemStack::new("minecraft:dirt", 1)),
-                Some(ItemStack::new("minecraft:grass_block", 1)),
-                Some(ItemStack::new("minecraft:oak_planks", 1)),
-                Some(ItemStack::new("minecraft:oak_log", 1)),
-                Some(ItemStack::new("minecraft:glass", 1)),
-                Some(ItemStack::new("minecraft:bricks", 1)),
-                Some(ItemStack::new("minecraft:stone_bricks", 1)),
-                Some(ItemStack::new("minecraft:white_wool", 1)),
-            ],
-            selected: 0,
+        let hotbar = [
+            Some(ItemStack::new("minecraft:stone", 1)),
+            Some(ItemStack::new("minecraft:dirt", 1)),
+            Some(ItemStack::new("minecraft:grass_block", 1)),
+            Some(ItemStack::new("minecraft:oak_planks", 1)),
+            Some(ItemStack::new("minecraft:oak_log", 1)),
+            Some(ItemStack::new("minecraft:glass", 1)),
+            Some(ItemStack::new("minecraft:bricks", 1)),
+            Some(ItemStack::new("minecraft:stone_bricks", 1)),
+            Some(ItemStack::new("minecraft:white_wool", 1)),
+        ];
+        let mut slots: [Option<ItemStack>; SLOTS] = std::array::from_fn(|_| None);
+        for (slot, stack) in slots.iter_mut().zip(hotbar) {
+            *slot = stack;
         }
+        Self { slots, selected: 0 }
     }
 
     pub fn selected(&self) -> usize {
         self.selected
     }
 
-    /// Selects `slot`; out-of-range values are ignored.
+    /// Selects `slot` (0..9); out-of-range values are ignored.
     pub fn select(&mut self, slot: usize) {
-        if slot < self.slots.len() {
+        if slot < HOTBAR_SLOTS {
             self.selected = slot;
         }
     }
 
     /// Moves the selection by `delta`, wrapping through the nine slots.
     pub fn scroll(&mut self, delta: i32) {
-        self.selected = (self.selected as i64 + delta as i64).rem_euclid(9) as usize;
+        self.selected =
+            (self.selected as i64 + delta as i64).rem_euclid(HOTBAR_SLOTS as i64) as usize;
     }
 
     /// The block state the selected stack places, when it is a block item.
@@ -101,8 +115,39 @@ impl Inventory {
         self.slots[self.selected].as_ref()?.block_state(table)
     }
 
+    /// The nine hotbar slots: the view every existing hotbar caller uses.
     pub fn slots(&self) -> &[Option<ItemStack>; 9] {
+        self.hotbar()
+    }
+
+    /// The nine hotbar slots.
+    pub fn hotbar(&self) -> &[Option<ItemStack>; 9] {
+        let (hotbar, _) = self.slots.split_at(HOTBAR_SLOTS);
+        std::convert::TryFrom::try_from(hotbar).expect("the hotbar is the first nine slots")
+    }
+
+    /// The twenty-seven storage slots behind the hotbar.
+    pub fn storage(&self) -> &[Option<ItemStack>; 27] {
+        let (_, storage) = self.slots.split_at(HOTBAR_SLOTS);
+        std::convert::TryFrom::try_from(storage).expect("storage is the last twenty-seven slots")
+    }
+
+    /// The stack in `slot` (0..36, hotbar first); empty and out-of-range
+    /// slots return `None`.
+    /// Every slot, hotbar first, then storage.
+    pub fn all_slots(&self) -> &[Option<ItemStack>; SLOTS] {
         &self.slots
+    }
+
+    pub fn slot(&self, index: usize) -> Option<&ItemStack> {
+        self.slots.get(index)?.as_ref()
+    }
+
+    /// Stores `stack` in `slot` (0..36); out-of-range values are ignored.
+    pub fn set(&mut self, index: usize, stack: Option<ItemStack>) {
+        if index < SLOTS {
+            self.slots[index] = stack;
+        }
     }
 
     /// The vanilla block-model texture used as the hotbar icon for `slot`,
@@ -123,16 +168,16 @@ impl Inventory {
         item_path(&stack.item).map(|_| [0.0, 0.0, 1.0, 1.0])
     }
 
-    /// Stores `stack` in `slot`; out-of-range values are ignored.
+    /// Stores `stack` in a hotbar `slot` (0..9); other values are ignored.
     pub fn set_slot(&mut self, slot: usize, stack: Option<ItemStack>) {
-        if slot < self.slots.len() {
+        if slot < HOTBAR_SLOTS {
             self.slots[slot] = stack;
         }
     }
 
-    /// Inserts `stack`, merging into the selected slot first and then into the
-    /// first matching or empty slot. Returns the number of items that did not
-    /// fit.
+    /// Inserts `stack`, merging into the selected slot first, then into the
+    /// first matching or empty hotbar slot, then into storage. Returns the
+    /// number of items that did not fit.
     pub fn add(&mut self, stack: ItemStack) -> usize {
         if stack.is_empty() {
             return 0;
@@ -168,6 +213,50 @@ impl Inventory {
             *slot = None;
         }
         Some(ItemStack { item, count: taken })
+    }
+
+    /// Stores `stack` in the hotbar first, then in storage, ignoring the
+    /// selection. Returns the number of items that did not fit.
+    pub fn add_to_storage(&mut self, stack: ItemStack) -> usize {
+        if stack.is_empty() {
+            return 0;
+        }
+        let item = stack.item;
+        let mut remaining = stack.count;
+        // Hotbar slots first, then the twenty-seven storage slots.
+        for slot in self.slots.iter_mut() {
+            if remaining == 0 {
+                break;
+            }
+            remaining = merge_slot(slot, &item, remaining);
+        }
+        remaining as usize
+    }
+
+    /// Removes one `item` from the first slot holding it, hotbar first, and
+    /// returns whether anything was removed.
+    pub fn remove_one(&mut self, item: &str) -> bool {
+        for slot in self.slots.iter_mut() {
+            let matches = match slot {
+                Some(stack) => stack.item == item,
+                None => false,
+            };
+            if !matches {
+                continue;
+            }
+            let emptied = match slot {
+                Some(stack) => {
+                    stack.count -= 1;
+                    stack.count == 0
+                }
+                None => false,
+            };
+            if emptied {
+                *slot = None;
+            }
+            return true;
+        }
+        false
     }
 }
 
@@ -397,16 +486,17 @@ mod tests {
     #[test]
     fn add_returns_overflow_when_all_slots_fill() {
         let mut inventory = Inventory::empty();
+        let capacity = Inventory::SLOTS as u32 * MAX_STACK_SIZE;
 
         assert_eq!(
-            inventory.add(ItemStack::new("minecraft:stone", 600)),
-            (600 - 9 * MAX_STACK_SIZE) as usize
+            inventory.add(ItemStack::new("minecraft:stone", capacity)),
+            0
         );
-        for slot in inventory.slots() {
-            assert_eq!(slot.as_ref().unwrap().count, MAX_STACK_SIZE);
+        for index in 0..Inventory::SLOTS {
+            assert_eq!(inventory.slot(index).unwrap().count, MAX_STACK_SIZE);
         }
 
-        assert_eq!(inventory.add(ItemStack::new("minecraft:stone", 1)), 1);
+        assert_eq!(inventory.add(ItemStack::new("minecraft:stone", 10)), 10);
         assert_eq!(inventory.add(ItemStack::new("minecraft:dirt", 1)), 1);
         assert_eq!(inventory.add(ItemStack::new("minecraft:stone", 0)), 0);
     }
@@ -482,5 +572,98 @@ mod tests {
         assert_eq!(inventory.icon(1), None);
         assert_eq!(inventory.icon_texture(9), None);
         assert_eq!(inventory.icon(usize::MAX), None);
+    }
+
+    #[test]
+    fn hotbar_view_stays_nine_slots() {
+        let inventory = Inventory::creative();
+        assert_eq!(Inventory::SLOTS, 36);
+        assert_eq!(inventory.slots().len(), 9);
+        assert_eq!(inventory.hotbar().len(), 9);
+        assert_eq!(inventory.storage().len(), 27);
+
+        for (index, stack) in inventory.slots().iter().enumerate() {
+            assert_eq!(inventory.slot(index), stack.as_ref());
+        }
+        assert!(inventory.storage().iter().all(Option::is_none));
+        assert_eq!(inventory.slot(Inventory::SLOTS), None);
+        assert_eq!(inventory.slot(usize::MAX), None);
+
+        // `set` reaches storage; out-of-range stores are ignored.
+        let mut inventory = Inventory::empty();
+        inventory.set(35, Some(ItemStack::new("minecraft:dirt", 2)));
+        assert_eq!(
+            inventory.storage()[26],
+            Some(ItemStack::new("minecraft:dirt", 2))
+        );
+        inventory.set(Inventory::SLOTS, Some(ItemStack::new("minecraft:dirt", 1)));
+        assert_eq!(inventory.slot(Inventory::SLOTS), None);
+        assert_eq!(inventory.storage()[26].as_ref().unwrap().count, 2);
+    }
+
+    #[test]
+    fn hotbar_spills_into_storage() {
+        let mut inventory = Inventory::empty();
+        // Nine hotbar stacks of 64 hold 576 items; the rest spills into
+        // storage.
+        assert_eq!(inventory.add(ItemStack::new("minecraft:stone", 600)), 0);
+        for slot in inventory.slots() {
+            assert_eq!(slot.as_ref().unwrap().count, MAX_STACK_SIZE);
+        }
+        assert_eq!(inventory.storage()[0].as_ref().unwrap().count, 24);
+        assert!(inventory.storage()[1..].iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn storage_add_fills_the_hotbar_first() {
+        let mut inventory = Inventory::empty();
+        inventory.set(9, Some(ItemStack::new("minecraft:stick", 63)));
+        assert_eq!(
+            inventory.add_to_storage(ItemStack::new("minecraft:stick", 3)),
+            0
+        );
+        assert_eq!(inventory.slot(0).as_ref().unwrap().count, 3);
+        assert_eq!(inventory.slot(9).as_ref().unwrap().count, 63);
+
+        // With the hotbar full, a stack lands in the first free storage
+        // slot; later adds merge into it.
+        let mut inventory = Inventory::empty();
+        for index in 0..9 {
+            inventory.set(
+                index,
+                Some(ItemStack::new("minecraft:stone", MAX_STACK_SIZE)),
+            );
+        }
+        assert_eq!(
+            inventory.add_to_storage(ItemStack::new("minecraft:stick", 4)),
+            0
+        );
+        assert_eq!(inventory.storage()[0].as_ref().unwrap().count, 4);
+        assert_eq!(
+            inventory.add_to_storage(ItemStack::new("minecraft:stick", MAX_STACK_SIZE)),
+            0
+        );
+        assert_eq!(
+            inventory.storage()[0].as_ref().unwrap().count,
+            MAX_STACK_SIZE
+        );
+        assert_eq!(inventory.storage()[1].as_ref().unwrap().count, 4);
+    }
+
+    #[test]
+    fn remove_one_takes_the_first_match() {
+        let mut inventory = Inventory::empty();
+        inventory.add_to_storage(ItemStack::new("minecraft:stick", 2));
+        inventory.set(9, Some(ItemStack::new("minecraft:stick", 1)));
+
+        assert!(inventory.remove_one("minecraft:stick"));
+        assert_eq!(inventory.slot(0).as_ref().unwrap().count, 1);
+        assert!(inventory.remove_one("minecraft:stick"));
+        assert_eq!(inventory.slot(0), None);
+        // The storage stack is the next match.
+        assert!(inventory.remove_one("minecraft:stick"));
+        assert_eq!(inventory.slot(9), None);
+        assert!(!inventory.remove_one("minecraft:stick"));
+        assert!(!inventory.remove_one("minecraft:dirt"));
     }
 }

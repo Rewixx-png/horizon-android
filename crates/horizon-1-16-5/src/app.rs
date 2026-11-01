@@ -1204,6 +1204,8 @@ fn fill_hud(
             hud.extend_from_slice(&hud_rect(rect[0], rect[1], rect[2], rect[3], color));
         }
     }
+    // Place and break read as a plus and a cross instead of bare squares.
+    hud.extend(action_glyphs(touch));
     let hotbar = touch.hotbar_rects();
     for (rect, _) in &hotbar {
         hud.extend_from_slice(&hud_rect(
@@ -1406,6 +1408,77 @@ fn hud_item_sprite(
         uv,
         color: [1.0, 1.0, 1.0, 1.0],
     })
+}
+
+/// A thin rotated bar centred on `(cx, cy)`, in normalized screen units.
+fn hud_bar(
+    cx: f32,
+    cy: f32,
+    half_length: f32,
+    half_width: f32,
+    angle: f32,
+    color: [f32; 4],
+) -> [HudVertex; 6] {
+    let (sin, cos) = angle.sin_cos();
+    let (ux, uy) = (cos * half_length, sin * half_length);
+    let (vx, vy) = (-sin * half_width, cos * half_width);
+    let corners = [
+        [cx - ux - vx, cy - uy - vy],
+        [cx + ux - vx, cy + uy - vy],
+        [cx + ux + vx, cy + uy + vy],
+        [cx - ux + vx, cy - uy + vy],
+    ];
+    let mut vertices = [HudVertex {
+        position: [0.0, 0.0],
+        color,
+    }; 6];
+    let point = |x: f32, y: f32| [x * 2.0 - 1.0, 1.0 - y * 2.0];
+    let order = [0, 1, 2, 0, 2, 3];
+    for (slot, corner) in order.iter().enumerate() {
+        let [x, y] = corners[*corner];
+        vertices[slot] = HudVertex {
+            position: point(x, y),
+            color,
+        };
+    }
+    vertices
+}
+
+/// Vertices in the place/break glyphs: two bars of six vertices each.
+/// Only the tests count them directly.
+#[cfg(test)]
+const ACTION_GLYPH_VERTICES: usize = 24;
+
+/// Place/attack button glyphs on top of the touch controls.
+fn action_glyphs(screen: &crate::touch::TouchControls) -> Vec<HudVertex> {
+    const GLYPH: [f32; 4] = [1.0, 1.0, 1.0, 0.85];
+    let rects = screen.hud_rects();
+    let mut glyphs = Vec::with_capacity(18);
+    // Place: a plus.
+    if let Some((rect, _)) = rects.get(2) {
+        let (cx, cy) = (rect[0] + rect[2] * 0.5, rect[1] + rect[3] * 0.5);
+        let arm = rect[2] * 0.28;
+        let thin = rect[2] * 0.055;
+        glyphs.extend_from_slice(&hud_bar(cx, cy, arm, thin, 0.0, GLYPH));
+        glyphs.extend_from_slice(&hud_bar(
+            cx,
+            cy,
+            arm,
+            thin,
+            std::f32::consts::FRAC_PI_2,
+            GLYPH,
+        ));
+    }
+    // Attack: a cross.
+    if let Some((rect, _)) = rects.get(3) {
+        let (cx, cy) = (rect[0] + rect[2] * 0.5, rect[1] + rect[3] * 0.5);
+        let arm = rect[2] * 0.22;
+        let thin = rect[2] * 0.055;
+        let angle = std::f32::consts::FRAC_PI_4;
+        glyphs.extend_from_slice(&hud_bar(cx, cy, arm, thin, angle, GLYPH));
+        glyphs.extend_from_slice(&hud_bar(cx, cy, arm, thin, -angle, GLYPH));
+    }
+    glyphs
 }
 
 /// Two thin quads forming a crosshair centred on the screen. Sizes are
@@ -2084,7 +2157,11 @@ mod tests {
         // The joystick discs, the three remaining control rectangles, nine
         // hotbar backgrounds, the flat swatch of every creative slot (there is
         // no atlas here), the selected overlay and the two-quad crosshair.
-        assert_eq!(hud.len(), flat_control_vertices(&touch) + 9 * 6);
+        assert_eq!(
+            hud.len(),
+            flat_control_vertices(&touch) + ACTION_GLYPH_VERTICES + 9 * 6,
+            "control rects, place/break glyphs, slot backgrounds and swatches"
+        );
         assert!(sprites.is_empty(), "no atlas means no item sprites");
         for vertex in &hud {
             assert!(vertex.position[0].is_finite());
@@ -2197,7 +2274,10 @@ mod tests {
 
         // The flat geometry is the controls, the nine slot backgrounds, the
         // selection overlay and the crosshair; every item icon is a sprite.
-        assert_eq!(hud.len(), flat_control_vertices(&touch));
+        assert_eq!(
+            hud.len(),
+            flat_control_vertices(&touch) + ACTION_GLYPH_VERTICES
+        );
         assert_eq!(sprites.len(), 9, "one sprite per creative slot");
 
         // Each sprite samples the atlas sprite inside its own hotbar slot.
@@ -2247,7 +2327,10 @@ mod tests {
             800,
             600,
         );
-        assert_eq!(hud.len(), flat_control_vertices(&touch) + 9 * 6);
+        assert_eq!(
+            hud.len(),
+            flat_control_vertices(&touch) + ACTION_GLYPH_VERTICES + 9 * 6
+        );
         assert!(sprites.is_empty());
 
         // Moving the selection moves the brighter overlay: the six selected
@@ -2323,7 +2406,7 @@ mod tests {
         // remaining controls, nine slot backgrounds, nine flat swatches (no
         // atlas), the selection overlay and the crosshair. No health, food or
         // tint vertices.
-        let expected = flat_control_vertices(&touch) + 9 * 6;
+        let expected = flat_control_vertices(&touch) + ACTION_GLYPH_VERTICES + 9 * 6;
         assert_eq!(hud.len(), expected);
         let mut overlay = Vec::new();
         survival_hud(&mut overlay, &touch, &survival);

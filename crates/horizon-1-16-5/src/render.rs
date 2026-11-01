@@ -301,13 +301,27 @@ pub fn hud_disc(
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CameraUniform {
     view_proj: [f32; 16],
+    /// Camera eye in block coordinates, for distance fog.
+    eye: [f32; 4],
 }
 
 const SHADER: &str = r#"
 struct Camera {
     view_proj: mat4x4<f32>,
+    eye: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> camera: Camera;
+
+const SKY: vec3<f32> = vec3<f32>(0.47, 0.65, 1.0);
+const FOG_NEAR: f32 = 48.0;
+const FOG_FAR: f32 = 96.0;
+
+// Distance fog toward the sky colour, as 1.16.5 blends the horizon.
+fn fogged(color: vec3<f32>, world: vec3<f32>) -> vec3<f32> {
+    let distance = length(world - camera.eye.xyz);
+    let amount = clamp((distance - FOG_NEAR) / (FOG_FAR - FOG_NEAR), 0.0, 1.0);
+    return mix(color, SKY, amount);
+}
 @group(0) @binding(1) var atlas_texture: texture_2d<f32>;
 @group(0) @binding(2) var atlas_sampler: sampler;
 
@@ -323,6 +337,7 @@ struct VertexOutput {
     @location(0) uv: vec2<f32>,
     @location(1) light: f32,
     @location(2) tint: vec3<f32>,
+    @location(3) world: vec3<f32>,
 };
 
 @vertex
@@ -330,6 +345,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
     output.clip_position = camera.view_proj * vec4<f32>(input.position, 1.0);
     output.uv = input.uv;
+    output.world = input.position;
     output.tint = input.tint;
     let normal = normalize(input.normal);
     // Vanilla's directional terms on top of the baked sky/block light: top
@@ -345,7 +361,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     if (texel.a < 0.5) {
         discard;
     }
-    return vec4<f32>(texel.rgb * input.tint * input.light, 1.0);
+    return vec4<f32>(fogged(texel.rgb * input.tint * input.light, input.world), 1.0);
 }
 
 // The blended pass keeps the sampled alpha so glass, water and ice mix with
@@ -357,7 +373,7 @@ fn fs_blend(input: VertexOutput) -> @location(0) vec4<f32> {
     if (texel.a <= 0.0) {
         discard;
     }
-    return vec4<f32>(texel.rgb * input.tint * input.light, texel.a);
+    return vec4<f32>(fogged(texel.rgb * input.tint * input.light, input.world), texel.a);
 }
 "#;
 
@@ -500,7 +516,10 @@ impl OffscreenRenderer {
         let prepared = prepare_mesh(mesh, atlas, light)?;
 
         let view_proj = view_projection(camera, width as f32 / height as f32, mesh);
-        let uniform = CameraUniform { view_proj };
+        let uniform = CameraUniform {
+            view_proj,
+            eye: [camera.eye[0], camera.eye[1], camera.eye[2], 1.0],
+        };
         let uniform_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -648,12 +667,7 @@ impl OffscreenRenderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.07,
-                            g: 0.09,
-                            b: 0.12,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(sky_clear()),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -1016,6 +1030,25 @@ pub fn is_translucent_texture(name: &str) -> bool {
     sprite
         .split('_')
         .any(|token| matches!(token, "glass" | "water" | "ice" | "slime" | "honey"))
+}
+
+/// The 1.16.5 daylight sky colour (RGB 0..1), used for the clear and, mixed
+/// with the far fog, for the horizon haze.
+pub const SKY_COLOR: [f32; 3] = [0.47, 0.65, 1.0];
+/// Fog ramp: fully clear until this many blocks, fully sky-coloured beyond
+/// `FOG_FAR`, matching the vanilla render distance feel at short radii.
+pub const FOG_NEAR: f32 = 48.0;
+/// Distance at which geometry is fully fogged.
+pub const FOG_FAR: f32 = 96.0;
+
+/// Sky clear colour for a frame.
+pub fn sky_clear() -> wgpu::Color {
+    wgpu::Color {
+        r: f64::from(SKY_COLOR[0]),
+        g: f64::from(SKY_COLOR[1]),
+        b: f64::from(SKY_COLOR[2]),
+        a: 1.0,
+    }
 }
 
 /// Vanilla's face shading: top faces brightest, bottom darkest, sides between.
@@ -1449,7 +1482,10 @@ impl SurfaceRenderer {
             self.depth = create_depth(&self.device, extent[0], extent[1]);
         }
         let view_proj = view_projection(camera, aspect_of(extent), mesh);
-        let uniform = CameraUniform { view_proj };
+        let uniform = CameraUniform {
+            view_proj,
+            eye: [camera.eye[0], camera.eye[1], camera.eye[2], 1.0],
+        };
         let uniform_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1562,12 +1598,7 @@ impl SurfaceRenderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.07,
-                            g: 0.09,
-                            b: 0.12,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(sky_clear()),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -2004,10 +2035,13 @@ mod tests {
             .count();
         assert!(red > 200, "expected red top pixels, got {red}");
         assert!(blue > 200, "expected blue side pixels, got {blue}");
+        // The corner keeps the sky clear colour when the cube does not cover it.
         assert!(
             frame
                 .pixel(0, 0)
-                .is_some_and(|p| p[0] < 100 && p[1] < 100 && p[2] < 100 && p[3] == 255)
+                .is_some_and(|p| p[2] > p[0] && p[3] == 255),
+            "expected sky at the corner: {:?}",
+            frame.pixel(0, 0)
         );
 
         let out = root.join("frame.png");

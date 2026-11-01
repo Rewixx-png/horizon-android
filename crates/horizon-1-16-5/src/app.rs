@@ -20,7 +20,7 @@ use crate::assets::ModelPack;
 use crate::atlas::{TextureAtlas, VanillaAssets};
 use crate::chunk_mesh::{MeshWorker, WorldSnapshot, chunks_around};
 use crate::crafting::Recipes;
-use crate::inventory::{Inventory, ItemStack, icon_texture_for_item};
+use crate::inventory::{Inventory, ItemStack, MAX_STACK_SIZE, icon_texture_for_item};
 use crate::inventory_ui::{self, InventoryScreen};
 use crate::player::{Input, Player};
 use crate::render::{Camera, HudVertex, SurfaceRenderer, hud_rect};
@@ -1409,12 +1409,19 @@ fn craft_result(state: &mut PlayState) {
             overflow[index] = state.server.survival.inventory.add(stack.clone()) as u32;
         }
     }
-    // The recipe book adds the result itself and drops whatever does not fit;
-    // size the capacity after folding so the surplus can stay in the grid.
+    // The recipe book removes one ingredient per non-empty cell and only then
+    // adds the result; mirror both steps on a probe inventory so the free
+    // capacity - and therefore the surplus - is exact.
+    let mut probe = state.server.survival.inventory.clone();
+    for stack in grid.iter().flatten() {
+        probe.remove_one(&stack.item);
+    }
     let surplus = preview
         .count
-        .saturating_sub(fitting_capacity(&state.server.survival.inventory, &preview.item));
-    if let Some(produced) = state.server.survival.craft(&grid)
+        .saturating_sub(fitting_capacity(&probe, &preview.item));
+    let crafted = state.server.survival.craft(&grid);
+    let crafted_something = crafted.is_some();
+    if let Some(produced) = crafted
         && state.server.survival.is_creative()
     {
         // The survival recipe book adds to its own inventory; the creative
@@ -1434,7 +1441,7 @@ fn craft_result(state: &mut PlayState) {
             Some(ItemStack::new(item, overflow[index]))
         };
     }
-    if surplus > 0 {
+    if surplus > 0 && crafted_something {
         match state.screen.craft.iter_mut().find(|cell| cell.is_none()) {
             Some(cell) => *cell = Some(ItemStack::new(preview.item, surplus)),
             None => {

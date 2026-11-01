@@ -1112,8 +1112,10 @@ fn build_vertices(
             mesh.textures.len()
         )));
     }
+    // An empty mesh is a valid frame: a network world starts with no chunks
+    // loaded, so the first frames show only the sky.
     if mesh.indices.is_empty() {
-        return Err(RenderError::Failed("mesh has no triangles".into()));
+        return Ok(Vec::new());
     }
     let missing_uv = atlas
         .uv(MISSING_TEXTURE)
@@ -2174,7 +2176,6 @@ mod tests {
 
     #[test]
     fn rejects_malformed_meshes() {
-        let mesh = Mesh::default();
         let root = temp_pack([255, 0, 0, 255], [0, 0, 255, 255]);
         let atlas =
             TextureAtlas::from_directory(&root, ["minecraft:block/red".to_owned()]).unwrap();
@@ -2186,9 +2187,18 @@ mod tests {
             }
             Err(error) => panic!("offscreen renderer: {error}"),
         };
+        // An empty mesh is a valid frame (a network world starts empty); a
+        // mesh whose textures and quads disagree is not.
+        let empty = Mesh::default();
         let camera = Camera::looking_at([3.0, 3.0, 3.0], [0.0, 0.0, 0.0]);
+        assert!(renderer.render(&empty, &atlas, camera, 64, 64).is_ok());
+        let malformed = Mesh {
+            vertices: vec![crate::Vertex::default(); 4],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            textures: Vec::new(),
+        };
         assert!(matches!(
-            renderer.render(&mesh, &atlas, camera, 64, 64),
+            renderer.render(&malformed, &atlas, camera, 64, 64),
             Err(RenderError::Failed(_))
         ));
         std::fs::remove_dir_all(&root).unwrap();

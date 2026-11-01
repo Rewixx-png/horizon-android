@@ -130,7 +130,7 @@ pub struct Mesh {
 #[derive(Clone, Debug, Default)]
 pub struct BlockTable {
     states: Vec<BlockState>,
-    ids: HashMap<BlockState, u16>,
+    ids: HashMap<BlockState, u32>,
 }
 
 impl BlockTable {
@@ -159,7 +159,7 @@ impl BlockTable {
                     .and_then(Value::as_i64)
                     .and_then(|id| usize::try_from(id).ok())
                     .ok_or_else(|| format!("block {name} has an invalid state id"))?;
-                if id > usize::from(u16::MAX) {
+                if id > u32::MAX as usize {
                     return Err(format!("block state id {id} does not fit the 1.16.5 table"));
                 }
                 let mut properties = Properties::new();
@@ -185,19 +185,19 @@ impl BlockTable {
                     return Err(format!("duplicate block state id or key at {id}"));
                 }
                 states[id] = block_state.clone();
-                ids.insert(block_state, id as u16);
+                ids.insert(block_state, id as u32);
             }
         }
         Ok(Self { states, ids })
     }
 
-    pub fn state(&self, id: u16) -> Option<&BlockState> {
+    pub fn state(&self, id: u32) -> Option<&BlockState> {
         self.states
-            .get(usize::from(id))
+            .get(id as usize)
             .filter(|state| !state.name.is_empty())
     }
 
-    pub fn state_id(&self, state: &BlockState) -> Option<u16> {
+    pub fn state_id(&self, state: &BlockState) -> Option<u32> {
         self.ids.get(state).copied()
     }
 

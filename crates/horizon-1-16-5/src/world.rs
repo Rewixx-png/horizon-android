@@ -71,7 +71,7 @@ const SECTION_BLOCKS: usize = 4096;
 /// Biome ids per column: 4×4 horizontal × 64 vertical cells of 4×4×4 blocks.
 const BIOMES: usize = 1024;
 /// One decoded section: 1.16.5 block-table state ids in YZX order.
-type Section = Box<[u16; SECTION_BLOCKS]>;
+type Section = Box<[u32; SECTION_BLOCKS]>;
 
 /// A whole 1.16.5 world directory, loaded eagerly into memory.
 pub struct World {
@@ -79,7 +79,7 @@ pub struct World {
     pub table: BlockTable,
     /// The table id of `minecraft:air`, used where a chunk is loaded but a
     /// section (or the whole y range) is absent.
-    air: u16,
+    air: u32,
     chunks: HashMap<(i32, i32), ChunkColumn>,
     /// Chunk positions changed since the last successful save.
     dirty: HashSet<(i32, i32)>,
@@ -157,6 +157,26 @@ impl World {
         }
     }
 
+    /// Inserts or replaces a chunk column, e.g. one decoded from the network.
+    pub fn insert_column(&mut self, column: ChunkColumn) -> Result<(), String> {
+        self.chunks.insert((column.x, column.z), column);
+        Ok(())
+    }
+
+    /// An empty world: every position reads as `None` (no chunk loaded) until
+    /// columns are inserted. Used by the `--server` mode.
+    pub fn empty(table: BlockTable) -> Self {
+        let air = table.state_id(&air_state()).unwrap_or(0);
+        Self {
+            table,
+            air,
+            chunks: HashMap::new(),
+            dirty: HashSet::new(),
+            loot: None,
+            break_count: 0,
+        }
+    }
+
     /// The loaded chunk column at chunk coordinates (x, z), if any.
     pub fn chunk(&self, x: i32, z: i32) -> Option<&ChunkColumn> {
         self.chunks.get(&(x, z))
@@ -191,7 +211,7 @@ impl World {
     /// A loaded chunk returns its id, or the air id where the y is outside
     /// 0..256 or the section was not saved. A position without a loaded
     /// chunk is `None`.
-    pub fn state_id_at(&self, x: i32, y: i32, z: i32) -> Option<u16> {
+    pub fn state_id_at(&self, x: i32, y: i32, z: i32) -> Option<u32> {
         let column = self.chunks.get(&(x >> 4, z >> 4))?;
         if !(0..256).contains(&y) {
             return Some(self.air);
@@ -206,7 +226,7 @@ impl World {
     ///
     /// Errors when no chunk is loaded at the position or the y is outside
     /// 0..256. A missing section is created filled with air.
-    pub fn set_state_id(&mut self, x: i32, y: i32, z: i32, id: u16) -> Result<(), String> {
+    pub fn set_state_id(&mut self, x: i32, y: i32, z: i32, id: u32) -> Result<(), String> {
         if !(0..256).contains(&y) {
             return Err(format!("block y {y} is outside 0..256"));
         }
@@ -331,13 +351,13 @@ impl World {
     /// Encodes one section with its own local palette and 1.16.5 packing.
     fn section_nbt(
         &self,
-        blocks: &[u16; SECTION_BLOCKS],
+        blocks: &[u32; SECTION_BLOCKS],
         y: usize,
         at: &str,
     ) -> Result<Tag, String> {
         // 1.16.5 re-enumerates the distinct states of the section on save.
-        let mut palette: Vec<u16> = Vec::new();
-        let mut indices: HashMap<u16, u64> = HashMap::new();
+        let mut palette: Vec<u32> = Vec::new();
+        let mut indices: HashMap<u32, u64> = HashMap::new();
         let mut values = Vec::with_capacity(SECTION_BLOCKS);
         for &id in blocks.iter() {
             let index = match indices.get(&id) {
@@ -487,6 +507,53 @@ pub struct ChunkColumn {
 }
 
 impl ChunkColumn {
+    /// An empty column at chunk coordinates `(x, z)`: every section absent
+    /// (air) and a zeroed biome grid. Used when the chunk comes from the
+    /// network rather than from disk.
+    pub fn empty(x: i32, z: i32) -> Self {
+        Self {
+            x,
+            z,
+            sections: std::array::from_fn(|_| None),
+            lights: std::array::from_fn(|_| None),
+            biomes: [0; BIOMES],
+            original: None,
+        }
+    }
+
+    /// Installs a decoded section (and its light) at index 0..16.
+    pub fn replace_section(
+        &mut self,
+        index: usize,
+        blocks: Option<Box<[u32; SECTION_BLOCKS]>>,
+        lights: Option<Vec<u8>>,
+    ) -> Result<(), String> {
+        if index >= SECTIONS {
+            return Err(format!("section index {index} is outside 0..{SECTIONS}"));
+        }
+        self.lights[index] = lights;
+        self.sections[index] = blocks;
+        Ok(())
+    }
+
+    /// Clears the sections the packet's mask says are empty, so a full chunk
+    /// never keeps stale blocks from a chunk it replaces.
+    pub fn replace_sections_absent_from(&mut self, bitmask: u32) -> Result<(), String> {
+        for index in 0..SECTIONS {
+            if bitmask & (1 << index) == 0 {
+                self.sections[index] = None;
+                self.lights[index] = None;
+            }
+        }
+        Ok(())
+    }
+
+    /// Replaces the 1024-cell biome grid.
+    pub fn set_biomes(&mut self, biomes: [i32; BIOMES]) -> Result<(), String> {
+        self.biomes = biomes;
+        Ok(())
+    }
+
     /// Decodes a 1.16.5 chunk NBT root; `None` for an empty chunk (no
     /// `Level.Sections`). `position` is the region slot, the fallback when
     /// `Level.xPos`/`zPos` are absent. The whole `root` is kept in
@@ -601,7 +668,7 @@ impl ChunkColumn {
 
     /// The section at index 0..16: its 4096 block-table state ids in YZX
     /// order, or `None` where the chunk did not save one (air).
-    pub fn section(&self, index: usize) -> Option<&[u16; SECTION_BLOCKS]> {
+    pub fn section(&self, index: usize) -> Option<&[u32; SECTION_BLOCKS]> {
         self.sections.get(index).and_then(Option::as_deref)
     }
 
@@ -609,7 +676,7 @@ impl ChunkColumn {
     ///
     /// `None` for a coordinate outside 0..16 or where the section was not
     /// saved (a missing section reads as air).
-    pub fn state_id(&self, x: usize, y: usize, z: usize) -> Option<u16> {
+    pub fn state_id(&self, x: usize, y: usize, z: usize) -> Option<u32> {
         if x >= 16 || y >= 16 || z >= 16 {
             return None;
         }
@@ -628,8 +695,8 @@ impl ChunkColumn {
         x: usize,
         y: usize,
         z: usize,
-        id: u16,
-        air: u16,
+        id: u32,
+        air: u32,
     ) -> Result<(), String> {
         if x >= 16 || y >= 16 || z >= 16 {
             return Err(format!("block ({x}, {y}, {z}) is outside 0..16"));
@@ -767,7 +834,7 @@ fn bits_per_entry(palette_len: usize) -> u32 {
 
 /// One `Palette` entry: a `{Name, Properties?}` compound mapped through the
 /// 1.16.5 block-state table.
-fn palette_entry(tag: &Tag, at: &str, y: usize, table: &BlockTable) -> Result<u16, String> {
+fn palette_entry(tag: &Tag, at: &str, y: usize, table: &BlockTable) -> Result<u32, String> {
     let Tag::Compound(_) = tag else {
         return Err(format!(
             "{at}: section {y} has a Palette entry that is not a compound"
@@ -1822,7 +1889,12 @@ mod tests {
         // 18-entry palette, past the 16-state 4-bit floor), at unique cells.
         for id in 1u16..=17 {
             world
-                .set_state_id(-16 + i32::from(id % 16), 0, 32 + i32::from(id / 16), id)
+                .set_state_id(
+                    -16 + i32::from(id % 16),
+                    0,
+                    32 + i32::from(id / 16),
+                    u32::from(id),
+                )
                 .unwrap();
         }
         // Section 15, i.e. y 240..256, still inside chunk (-1, 2).
@@ -1865,7 +1937,7 @@ mod tests {
         for id in 1u16..=17 {
             assert_eq!(
                 world.state_id_at(-16 + i32::from(id % 16), 0, 32 + i32::from(id / 16)),
-                Some(id),
+                Some(u32::from(id)),
                 "state {id}"
             );
         }

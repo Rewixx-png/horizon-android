@@ -122,7 +122,7 @@ pub fn chunks_around(center: [i32; 2], radius: i32) -> Vec<[i32; 2]> {
 const CHUNK_VOLUME: usize = 16 * 256 * 16;
 /// Sentinel for a block the captured source did not know. Vanilla block
 /// tables stay well below 65535 states, so this id is never a real state.
-const MISSING: u16 = u16::MAX;
+const MISSING: u32 = u32::MAX;
 
 /// Index of a block in a snapshot column: Y outermost, then Z, then X.
 fn chunk_index(x: usize, y: usize, z: usize) -> usize {
@@ -144,7 +144,7 @@ enum SnapshotStates {
 /// captured chunk is `None`, and a hole the source did not know inside a
 /// captured chunk stays `None` as well.
 pub struct WorldSnapshot {
-    chunks: HashMap<[i32; 2], Vec<u16>>,
+    chunks: HashMap<[i32; 2], Vec<u32>>,
     states: SnapshotStates,
     /// Packed `(sky << 4) | block` pairs, 4096 per captured chunk.
     light: HashMap<[i32; 2], Vec<u8>>,
@@ -160,7 +160,7 @@ impl WorldSnapshot {
     /// [`BlockState`] for every block.
     pub fn capture(world: &dyn BlockSource, chunks: &[[i32; 2]]) -> Self {
         let mut states = vec![BlockState::new("minecraft:air")];
-        let mut ids: HashMap<BlockState, u16> = HashMap::new();
+        let mut ids: HashMap<BlockState, u32> = HashMap::new();
         ids.insert(states[0].clone(), 0);
         let mut captured = HashMap::with_capacity(chunks.len());
         for &chunk in chunks {
@@ -176,7 +176,7 @@ impl WorldSnapshot {
                         let id = match ids.get(&state) {
                             Some(&id) => id,
                             None => {
-                                let Ok(id) = u16::try_from(states.len()) else {
+                                let Ok(id) = u32::try_from(states.len()) else {
                                     continue;
                                 };
                                 if id == MISSING {
@@ -253,9 +253,9 @@ impl WorldSnapshot {
         }
     }
 
-    fn state(&self, id: u16) -> Option<BlockState> {
+    fn state(&self, id: u32) -> Option<BlockState> {
         match &self.states {
-            SnapshotStates::Interned(states) => states.get(usize::from(id)).cloned(),
+            SnapshotStates::Interned(states) => states.get(id as usize).cloned(),
             SnapshotStates::Table(table) => table.state(id).cloned(),
         }
     }

@@ -88,7 +88,8 @@ const INVENTORY_CURSOR_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.55];
 
 const USAGE: &str = "usage: horizon-1165 --world <dir> --tables <file> --client-jar <file> \
 --assets-index <file> --assets-objects <dir> [--width <px>] [--height <px>] \
-[--spawn <x> <y> <z>] [--radius <chunks>] [--frames <n>] [--survival]";
+[--spawn <x> <y> <z>] [--radius <chunks>] [--frames <n>] [--survival] \
+[--server <host:port>]";
 
 /// The parsed play arguments.
 #[derive(Debug)]
@@ -107,6 +108,9 @@ struct PlayOptions {
     frames: u32,
     /// Start in survival mode instead of the default creative mode.
     survival: bool,
+    /// `host:port` of a 1.16.5 server: chunks come from the network instead
+    /// of the world directory.
+    server: Option<String>,
 }
 
 /// Parses the play arguments. Every flag takes its value as the following
@@ -128,6 +132,7 @@ where
     let mut radius = DEFAULT_RADIUS;
     let mut frames = 0u32;
     let mut survival = false;
+    let mut server: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -145,6 +150,21 @@ where
             "--radius" => radius = parse_number(&args, &mut i, flag)?,
             "--frames" => frames = parse_number(&args, &mut i, flag)?,
             "--survival" => survival = true,
+            "--server" => {
+                i += 1;
+                let value = args.get(i).ok_or("--server needs host:port")?;
+                let value = value.to_str().ok_or("--server is not valid UTF-8")?;
+                let (host, port) = value
+                    .rsplit_once(':')
+                    .ok_or_else(|| format!("--server expects host:port, got '{value}'"))?;
+                let port: u16 = port
+                    .parse()
+                    .map_err(|error| format!("--server port: {error}"))?;
+                if host.is_empty() {
+                    return Err("--server needs a host".into());
+                }
+                server = Some(format!("{host}:{port}"));
+            }
             "--spawn" => {
                 let x = parse_number(&args, &mut i, flag)?;
                 let y = parse_number(&args, &mut i, flag)?;
@@ -160,8 +180,8 @@ where
     }
 
     let mut missing = Vec::new();
-    if world.is_none() {
-        missing.push("--world");
+    if world.is_none() && server.is_none() {
+        missing.push("--world or --server");
     }
     if tables.is_none() {
         missing.push("--tables");
@@ -189,8 +209,9 @@ where
         return Err("--radius must be at least 1".into());
     }
 
+    let world = world.unwrap_or_else(|| std::env::temp_dir().join("horizon-1165-network-world"));
     Ok(PlayOptions {
-        world: world.unwrap(),
+        world,
         tables: tables.unwrap(),
         client_jar: client_jar.unwrap(),
         assets_index: assets_index.unwrap(),
@@ -201,6 +222,7 @@ where
         radius,
         frames,
         survival,
+        server,
     })
 }
 
@@ -234,6 +256,8 @@ where
 struct Loaded {
     /// The world directory the chunks are saved back into.
     world_root: PathBuf,
+    /// Network handle when the world is streamed from a server.
+    net: Option<crate::net::NetHandle>,
     server: IntegratedServer,
     assets: VanillaAssets,
     atlas: TextureAtlas,
@@ -258,10 +282,17 @@ impl Loaded {
         assets_objects: Option<&Path>,
         spawn: Option<[f64; 3]>,
         radius: i32,
+        server_address: Option<&str>,
     ) -> Result<Self, String> {
         let table = BlockTable::load(tables)?;
         let world_root = world;
-        let mut world = World::open(&world_root, table)?;
+        // A chunk from the network needs no directory on disk; an empty world
+        // starts out with no loaded chunks and fills in as packets arrive.
+        let mut world = if world_root.is_dir() && world_root.join("region").is_dir() {
+            World::open(&world_root, table)?
+        } else {
+            World::empty(table)
+        };
         // The server jar sits beside the world in the bundled layout; loot is
         // optional, the block-table fallback still drops most blocks.
         let server_jar = client_jar
@@ -286,6 +317,10 @@ impl Loaded {
         };
         let mut server = match spawn {
             Some(spawn) => IntegratedServer::new(world, spawn),
+            // A network world has no chunks yet, so the spawn scan would fall
+            // back to y = 64; start above the sea and let the server's
+            // Position packet place the player.
+            None if server_address.is_some() => IntegratedServer::new(world, [0.5, 70.0, 0.5]),
             None => IntegratedServer::open(world),
         };
         // Recipes are optional too: without them the inventory screen still
@@ -317,9 +352,27 @@ impl Loaded {
             mesh.textures.iter().cloned().chain(hud_icon_textures()),
         )?;
         let block_table = Arc::new(server.world.table.clone());
+        let net = match server_address {
+            Some(address) => {
+                let (host, port) = address
+                    .rsplit_once(':')
+                    .ok_or_else(|| format!("--server expects host:port, got '{address}'"))?;
+                let port: u16 = port
+                    .parse()
+                    .map_err(|error| format!("--server port: {error}"))?;
+                Some(crate::net::spawn(
+                    host.to_owned(),
+                    port,
+                    "Horizon1165".to_owned(),
+                    block_table.clone(),
+                )?)
+            }
+            None => None,
+        };
         let mesh_worker = MeshWorker::new(models);
         Ok(Self {
             world_root,
+            net,
             server,
             assets,
             atlas,
@@ -334,6 +387,7 @@ impl Loaded {
 /// Everything loaded before the window exists.
 struct Pending {
     world_root: PathBuf,
+    net: Option<crate::net::NetHandle>,
     server: IntegratedServer,
     assets: VanillaAssets,
     atlas: TextureAtlas,
@@ -354,6 +408,10 @@ struct PlayState {
     server: IntegratedServer,
     /// The world directory chunks are saved into on the timer and on exit.
     world_root: PathBuf,
+    /// Set when the chunks come from a 1.16.5 server instead of disk.
+    net: Option<crate::net::NetHandle>,
+    /// Last position reported to the server, to avoid redundant packets.
+    sent_position: Option<[f64; 3]>,
     assets: VanillaAssets,
     atlas: TextureAtlas,
     mesh: Mesh,
@@ -409,6 +467,60 @@ struct PlayState {
 }
 
 impl PlayState {
+    /// Applies everything the network thread delivered since the last frame.
+    ///
+    /// Chunks are inserted into the shared world and trigger the same
+    /// background remesh a local edit does; a teleport moves the player; a
+    /// disconnect is logged and leaves the last frame on screen.
+    fn poll_network(&mut self) {
+        let Some(net) = self.net.as_ref() else {
+            return;
+        };
+        let mut received = Vec::new();
+        while let Some(event) = net.try_recv() {
+            received.push(event);
+            if received.len() >= 256 {
+                break;
+            }
+        }
+        for event in received {
+            match event {
+                crate::net::NetEvent::Connected {
+                    name,
+                    view_distance,
+                } => {
+                    eprintln!("connected to {name} (view distance {view_distance})");
+                }
+                crate::net::NetEvent::Chunk(column) => {
+                    let (x, z) = (column.x, column.z);
+                    eprintln!(
+                        "net: chunk ({x}, {z}) loaded={}",
+                        column.section(0).is_some()
+                    );
+                    if let Err(error) = self.server.world.insert_column(*column) {
+                        eprintln!("chunk ({x}, {z}): {error}");
+                    }
+                    self.remesh_wanted = true;
+                }
+                crate::net::NetEvent::Position {
+                    position,
+                    yaw,
+                    pitch,
+                } => {
+                    self.server.player.teleport(position);
+                    self.server.player.set_look(yaw, pitch);
+                    self.remesh_wanted = true;
+                }
+                crate::net::NetEvent::Chat(text) => eprintln!("chat: {text}"),
+                crate::net::NetEvent::Disconnected(reason) => {
+                    eprintln!("disconnected: {reason}");
+                }
+            }
+        }
+        if self.remesh_wanted {
+            self.request_remesh();
+        }
+    }
     /// Flushes dirty chunks under [`Self::world_root`] and stamps the periodic
     /// timer.
     ///
@@ -502,6 +614,7 @@ pub fn run() -> Result<(), String> {
         Some(&options.assets_objects),
         options.spawn,
         options.radius,
+        options.server.as_deref(),
     )?;
     let mut loaded = loaded;
     if options.survival {
@@ -511,6 +624,7 @@ pub fn run() -> Result<(), String> {
     let mut app = PlayApp {
         pending: Some(Pending {
             world_root: loaded.world_root,
+            net: loaded.net,
             server: loaded.server,
             assets: loaded.assets,
             atlas: loaded.atlas,
@@ -558,6 +672,7 @@ pub fn run_android(
         None,
         None,
         ANDROID_RADIUS,
+        None,
     )?;
     let event_loop = EventLoop::builder()
         .with_android_app(app)
@@ -566,6 +681,7 @@ pub fn run_android(
     let mut play = PlayApp {
         pending: Some(Pending {
             world_root: loaded.world_root,
+            net: loaded.net,
             server: loaded.server,
             assets: loaded.assets,
             atlas: loaded.atlas,
@@ -620,6 +736,23 @@ impl PlayApp {
         state.place_block = false;
         state.attack = false;
         state.server.tick(&input);
+        if let Some(net) = state.net.as_ref() {
+            let position = state.server.player.position;
+            let moved = state.sent_position.is_none_or(|last| {
+                (last[0] - position[0]).abs() > 1e-3
+                    || (last[1] - position[1]).abs() > 1e-3
+                    || (last[2] - position[2]).abs() > 1e-3
+            });
+            if moved {
+                net.send_move(
+                    position,
+                    state.server.player.yaw,
+                    state.server.player.pitch,
+                    true,
+                );
+                state.sent_position = Some(position);
+            }
+        }
         let chunk = player_chunk(&state.server.player);
         let changed = state.server.dirty || chunk != state.last_chunk;
         if changed {
@@ -829,6 +962,8 @@ impl ApplicationHandler for PlayApp {
             renderer,
             server: pending.server,
             world_root: pending.world_root,
+            net: pending.net,
+            sent_position: None,
             assets: pending.assets,
             atlas: pending.atlas,
             mesh: pending.mesh,
@@ -1036,6 +1171,9 @@ impl ApplicationHandler for PlayApp {
                 event_loop.exit();
                 return;
             }
+        }
+        if let Some(state) = self.state.as_mut() {
+            state.poll_network();
         }
         let Some(state) = self.state.as_mut() else {
             return;

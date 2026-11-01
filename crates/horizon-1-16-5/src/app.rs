@@ -258,6 +258,8 @@ where
 struct Loaded {
     /// The world directory the chunks are saved back into.
     world_root: PathBuf,
+    /// Vanilla GUI atlas, when the pack supplied it.
+    gui: Option<crate::gui::GuiSprites>,
     /// Network handle when the world is streamed from a server.
     net: Option<crate::net::NetHandle>,
     server: IntegratedServer,
@@ -360,6 +362,40 @@ impl Loaded {
             &mut assets,
             mesh.textures.iter().cloned().chain(hud_icon_textures()),
         )?;
+        // The GUI sprites are best-effort: a pack without the vanilla sheets
+        // keeps the drawn touch HUD instead of failing the world load.
+        // The Bedrock touch sprites live in the private input resources
+        // (prepared by tools/android_bedrock_controls.py), never in Git.
+        // `--assets-index` is `inputs/assets/indexes/1.16.json`; the trees that
+        // hold the sheets sit above it: the client jar's own extraction and
+        // the private Bedrock resources.
+        let mut bedrock = assets_index
+            .and_then(|index| index.parent())
+            .and_then(|indexes| indexes.parent())
+            .map(crate::atlas::DirectorySource::new);
+        let mut gui = crate::gui::GuiSprites::load_with(
+            &mut assets,
+            bedrock
+                .as_mut()
+                .map(|source| source as &mut dyn crate::atlas::TextureSource),
+        )
+        .ok();
+        if gui.is_none() {
+            eprintln!("vanilla GUI textures are missing from the pack");
+        }
+        // Optional Bedrock touch sprites: prepared privately by
+        // `tools/android_bedrock_controls.py`, never in Git.
+        if let Some(gui) = gui.as_mut() {
+            let controls = client_jar
+                .parent()
+                .map(|directory| directory.join("bedrock-controls.zip"))
+                .filter(|path| path.is_file());
+            if let Some(controls) = controls.as_deref()
+                && let Err(error) = gui.add_bedrock_zip(controls)
+            {
+                eprintln!("bedrock controls from {}: {error}", controls.display());
+            }
+        }
         let block_table = Arc::new(server.world.table.clone());
         let net = match server_address {
             Some(address) => {
@@ -382,6 +418,7 @@ impl Loaded {
         Ok(Self {
             world_root,
             net,
+            gui,
             server,
             assets,
             atlas,
@@ -397,6 +434,7 @@ impl Loaded {
 struct Pending {
     world_root: PathBuf,
     net: Option<crate::net::NetHandle>,
+    gui: Option<crate::gui::GuiSprites>,
     server: IntegratedServer,
     assets: VanillaAssets,
     atlas: TextureAtlas,
@@ -456,6 +494,12 @@ struct PlayState {
     hud: Vec<HudVertex>,
     /// Reused atlas-sampled HUD sprites, drawn after the flat vertices.
     sprites: Vec<HudSprite>,
+    /// Vanilla GUI sprites (hotbar, crosshair, Bedrock touch buttons).
+    gui: Option<crate::gui::GuiSprites>,
+    /// Sprite quads sampled from `gui`.
+    gui_sprites: Vec<HudSprite>,
+    /// Rotated geometry for the held block, drawn from the world atlas.
+    hand: Vec<crate::render::SpriteVertex>,
     /// The inventory and crafting screen: open flag, carried stack, grid.
     screen: InventoryScreen,
     /// Pointer position in normalized screen coordinates, so a mouse click
@@ -636,6 +680,7 @@ pub fn run() -> Result<(), String> {
         pending: Some(Pending {
             world_root: loaded.world_root,
             net: loaded.net,
+            gui: loaded.gui.clone(),
             server: loaded.server,
             assets: loaded.assets,
             atlas: loaded.atlas,
@@ -693,6 +738,7 @@ pub fn run_android(
         pending: Some(Pending {
             world_root: loaded.world_root,
             net: loaded.net,
+            gui: loaded.gui.clone(),
             server: loaded.server,
             assets: loaded.assets,
             atlas: loaded.atlas,
@@ -837,14 +883,48 @@ impl PlayApp {
             size.height,
             state.pointer,
         );
+        state.hand.clear();
+        let held = inventory.icon_texture(inventory.selected());
+        let hand = held.and_then(|texture| {
+            let atlas = &state.atlas;
+            let uv = atlas.uv(&texture)?;
+            let sway = (state.bob_phase * 0.5).sin() * 0.012;
+            let rise = state.bob_phase.sin().abs() * 0.02;
+            Some(crate::render::hud_sprite_rotated(
+                [0.66 + sway, 0.90 - rise],
+                [0.13, 0.13],
+                -0.35,
+                uv,
+                [1.0; 4],
+            ))
+        });
+        if let Some(vertices) = hand {
+            state.hand.extend_from_slice(&vertices);
+        }
+        fill_gui(
+            &mut state.hud,
+            &mut state.gui_sprites,
+            state.gui.as_ref(),
+            &state.touch,
+            state.touch_active,
+            size.width,
+            size.height,
+            (inventory.selected(), state.screen.open),
+        );
         state
             .renderer
-            .render_with_hud(
+            .render_with_hud_gui(
                 &state.mesh,
                 &state.atlas,
                 camera,
                 &state.hud,
                 &state.sprites,
+                &state.light,
+                state
+                    .gui
+                    .as_ref()
+                    .map(|gui| (gui, state.gui_sprites.as_slice())),
+                &state.hand,
             )
             .map_err(|error| error.to_string())?;
         state.frames_presented += 1;
@@ -988,6 +1068,7 @@ impl ApplicationHandler for PlayApp {
             server: pending.server,
             world_root: pending.world_root,
             net: pending.net,
+            gui: pending.gui,
             sent_position: None,
             bob_phase: 0.0,
             assets: pending.assets,
@@ -1010,6 +1091,8 @@ impl ApplicationHandler for PlayApp {
                 || std::env::var_os("HORIZON_1165_TOUCH_HUD").is_some(),
             hud: Vec::new(),
             sprites: Vec::new(),
+            gui_sprites: Vec::new(),
+            hand: Vec::new(),
             screen: InventoryScreen::default(),
             pointer: [0.5, 0.5],
             look: None,
@@ -1291,6 +1374,11 @@ fn merge_movement(keyboard: Input, touch: Input) -> Input {
     }
 }
 
+/// Height of the vanilla hotbar strip as a fraction of the screen height.
+const HOTBAR_GUI_SCALE: f32 = 0.23;
+/// Width of the hotbar sheet's nine slots in GUI pixels (182 - borders).
+const HOTBAR_GUI_SLOTS: f32 = 18.2;
+
 /// The block and item sprites the touch hotbar draws.
 ///
 /// The world atlas is built from the visible chunks' textures, which may not
@@ -1430,6 +1518,113 @@ fn fill_hud(
         ));
     }
     hud.extend_from_slice(&crosshair_vertices(width, height));
+}
+
+/// The vanilla GUI layer: the nine-slot hotbar strip, its selection frame, the
+/// crosshair, and the Bedrock touch arrows when the pack supplies them.
+///
+/// Everything here is a sprite from `gui::GuiSprites`; when the pack has no
+/// GUI sheets the function draws nothing and the flat HUD stays as it was.
+#[allow(clippy::too_many_arguments)]
+fn fill_gui(
+    hud: &mut Vec<HudVertex>,
+    gui_sprites: &mut Vec<HudSprite>,
+    gui: Option<&crate::gui::GuiSprites>,
+    touch: &TouchControls,
+    touch_active: bool,
+    width: u32,
+    height: u32,
+    state: (usize, bool),
+) {
+    gui_sprites.clear();
+    let (selected, panel_open) = state;
+    let _ = hud;
+    let Some(gui) = gui else {
+        return;
+    };
+    if panel_open {
+        return;
+    }
+    // The hotbar sprite is 182x22 vanilla pixels, nine 20x20 slots plus the
+    // 2-pixel border. Scale it so one slot matches a touch slot when the
+    // touch HUD is up, otherwise keep the classic anchored size.
+    let slot = if touch_active {
+        touch.hotbar_rects()[0].0[2]
+    } else {
+        (height as f32 * HOTBAR_GUI_SCALE) / height as f32
+    };
+    let strip_width = slot * (HOTBAR_GUI_SLOTS / 9.0) * 9.0;
+    let strip_height = slot * (HOTBAR_GUI_SLOTS / 9.0);
+    let x = 0.5 - strip_width * 0.5;
+    let y = if touch_active {
+        let first = touch.hotbar_rects()[0].0;
+        first[1] + first[3] * 0.02 - strip_height + first[3] * 0.98
+    } else {
+        1.0 - strip_height - 0.01
+    };
+    if let Some(uv) = gui.uv("hotbar") {
+        gui_sprites.push(HudSprite {
+            rect: [x, y, strip_width, strip_height],
+            uv,
+            color: [1.0; 4],
+        });
+    }
+    // The selection frame is centred on the selected slot.
+    let frame = slot * (24.0 / 20.0);
+    let slot_x = x + strip_width * (selected as f32 + 0.5) / 9.0;
+    let slot_y = y + strip_height * 0.5;
+    if let Some(uv) = gui.uv("hotbar_selected") {
+        gui_sprites.push(HudSprite {
+            rect: [slot_x - frame * 0.5, slot_y - frame * 0.5, frame, frame],
+            uv,
+            color: [1.0; 4],
+        });
+    }
+    // Touch arrows replace the drawn rectangles.
+    if touch_active {
+        let rects = touch.hud_rects();
+        let names = [
+            "touch_up",
+            "touch_left",
+            "touch_sneak",
+            "touch_right",
+            "touch_down",
+            "touch_jump",
+            "touch_place",
+            "touch_attack",
+        ];
+        let pressed = [false, false, false, false, false, false, false, false];
+        for (index, name) in names.iter().enumerate() {
+            let Some((rect, _)) = rects.get(index) else {
+                continue;
+            };
+            let pressed_name = format!("{name}_pressed");
+            let key = if pressed[index] && gui.sprite(&pressed_name).is_some() {
+                pressed_name.as_str()
+            } else {
+                name
+            };
+            let Some(uv) = gui.uv(key) else {
+                continue;
+            };
+            gui_sprites.push(HudSprite {
+                rect: *rect,
+                uv,
+                color: [1.0; 4],
+            });
+        }
+    }
+    // The vanilla crosshair icon is 15x15 pixels of a 256-pixel sheet; draw
+    // it at the same GUI scale as a hotbar slot.
+    let cross = (slot * 15.0 / 20.0).max(0.008);
+    if let Some(uv) = gui.uv("crosshair") {
+        gui_sprites.push(HudSprite {
+            rect: [0.5 - cross * 0.5, 0.5 - cross * 0.5, cross, cross],
+            uv,
+            color: [1.0, 1.0, 1.0, 0.85],
+        });
+    }
+    let _ = (width, height);
 }
 
 /// Appends the survival-only HUD: a health bar and a food bar above the

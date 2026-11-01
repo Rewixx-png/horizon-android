@@ -12,6 +12,7 @@ pub mod blocks;
 pub mod chunk_codec;
 pub mod chunk_mesh;
 pub mod crafting;
+pub mod gui;
 pub mod interact;
 pub mod inventory;
 pub mod inventory_ui;

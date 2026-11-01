@@ -1,0 +1,478 @@
+//! Vanilla GUI sprites for the in-world HUD.
+//!
+//! The HUD used to draw its own circles and rectangles. This module instead
+//! reads the real 1.16.5 GUI sheets from the client jar, so the hotbar, its
+//! selection frame and the crosshair are the textures a vanilla client shows:
+//!
+//! * `assets/minecraft/textures/gui/widgets.png` — the 182×22 nine-slot hotbar
+//!   at `(0, 0)`, the 24×24 selection frame at `(0, 22)`, and the 20×20
+//!   button sprites;
+//! * `assets/minecraft/textures/gui/icons.png` — the 15×15 crosshair at
+//!   `(0, 0)` and the 9×9 icon cells.
+//!
+//! Sprites are cut out of one packed atlas ([`GuiSprites::atlas`]) and
+//! addressed by name in 0..1 UVs ([`GuiSprites::uv`]), which is exactly what
+//! the HUD's textured pass samples.
+//!
+//! Touch controls use the Bedrock editions' own sprites when they are present
+//! in the pack (`assets/minecraft/textures/gui/bedrock/...`): directional
+//! arrows (`controls/up.png`, `_pressed` variants) and the `ui/` action icons
+//! (jump, sneak, interact, attack). They are prepared privately by
+//! `tools/android_bedrock_controls.py` and never shipped in Git.
+
+use std::collections::BTreeMap;
+
+use crate::atlas::{TextureImage, TextureSource, decode_png};
+
+/// One sprite rectangle inside the packed GUI atlas, in pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GuiSprite {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// The vanilla GUI atlas plus a name → sprite table.
+#[derive(Clone, Debug, Default)]
+pub struct GuiSprites {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+    sprites: BTreeMap<String, GuiSprite>,
+}
+
+/// Where 1.16.5 keeps the widget sheet, and the sprites this HUD uses.
+const WIDGETS: &str = "minecraft/textures/gui/widgets.png";
+const ICONS: &str = "minecraft/textures/gui/icons.png";
+
+/// A slice of a source sheet, copied into the atlas under `name`.
+struct Piece<'a> {
+    sheet: &'a str,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    name: &'a str,
+}
+
+/// The vanilla pieces: hotbar, selection frame and crosshair.
+const VANILLA: &[Piece<'_>] = &[
+    Piece {
+        sheet: WIDGETS,
+        x: 0,
+        y: 0,
+        width: 182,
+        height: 22,
+        name: "hotbar",
+    },
+    Piece {
+        sheet: WIDGETS,
+        x: 0,
+        y: 22,
+        width: 24,
+        height: 24,
+        name: "hotbar_selected",
+    },
+    Piece {
+        sheet: ICONS,
+        x: 0,
+        y: 0,
+        width: 15,
+        height: 15,
+        name: "crosshair",
+    },
+];
+
+/// Bedrock touch sprites, addressed by their pack-relative name.
+const BEDROCK: &[(&str, &str)] = &[
+    ("controls/up.png", "touch_up"),
+    ("controls/up_pressed.png", "touch_up_pressed"),
+    ("controls/down.png", "touch_down"),
+    ("controls/down_pressed.png", "touch_down_pressed"),
+    ("controls/left.png", "touch_left"),
+    ("controls/left_pressed.png", "touch_left_pressed"),
+    ("controls/right.png", "touch_right"),
+    ("controls/right_pressed.png", "touch_right_pressed"),
+    ("controls/sneak_dpad.png", "touch_sneak"),
+    ("controls/sneak_dpad_pressed.png", "touch_sneak_pressed"),
+    ("controls/jump_dpad.png", "touch_jump"),
+    ("controls/jump_dpad_pressed.png", "touch_jump_pressed"),
+    ("ui/interact.png", "touch_place"),
+    ("ui/interact_pressed.png", "touch_place_pressed"),
+    ("ui/attack.png", "touch_attack"),
+    ("ui/attack_pressed.png", "touch_attack_pressed"),
+];
+
+impl GuiSprites {
+    /// Loads the vanilla sheets from `source` and, when the pack has them,
+    /// the Bedrock touch sprites. A missing vanilla sheet is an error; a
+    /// missing Bedrock folder simply leaves the touch HUD in its drawn style.
+    pub fn load(source: &mut dyn TextureSource) -> Result<Self, String> {
+        Self::load_with(source, None)
+    }
+
+    /// Like [`Self::load`], but also reads the Bedrock touch sprites from a
+    /// second source (the extracted vanilla input resources) when one is
+    /// given, before falling back to the pack's own `gui/bedrock` folder.
+    pub fn load_with(
+        source: &mut dyn TextureSource,
+        bedrock: Option<&mut dyn TextureSource>,
+    ) -> Result<Self, String> {
+        let widgets = source
+            .read(WIDGETS)?
+            .ok_or_else(|| format!("{WIDGETS} is not in the pack"))?;
+        let icons = source
+            .read(ICONS)?
+            .ok_or_else(|| format!("{ICONS} is not in the pack"))?;
+        let mut sheets = BTreeMap::new();
+        sheets.insert(WIDGETS, decode_png(&widgets)?);
+        sheets.insert(ICONS, decode_png(&icons)?);
+
+        let mut vanilla_images: Vec<(String, TextureImage)> = Vec::new();
+        let mut sprites = BTreeMap::new();
+        for piece in VANILLA {
+            let sheet = &sheets[piece.sheet];
+            let image = cut(sheet, piece)?;
+            sprites.insert(piece.name.to_owned(), image.0);
+            vanilla_images.push((piece.name.to_owned(), image.1));
+        }
+        // Touch sprites first: they may come from a separate source, and the
+        // vanilla sheets are already held in `sheets` above.
+        let mut bedrock = bedrock;
+        let mut touch_images: Vec<(String, TextureImage)> = Vec::new();
+        let mut touch_sprites = BTreeMap::new();
+        for (path, name) in BEDROCK {
+            let asset = format!("minecraft/textures/gui/bedrock/{path}");
+            let read = match bedrock.as_mut() {
+                Some(other) => other.read(&asset)?.or(source.read(&asset)?),
+                None => source.read(&asset)?,
+            };
+            let Some(bytes) = read else {
+                continue;
+            };
+            let Ok(sheet) = decode_png(&bytes) else {
+                continue;
+            };
+            let piece = Piece {
+                sheet: "",
+                x: 0,
+                y: 0,
+                width: sheet.width,
+                height: sheet.height,
+                name,
+            };
+            let (rect, image) = cut(&sheet, &piece)?;
+            touch_sprites.insert((*name).to_owned(), rect);
+            touch_images.push(((*name).to_owned(), image));
+        }
+        // Pack vanilla first so the hotbar and crosshair sit at the origin of
+        // the atlas, then the optional touch sprites.
+        let mut images = vanilla_images;
+        images.extend(touch_images);
+        sprites.extend(touch_sprites);
+
+        let gap = 1;
+        let (width, placed) = pack(&images, gap);
+        let rows: u32 = images
+            .iter()
+            .zip(&placed)
+            .map(|((_, image), (_, y))| y + image.height)
+            .max()
+            .unwrap_or(1);
+        let height = rows.next_power_of_two().max(64);
+        let mut rgba = vec![0u8; (width * height * 4) as usize];
+        for ((name, image), (x, y)) in images.iter().zip(&placed) {
+            let sprite = sprites.get_mut(name).expect("every image has a sprite");
+            sprite.x = *x;
+            sprite.y = *y;
+            paste(&mut rgba, width, image, *x, *y);
+        }
+        Ok(Self {
+            width,
+            height,
+            rgba,
+            sprites,
+        })
+    }
+
+    /// Adds the Bedrock touch sprites from an already opened
+    /// `bedrock-controls.zip` (prepared by `tools/android_bedrock_controls.py`,
+    /// never committed). Names that are absent simply stay unresolved.
+    pub fn add_bedrock_zip(&mut self, path: &std::path::Path) -> Result<usize, String> {
+        let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let mut archive = zip::ZipArchive::new(file)
+            .map_err(|e| format!("{}: not a zip: {e}", path.display()))?;
+        let mut added = 0;
+        for (pack_path, name) in BEDROCK {
+            let Ok(mut entry) = archive.by_name(pack_path) else {
+                continue;
+            };
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut bytes)
+                .map_err(|e| format!("{}: {e}", pack_path))?;
+            let Ok(image) = decode_png(&bytes) else {
+                continue;
+            };
+            let piece = Piece {
+                sheet: "",
+                x: 0,
+                y: 0,
+                width: image.width,
+                height: image.height,
+                name,
+            };
+            let (rect, image) = cut(&image, &piece)?;
+            let (x, y) = self.append(&image);
+            self.sprites
+                .insert((*name).to_owned(), GuiSprite { x, y, ..rect });
+            added += 1;
+        }
+        Ok(added)
+    }
+
+    /// Places one more image at the right of the atlas, growing its column
+    /// count in powers of two. Returns the top-left pixel.
+    fn append(&mut self, image: &TextureImage) -> (u32, u32) {
+        let x = self
+            .sprites
+            .values()
+            .map(|sprite| sprite.x + sprite.width + 1)
+            .max()
+            .unwrap_or(1);
+        let y = 1;
+        let width = self.width.max(x + image.width + 1);
+        let height = self.height.max(y + image.height + 1);
+        if width != self.width || height != self.height {
+            let mut rgba = vec![0u8; (width * height * 4) as usize];
+            for row in 0..self.height {
+                let from = (row * self.width * 4) as usize;
+                let to = (row * width * 4) as usize;
+                let line = (self.width * 4) as usize;
+                rgba[to..to + line].copy_from_slice(&self.rgba[from..from + line]);
+            }
+            self.rgba = rgba;
+            self.width = width;
+            self.height = height;
+        }
+        paste(&mut self.rgba, self.width, image, x, y);
+        (x, y)
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn rgba(&self) -> &[u8] {
+        &self.rgba
+    }
+
+    pub fn sprite(&self, name: &str) -> Option<GuiSprite> {
+        self.sprites.get(name).copied()
+    }
+
+    /// The sprite rectangle in 0..1 UVs, or `None` when the pack lacks it.
+    pub fn uv(&self, name: &str) -> Option<[f32; 4]> {
+        let sprite = self.sprite(name)?;
+        Some([
+            sprite.x as f32 / self.width as f32,
+            sprite.y as f32 / self.height as f32,
+            (sprite.x + sprite.width) as f32 / self.width as f32,
+            (sprite.y + sprite.height) as f32 / self.height as f32,
+        ])
+    }
+}
+
+/// Cuts `piece` out of `sheet` and returns its atlas rect plus the image.
+fn cut(sheet: &TextureImage, piece: &Piece<'_>) -> Result<(GuiSprite, TextureImage), String> {
+    if piece.x + piece.width > sheet.width || piece.y + piece.height > sheet.height {
+        return Err(format!(
+            "sprite {} ({}x{} at {}, {}) is outside its {sheet_width}x{sheet_height} sheet",
+            piece.name,
+            piece.width,
+            piece.height,
+            piece.x,
+            piece.y,
+            sheet_width = sheet.width,
+            sheet_height = sheet.height,
+        ));
+    }
+    let mut rgba = Vec::with_capacity((piece.width * piece.height * 4) as usize);
+    for row in 0..piece.height {
+        let start = (((piece.y + row) * sheet.width + piece.x) * 4) as usize;
+        let end = start + (piece.width * 4) as usize;
+        rgba.extend_from_slice(&sheet.rgba[start..end]);
+    }
+    Ok((
+        GuiSprite {
+            x: 0,
+            y: 0,
+            width: piece.width,
+            height: piece.height,
+        },
+        TextureImage {
+            width: piece.width,
+            height: piece.height,
+            rgba,
+        },
+    ))
+}
+
+/// Shelf-packs the images and reports each one's top-left corner.
+fn pack(images: &[(String, TextureImage)], gap: u32) -> (u32, Vec<(u32, u32)>) {
+    let widest = images
+        .iter()
+        .map(|(_, image)| image.width)
+        .max()
+        .unwrap_or(1);
+    let area: u64 = images
+        .iter()
+        .map(|(_, image)| u64::from(image.width + gap) * u64::from(image.height + gap))
+        .sum();
+    let mut width = ((area as f64).sqrt().ceil() as u32).max(widest + gap);
+    width = width.max(64).next_power_of_two();
+    let mut placed = Vec::with_capacity(images.len());
+    let (mut x, mut y, mut row_height) = (gap, gap, 0);
+    for (_, image) in images {
+        if x + image.width + gap > width {
+            x = gap;
+            y += row_height + gap;
+            row_height = 0;
+        }
+        placed.push((x, y));
+        x += image.width + gap;
+        row_height = row_height.max(image.height);
+    }
+    (width, placed)
+}
+
+/// Copies an image into the atlas, extruding its edge texels by one pixel so
+/// nearest sampling at a sprite boundary never reads transparent atlas.
+fn paste(atlas: &mut [u8], atlas_width: u32, image: &TextureImage, x: u32, y: u32) {
+    for py in -1..=image.height as i32 {
+        for px in -1..=image.width as i32 {
+            let sx = px.clamp(0, image.width as i32 - 1) as u32;
+            let sy = py.clamp(0, image.height as i32 - 1) as u32;
+            let dx = x as i32 + px;
+            let dy = y as i32 + py;
+            if dx < 0 || dy < 0 || dx >= atlas_width as i32 {
+                continue;
+            }
+            let source = ((sy * image.width + sx) * 4) as usize;
+            let target = ((dy as u32 * atlas_width + dx as u32) * 4) as usize;
+            if let (Some(from), Some(to)) = (
+                image.rgba.get(source..source + 4),
+                atlas.get_mut(target..target + 4),
+            ) {
+                to.copy_from_slice(from);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    /// A pack whose GUI sheets are solid-coloured test images.
+    struct Pack {
+        root: std::path::PathBuf,
+    }
+
+    impl Pack {
+        fn new(with_bedrock: bool) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "horizon-1165-gui-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let gui = root.join("minecraft/textures/gui");
+            std::fs::create_dir_all(&gui).unwrap();
+            write_png(&gui.join("widgets.png"), 256, 256, [10, 20, 30, 255]);
+            write_png(&gui.join("icons.png"), 256, 256, [200, 210, 220, 255]);
+            if with_bedrock {
+                let controls = gui.join("bedrock/controls");
+                std::fs::create_dir_all(&controls).unwrap();
+                write_png(&controls.join("up.png"), 22, 22, [1, 2, 3, 255]);
+                write_png(&controls.join("up_pressed.png"), 22, 22, [4, 5, 6, 255]);
+            }
+            Self { root }
+        }
+    }
+
+    impl Drop for Pack {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn write_png(path: &std::path::Path, width: u32, height: u32, colour: [u8; 4]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut encoder = png::Encoder::new(file, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer
+            .write_image_data(&colour.repeat((width * height) as usize).to_vec())
+            .unwrap();
+        writer.finish().unwrap();
+    }
+
+    #[test]
+    fn vanilla_sprites_keep_their_sizes_and_pixels() {
+        let pack = Pack::new(false);
+        let mut source = crate::atlas::DirectorySource::new(pack.root.join(""));
+        // The source is addressed by `minecraft/textures/...`, so root is the
+        // folder holding `minecraft/`.
+        let sprites = GuiSprites::load(&mut source).unwrap();
+        let hotbar = sprites.sprite("hotbar").unwrap();
+        assert_eq!((hotbar.width, hotbar.height), (182, 22));
+        let selected = sprites.sprite("hotbar_selected").unwrap();
+        assert_eq!((selected.width, selected.height), (24, 24));
+        let crosshair = sprites.sprite("crosshair").unwrap();
+        assert_eq!((crosshair.width, crosshair.height), (15, 15));
+        // Each sheet kept its own colour: widgets are dark, icons are light.
+        let at = |sprite: GuiSprite| {
+            let index = ((sprite.y * sprites.width() + sprite.x) * 4) as usize;
+            sprites.rgba()[index..index + 4].to_vec()
+        };
+        assert_eq!(at(hotbar), vec![10, 20, 30, 255]);
+        assert_eq!(at(crosshair), vec![200, 210, 220, 255]);
+    }
+
+    #[test]
+    fn bedrock_sprites_are_optional() {
+        let pack = Pack::new(true);
+        let mut source = crate::atlas::DirectorySource::new(pack.root.join(""));
+        let sprites = GuiSprites::load(&mut source).unwrap();
+        assert!(sprites.uv("touch_up").is_some());
+        assert!(sprites.uv("touch_up_pressed").is_some());
+        assert!(sprites.uv("touch_down").is_none(), "not in this pack");
+
+        let plain = Pack::new(false);
+        let mut source = crate::atlas::DirectorySource::new(plain.root.join(""));
+        let sprites = GuiSprites::load(&mut source).unwrap();
+        assert!(sprites.uv("touch_up").is_none());
+        assert!(sprites.uv("hotbar").is_some());
+    }
+
+    #[test]
+    fn uvs_stay_inside_the_atlas() {
+        let pack = Pack::new(false);
+        let mut source = crate::atlas::DirectorySource::new(pack.root.join(""));
+        let sprites = GuiSprites::load(&mut source).unwrap();
+        for name in ["hotbar", "hotbar_selected", "crosshair"] {
+            let uv = sprites.uv(name).unwrap();
+            assert!(uv[0] >= 0.0 && uv[2] <= 1.0, "{name}: {uv:?}");
+            assert!(uv[1] >= 0.0 && uv[3] <= 1.0, "{name}: {uv:?}");
+            assert!(uv[2] > uv[0] && uv[3] > uv[1], "{name}: {uv:?}");
+        }
+    }
+}

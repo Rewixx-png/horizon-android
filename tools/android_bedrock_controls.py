@@ -47,7 +47,11 @@ def main():
             archive.writestr(name, data)
             records.append({'path': name, 'source': relative, 'git_blob': expected,
                             'sha256': hashlib.sha256(data).hexdigest()})
-        archive.writestr('LICENSE.md', (work / 'LICENSE.md').read_bytes())
+        # The sparse checkout only materialises the texture folders, so read
+        # the licence straight out of the pinned commit.
+        license_bytes = subprocess.check_output(
+            [*git, 'cat-file', 'blob', f'{REVISION}:LICENSE.md'])
+        archive.writestr('LICENSE.md', license_bytes)
         archive.writestr('provenance.json', json.dumps({'repository': REPOSITORY,
                           'revision': REVISION, 'files': records}, indent=2))
     output.with_suffix('.partial').replace(output)

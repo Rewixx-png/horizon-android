@@ -217,7 +217,7 @@ impl HudSprite {
 /// straight (unpremultiplied) RGBA colour. [`hud_sprite`] builds quads from
 /// these and the sprite pipeline samples the atlas with their UVs.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct SpriteVertex {
     /// Clip space, `-1..=1` on both axes, with `y` pointing up.
     pub position: [f32; 2],
@@ -255,6 +255,60 @@ pub fn sprite_vertices(sprites: &[HudSprite]) -> Vec<SpriteVertex> {
     let mut vertices = Vec::with_capacity(sprites.len() * 6);
     for sprite in sprites {
         vertices.extend_from_slice(&hud_sprite(sprite.rect, sprite.uv, sprite.color));
+    }
+    vertices
+}
+
+/// The GPU vertices for a mixed list: axis-aligned [`HudSprite`]s plus raw
+/// [`SpriteVertex`] triangles (a rotated quad such as the held block). Raw
+/// vertices come first so a caller can append them in any order.
+pub fn sprite_vertex_list(sprites: &[HudSprite], extra: &[SpriteVertex]) -> Vec<SpriteVertex> {
+    let mut vertices = Vec::with_capacity(extra.len() + sprites.len() * 6);
+    vertices.extend_from_slice(extra);
+    vertices.extend_from_slice(&sprite_vertices(sprites));
+    vertices
+}
+
+/// One tilted sprite quad, e.g. the block in the player's hand: the rect is
+/// the sprite's centre and half-size in normalized screen units, `angle` is a
+/// clockwise rotation in radians.
+pub fn hud_sprite_rotated(
+    center: [f32; 2],
+    half: [f32; 2],
+    angle: f32,
+    uv: [f32; 4],
+    color: [f32; 4],
+) -> [SpriteVertex; 6] {
+    let (sin, cos) = angle.sin_cos();
+    let corners: [[f32; 2]; 4] = [
+        [center[0] - half[0], center[1] - half[1]],
+        [center[0] + half[0], center[1] - half[1]],
+        [center[0] + half[0], center[1] + half[1]],
+        [center[0] - half[0], center[1] + half[1]],
+    ];
+    let rotate = |point: [f32; 2]| {
+        let dx = point[0] - center[0];
+        let dy = point[1] - center[1];
+        [
+            center[0] + dx * cos - dy * sin,
+            center[1] + dx * sin + dy * cos,
+        ]
+    };
+    let uv_corners = [
+        [uv[0], uv[1]],
+        [uv[2], uv[1]],
+        [uv[2], uv[3]],
+        [uv[0], uv[3]],
+    ];
+    let mut vertices = [SpriteVertex::default(); 6];
+    let order = [0usize, 1, 2, 0, 2, 3];
+    for (slot, corner) in order.iter().enumerate() {
+        let point = rotate(corners[*corner]);
+        vertices[slot] = SpriteVertex {
+            position: [point[0] * 2.0 - 1.0, 1.0 - point[1] * 2.0],
+            uv: uv_corners[*corner],
+            color,
+        };
     }
     vertices
 }
@@ -1453,6 +1507,24 @@ impl SurfaceRenderer {
         sprites: &[HudSprite],
         light: &[f32],
     ) -> Result<(), RenderError> {
+        self.render_with_hud_gui(mesh, atlas, camera, hud, sprites, light, None, &[])
+    }
+
+    /// [`Self::render_with_hud_lit`] plus a third sprite list sampled from the
+    /// vanilla GUI atlas (`gui::GuiSprites`): hotbar, selection frame,
+    /// crosshair and the Bedrock touch buttons.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_with_hud_gui(
+        &mut self,
+        mesh: &Mesh,
+        atlas: &TextureAtlas,
+        camera: Camera,
+        hud: &[HudVertex],
+        sprites: &[HudSprite],
+        light: &[f32],
+        gui: Option<(&crate::gui::GuiSprites, &[HudSprite])>,
+        hand: &[SpriteVertex],
+    ) -> Result<(), RenderError> {
         let prepared = prepare_mesh(mesh, atlas, light)?;
         // The swapchain is not authoritative: Android can deliver the first
         // `Resized` late or not at all, and may hand back a frame a different
@@ -1592,6 +1664,7 @@ impl SurfaceRenderer {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+        let view_of_frame = view.clone();
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1732,6 +1805,89 @@ impl SurfaceRenderer {
             pass.set_pipeline(&self.hud_sprite_pipeline);
             pass.set_bind_group(0, &sprite_bind_group, &[]);
             pass.set_vertex_buffer(0, sprite_buffer.slice(..));
+            pass.draw(0..vertices.len() as u32, 0..1);
+        }
+        if let Some((gui, gui_sprites)) = gui.filter(|(_, sprites)| !sprites.is_empty()) {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("horizon-1-16-5 gui atlas"),
+                size: wgpu::Extent3d {
+                    width: gui.width(),
+                    height: gui.height(),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            self.queue.write_texture(
+                texture.as_image_copy(),
+                gui.rgba(),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(gui.width() * 4),
+                    rows_per_image: Some(gui.height()),
+                },
+                wgpu::Extent3d {
+                    width: gui.width(),
+                    height: gui.height(),
+                    depth_or_array_layers: 1,
+                },
+            );
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("horizon-1-16-5 gui sampler"),
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                address_mode_w: wgpu::AddressMode::ClampToEdge,
+                mag_filter: wgpu::FilterMode::Nearest,
+                min_filter: wgpu::FilterMode::Nearest,
+                mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+                ..Default::default()
+            });
+            let vertices = sprite_vertex_list(gui_sprites, hand);
+            let buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("horizon-1-16-5 gui sprites"),
+                    contents: bytemuck::cast_slice(&vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("horizon-1-16-5 gui bind group"),
+                layout: &self.hud_sprite_pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                ],
+            });
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("horizon-1-16-5 gui pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view_of_frame,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.hud_sprite_pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_vertex_buffer(0, buffer.slice(..));
             pass.draw(0..vertices.len() as u32, 0..1);
         }
         self.queue.submit([encoder.finish()]);

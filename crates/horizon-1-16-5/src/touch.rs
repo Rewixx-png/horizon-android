@@ -79,7 +79,8 @@ const DIR_DOWN: u8 = 1 << 1;
 const DIR_LEFT: u8 = 1 << 2;
 const DIR_RIGHT: u8 = 1 << 3;
 
-// Subtle translucent white controls, drawn over the world.
+// Subtle translucent white controls, drawn over the world: honest alpha, so
+// the scene keeps showing through instead of a solid black plate.
 const PAD_BUTTON_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.18];
 /// The sneak cell turns cool blue while the sticky flag is set.
 const SNEAK_ACTIVE_COLOR: [f32; 4] = [0.45, 0.85, 1.0, 0.55];
@@ -403,12 +404,41 @@ impl TouchControls {
     /// The side is capped against the screen width so the bar still fits on
     /// unusually narrow surfaces.
     fn hotbar_slot_rect(&self, slot: usize) -> [f32; 4] {
+        let (left, y, side, gap) = self.hotbar_strip();
+        [left + slot as f32 * (side + gap), y, side, side]
+    }
+
+    /// `(left, top, slot side, gap)` of the whole hotbar in pixels: the nine
+    /// slots plus the gaps between them, so a tap anywhere on the bar picks a
+    /// slot and never falls through to the look zone.
+    fn hotbar_strip(&self) -> (f32, f32, f32, f32) {
         let side = (self.min_side() * HOTBAR_SLOT_SIZE).min(self.width * 0.11);
         let gap = side * (HOTBAR_GAP / HOTBAR_SLOT_SIZE);
         let total = side * HOTBAR_SLOTS as f32 + gap * (HOTBAR_SLOTS - 1) as f32;
         let left = (self.width - total) * 0.5;
         let y = self.height - self.min_side() * HOTBAR_BOTTOM - side;
-        [left + slot as f32 * (side + gap), y, side, side]
+        (left, y, side, gap)
+    }
+
+    /// The hotbar slot a touch at `point` selects, if the point is on the bar.
+    ///
+    /// The whole strip counts, gaps included: the slot under the finger is
+    /// the index of the slot cell, clamped to the nine that exist, so the
+    /// edges of the bar still pick slot 0 and slot 8.
+    pub fn hotbar_slot_at(&self, point: [f32; 2]) -> Option<usize> {
+        let (left, top, side, gap) = self.hotbar_strip();
+        if side <= 0.0 {
+            return None;
+        }
+        let total = side * HOTBAR_SLOTS as f32 + gap * (HOTBAR_SLOTS - 1) as f32;
+        if point[0] < left || point[0] > left + total || point[1] < top || point[1] > top + side {
+            return None;
+        }
+        // The bar is nine even cells wide; the gaps between them belong to
+        // whichever slot the finger is closer to.
+        let cell = total / HOTBAR_SLOTS as f32;
+        let index = ((point[0] - left) / cell).floor();
+        Some((index.max(0.0) as usize).min(HOTBAR_SLOTS - 1))
     }
 
     /// Converts a pixel rectangle into normalized screen coordinates.
@@ -475,22 +505,17 @@ impl TouchControls {
         // drag or press a control, even though the bar overlays the tail of
         // the look zone. Selection takes effect immediately and is queued for
         // the next tick.
-        let side = self.hotbar_slot_rect(0)[2];
-        if side > 0.0 {
-            for slot in 0..HOTBAR_SLOTS {
-                if contains(self.hotbar_slot_rect(slot), point) {
-                    self.selected = slot;
-                    self.select = Some(slot);
-                    self.fingers.insert(
-                        id,
-                        Finger {
-                            role: Role::Hotbar,
-                            ..finger
-                        },
-                    );
-                    return;
-                }
-            }
+        if let Some(slot) = self.hotbar_slot_at(point) {
+            self.selected = slot;
+            self.select = Some(slot);
+            self.fingers.insert(
+                id,
+                Finger {
+                    role: Role::Hotbar,
+                    ..finger
+                },
+            );
+            return;
         }
 
         // The jump button is the largest control in the look zone and is
@@ -1401,6 +1426,68 @@ mod tests {
         assert_eq!(controls.frame().select, Some(8));
         controls.touch_at(12, TouchPhase::Ended, point, at(now, 260));
         assert!(!controls.frame().break_block);
+    }
+
+    #[test]
+    fn fifth_hotbar_slot_tap_selects_slot_five() {
+        let mut controls = new_controls();
+        let now = Instant::now();
+        let point = slot_center(&controls, 4);
+        controls.touch_at(31, TouchPhase::Started, point, now);
+        let frame = controls.frame();
+        assert_eq!(frame.select, Some(4), "the fifth slot is index 4");
+        assert_eq!(controls.selected(), 4);
+        assert_eq!(frame.look, [0.0, 0.0]);
+        assert!(!frame.break_block && !frame.place_block && !frame.attack);
+        assert_eq!(frame.movement, Input::default());
+        assert!(controls.hotbar_rects()[4].1, "the frame marks slot 5");
+        assert!(controls.hotbar_rects().iter().filter(|r| r.1).count() == 1);
+    }
+
+    #[test]
+    fn hotbar_gaps_still_select_the_nearer_slot() {
+        // A tap in the gap between slot 4 and slot 5 belongs to one of them
+        // and never falls through to the look zone.
+        let mut controls = new_controls();
+        let now = Instant::now();
+        let (left, top, side, gap) = controls.hotbar_strip();
+        let point = [
+            left + 4.0 * (side + gap) + side + gap * 0.5,
+            top + side * 0.5,
+        ];
+        controls.touch_at(32, TouchPhase::Started, point, now);
+        let frame = controls.frame();
+        assert!(
+            matches!(frame.select, Some(4) | Some(5)),
+            "gap tap must pick a slot, got {:?}",
+            frame.select
+        );
+        assert_eq!(frame.look, [0.0, 0.0]);
+        assert!(!frame.break_block);
+    }
+
+    #[test]
+    fn hotbar_slot_at_covers_the_strip_and_clamps_the_edges() {
+        let controls = new_controls();
+        let (left, top, side, _gap) = controls.hotbar_strip();
+        assert_eq!(controls.hotbar_slot_at([left - 40.0, top]), None);
+        assert_eq!(controls.hotbar_slot_at([left + 1.0, top - 20.0]), None);
+        let last = controls.hotbar_slot_rect(HOTBAR_SLOTS - 1);
+        let right_edge = last[0] + last[2];
+        assert_eq!(
+            controls.hotbar_slot_at([right_edge - 0.5, top + side * 0.5]),
+            Some(HOTBAR_SLOTS - 1)
+        );
+        // Past the bar is dead space, not a selection.
+        assert_eq!(
+            controls.hotbar_slot_at([right_edge + 5.0, top + side * 0.5]),
+            None
+        );
+        // Inside the last cell, however, the clamp holds at the ninth slot.
+        assert_eq!(
+            controls.hotbar_slot_at([right_edge - 1.0, top + side * 0.5]),
+            Some(HOTBAR_SLOTS - 1)
+        );
     }
 
     #[test]

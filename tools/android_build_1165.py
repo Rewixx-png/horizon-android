@@ -7,7 +7,7 @@ the prepared private inputs bundled as ``assets/1165.zip`` (``world/...``,
 ``tables.json`` and ``client.jar`` at the zip root).
 
 The inputs stay in ``.local/`` and never enter Git.  The Rust library is built
-with the workspace's fast profile; APK staging, Gradle's build directory and
+with the workspace's release profile (opt-level 3, thin LTO); APK staging, Gradle's build directory and
 the finished APK all stay under ``.local/android-1165``.  Every APK is signed
 with the repository's committed developer key
 (``packaging/android-1165/keystore/horizon-1165-dev.jks``), so consecutive
@@ -293,9 +293,9 @@ def build(args):
 
     if cargo is not None:
         run([cargo, 'build', '-p', 'horizon-1-16-5', '--lib',
-             '--target', target, '--profile', 'fast'], cwd=ROOT, env=environment)
+             '--target', target, '--release'], cwd=ROOT, env=environment)
 
-    library = target_dir / target / 'fast' / LIBRARY_NAME
+    library = target_dir / target / 'release' / LIBRARY_NAME
     staging = LOCAL / 'gradle-jni' / abi
     staging.mkdir(parents=True, exist_ok=True)
     staged_library = staging / LIBRARY_NAME
@@ -364,7 +364,7 @@ def main(argv=None):
     parser.add_argument('--gradle', type=Path,
                         help='Gradle 8.13-8.x executable (otherwise discover it)')
     parser.add_argument('--skip-rust', action='store_true',
-                        help='Reuse the existing cargo fast-profile library')
+                        help='Reuse the existing cargo release library')
     parser.add_argument('--keystore', type=Path,
                         help='Signing keystore override (default: the committed '
                              'packaging/android-1165/keystore/horizon-1165-dev.jks)')

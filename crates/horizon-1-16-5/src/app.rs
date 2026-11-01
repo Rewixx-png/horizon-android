@@ -490,6 +490,12 @@ struct PlayState {
     radius: i32,
     frames_limit: u32,
     frames_presented: u32,
+    /// Frames counted in the current one-second FPS window, and when it
+    /// started. The counter is redrawn once a second so the text is not
+    /// rebuilt every frame.
+    fps_frames: u32,
+    fps_window: Instant,
+    fps_shown: u32,
     cursor_grabbed: bool,
     movement: Input,
     /// Virtual joystick, look area and place button. Fed by touch events and
@@ -862,6 +868,7 @@ impl PlayApp {
         let Some(state) = self.state.as_mut() else {
             return Ok(());
         };
+        let now_frame = Instant::now();
         let camera = camera_for_with_bob(&state.server.player, state.bob_phase);
         let size = state.window.inner_size();
         // Keyboard digits, the wheel and touch all converge on the active
@@ -964,6 +971,24 @@ impl PlayApp {
                 size.height as f32,
             );
         }
+        if let Some(gui) = state.gui.as_ref() {
+            // One extra GUI pixel of padding from the top-left corner.
+            let scale = state
+                .gui_sprites
+                .iter()
+                .find_map(|sprite| (sprite.name == "hotbar").then_some(sprite.rect[3] / 22.0));
+            let scale = scale.unwrap_or(2.0).max(1.0);
+            let label = format!("{} fps", state.fps_shown);
+            debug_text(
+                &mut state.gui_sprites,
+                gui,
+                &label,
+                4.0 * scale,
+                4.0 * scale,
+                scale,
+                0.95,
+            );
+        }
         state
             .renderer
             .render_with_hud_gui(
@@ -981,6 +1006,16 @@ impl PlayApp {
             )
             .map_err(|error| error.to_string())?;
         state.frames_presented += 1;
+        state.fps_frames += 1;
+        let window = now_frame.saturating_duration_since(state.fps_window);
+        if window.as_secs_f32() >= 1.0 && state.fps_frames > 0 {
+            state.fps_shown = (state.fps_frames as f32 / window.as_secs_f32()).round() as u32;
+            state.fps_frames = 0;
+            state.fps_window = now_frame;
+            if std::env::var_os("HORIZON_1165_FPS_LOG").is_some() {
+                println!("fps {}", state.fps_shown);
+            }
+        }
         if state.frames_limit > 0 && state.frames_presented >= state.frames_limit {
             println!("rendered {} frames", state.frames_presented);
             event_loop.exit();
@@ -1142,6 +1177,9 @@ impl ApplicationHandler for PlayApp {
             radius: pending.radius,
             frames_limit: pending.frames,
             frames_presented: 0,
+            fps_frames: 0,
+            fps_window: Instant::now(),
+            fps_shown: 0,
             cursor_grabbed: true,
             movement: Input::default(),
             touch,
@@ -1200,6 +1238,17 @@ impl ApplicationHandler for PlayApp {
                 if let Err(error) = self.render(event_loop) {
                     self.error = Some(error);
                     event_loop.exit();
+                    return;
+                }
+                // Keep the render thread fed: the frame just presented is
+                // replaced by the next one as soon as the compositor (or the
+                // mailbox) is ready, so the game is not pinned to the 20 Hz
+                // tick rate. Android has no vsync callback, so this is also
+                // what drives the surface on devices without a redraw loop.
+                if let Some(state) = self.state.as_ref()
+                    && (state.frames_limit == 0 || state.frames_presented < state.frames_limit)
+                {
+                    state.window.request_redraw();
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => self.key(event_loop, event),
@@ -1347,9 +1396,11 @@ impl ApplicationHandler for PlayApp {
         if save_due(state.last_save, now) {
             state.save(now);
         }
-        if ticks > 0 {
-            state.window.request_redraw();
-        }
+        // Render every frame, not once per 20 Hz tick: the tick loop keeps
+        // the simulation at vanilla speed while the render thread runs at the
+        // display's rate. Redraws are coalesced, so this waits on the next
+        // vsync (Fifo) or mailbox signal instead of spinning.
+        state.window.request_redraw();
         event_loop.set_control_flow(ControlFlow::WaitUntil(state.last_tick + TICK));
     }
 
@@ -1876,6 +1927,44 @@ fn hotbar_icons(
             ],
             uv,
         ));
+    }
+}
+
+/// Draws `text` in the GUI atlas at the GUI scale, starting at `(x, y)` in
+/// GUI pixels, with vanilla's one-pixel shadow. Used for the FPS counter and
+/// any other debug line the HUD shows.
+fn debug_text(
+    gui_sprites: &mut Vec<HudSprite>,
+    gui: &crate::gui::GuiSprites,
+    text: &str,
+    x: f32,
+    y: f32,
+    scale: f32,
+    alpha: f32,
+) {
+    let mut cursor = x;
+    for byte in text.bytes() {
+        let shadow = crate::font::sprite_name(byte, true);
+        if let Some(uv) = gui.uv(&shadow) {
+            gui_sprites.push(HudSprite::named(
+                [cursor + scale, y + scale, 8.0 * scale, 8.0 * scale],
+                shadow,
+                uv,
+                true,
+                [0.0, 0.0, 0.0, 0.55 * alpha],
+            ));
+        }
+        let glyph = crate::font::sprite_name(byte, false);
+        if let Some(uv) = gui.uv(&glyph) {
+            gui_sprites.push(HudSprite::named(
+                [cursor, y, 8.0 * scale, 8.0 * scale],
+                glyph,
+                uv,
+                true,
+                [0.75, 1.0, 0.75, alpha],
+            ));
+        }
+        cursor += gui.advance(byte) as f32 * scale;
     }
 }
 

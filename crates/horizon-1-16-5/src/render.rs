@@ -599,8 +599,6 @@ impl OffscreenRenderer {
         if width == 0 || height == 0 {
             return Err(RenderError::Failed("frame size must be non-zero".into()));
         }
-        let prepared = prepare_mesh(mesh, atlas, light)?;
-
         let view_proj = view_projection(camera, width as f32 / height as f32, mesh);
         let uniform = CameraUniform {
             view_proj,
@@ -613,63 +611,14 @@ impl OffscreenRenderer {
                 contents: bytemuck::bytes_of(&uniform),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
-        let vertex_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("horizon-1-16-5 vertices"),
-                contents: bytemuck::cast_slice(&prepared.vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-        let opaque_indices = index_buffer(
-            &self.device,
-            "horizon-1-16-5 opaque indices",
-            &prepared.opaque_indices,
-        );
-        let translucent_indices = index_buffer(
-            &self.device,
-            "horizon-1-16-5 translucent indices",
-            &prepared.translucent_indices,
-        );
-
-        let atlas_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("horizon-1-16-5 atlas"),
-            size: wgpu::Extent3d {
-                width: atlas.width(),
-                height: atlas.height(),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        self.queue.write_texture(
-            atlas_texture.as_image_copy(),
-            atlas.rgba(),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(atlas.width().max(1) * 4),
-                rows_per_image: Some(atlas.height().max(1)),
-            },
-            wgpu::Extent3d {
-                width: atlas.width(),
-                height: atlas.height(),
-                depth_or_array_layers: 1,
-            },
-        );
-        let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("horizon-1-16-5 atlas sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
+        // One upload per installed mesh, not per frame: rebuilding the atlas
+        // texture and every buffer each frame dominated the frame time.
+        let world = WorldResources::build(&self.device, &self.queue, mesh, atlas, light)?;
+        let vertex_buffer = &world.vertices;
+        let opaque_indices = world.opaque_indices.as_ref();
+        let translucent_indices = world.translucent_indices.as_ref();
+        let atlas_view = &world.atlas_view;
+        let sampler = &world.sampler;
         // The two world pipelines get their own auto-generated bind group
         // layouts, so the same camera/texture/sampler resources are bound
         // once per pipeline.
@@ -684,11 +633,11 @@ impl OffscreenRenderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&atlas_view),
+                        resource: wgpu::BindingResource::TextureView(atlas_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&sampler),
+                        resource: wgpu::BindingResource::Sampler(sampler),
                     },
                 ],
             })
@@ -774,7 +723,7 @@ impl OffscreenRenderer {
                 pass.set_bind_group(0, &opaque_bind_group, &[]);
                 pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                 pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..prepared.opaque_indices.len() as u32, 0, 0..1);
+                pass.draw_indexed(0..world.opaque_count, 0, 0..1);
             }
         }
         if let Some(indices) = &translucent_indices {
@@ -805,7 +754,7 @@ impl OffscreenRenderer {
             pass.set_bind_group(0, &translucent_bind_group, &[]);
             pass.set_vertex_buffer(0, vertex_buffer.slice(..));
             pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..prepared.translucent_indices.len() as u32, 0, 0..1);
+            pass.draw_indexed(0..world.translucent_count, 0, 0..1);
         }
         encoder.copy_texture_to_buffer(
             target.as_image_copy(),
@@ -1564,8 +1513,141 @@ pub struct SurfaceRenderer {
     gui_pipeline: wgpu::RenderPipeline,
     gui_layout: wgpu::BindGroupLayout,
     format: wgpu::TextureFormat,
+    /// Mailbox when the surface offers it, Fifo otherwise: the render thread
+    /// then hands over the newest frame without waiting on the previous one.
+    present_mode: wgpu::PresentMode,
     size: [u32; 2],
     depth: wgpu::TextureView,
+    /// Uploaded world atlas and geometry, rebuilt only when the world does.
+    world: Option<WorldResources>,
+    /// The 64-byte camera uniform, rewritten in place every frame.
+    camera_buffer: Option<wgpu::Buffer>,
+    /// Bind groups over `world` and `camera_buffer`; dropped when the world
+    /// is rebuilt. Cloning a bind group is a handle copy.
+    world_bind_groups: Option<(wgpu::BindGroup, wgpu::BindGroup)>,
+}
+
+/// GPU copies of the world that only change when a new mesh is installed.
+struct WorldResources {
+    mesh_key: [usize; 3],
+    atlas_key: [usize; 4],
+    atlas_view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+    vertices: wgpu::Buffer,
+    opaque_indices: Option<wgpu::Buffer>,
+    translucent_indices: Option<wgpu::Buffer>,
+    opaque_count: u32,
+    translucent_count: u32,
+}
+
+impl WorldResources {
+    fn build(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mesh: &Mesh,
+        atlas: &TextureAtlas,
+        light: &[f32],
+    ) -> Result<Self, RenderError> {
+        let prepared = prepare_mesh(mesh, atlas, light)?;
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("horizon-1-16-5 atlas"),
+            size: wgpu::Extent3d {
+                width: atlas.width().max(1),
+                height: atlas.height().max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            texture.as_image_copy(),
+            atlas.rgba(),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(atlas.width().max(1) * 4),
+                rows_per_image: Some(atlas.height().max(1)),
+            },
+            wgpu::Extent3d {
+                width: atlas.width().max(1),
+                height: atlas.height().max(1),
+                depth_or_array_layers: 1,
+            },
+        );
+        let atlas_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("horizon-1-16-5 atlas sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        let vertices = if prepared.vertices.is_empty() {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("horizon-1-16-5 vertices"),
+                size: 16,
+                usage: wgpu::BufferUsages::VERTEX,
+                mapped_at_creation: false,
+            })
+        } else {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("horizon-1-16-5 vertices"),
+                contents: bytemuck::cast_slice(&prepared.vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+        };
+        let keys = Self::keys(mesh, atlas, light);
+        Ok(Self {
+            mesh_key: keys.0,
+            atlas_key: keys.1,
+            atlas_view,
+            sampler,
+            vertices,
+            opaque_count: prepared.opaque_indices.len() as u32,
+            translucent_count: prepared.translucent_indices.len() as u32,
+            opaque_indices: index_buffer(
+                device,
+                "horizon-1-16-5 opaque indices",
+                &prepared.opaque_indices,
+            ),
+            translucent_indices: index_buffer(
+                device,
+                "horizon-1-16-5 translucent indices",
+                &prepared.translucent_indices,
+            ),
+        })
+    }
+
+    /// Identity of the inputs a build consumed: the mesh and light buffers by
+    /// address and length, the atlas by address and size. A new mesh from the
+    /// worker always lands in a new allocation, so this misses exactly when
+    /// the world changed.
+    fn keys(mesh: &Mesh, atlas: &TextureAtlas, light: &[f32]) -> ([usize; 3], [usize; 4]) {
+        (
+            [
+                mesh.vertices.as_ptr() as usize,
+                mesh.vertices.len(),
+                light.as_ptr() as usize,
+            ],
+            [
+                atlas.rgba().as_ptr() as usize,
+                atlas.rgba().len(),
+                atlas.width() as usize,
+                atlas.height() as usize,
+            ],
+        )
+    }
+
+    fn matches(&self, mesh: &Mesh, atlas: &TextureAtlas, light: &[f32]) -> bool {
+        let (mesh_key, atlas_key) = Self::keys(mesh, atlas, light);
+        self.mesh_key == mesh_key && self.atlas_key == atlas_key
+    }
 }
 
 impl SurfaceRenderer {
@@ -1628,6 +1710,14 @@ impl SurfaceRenderer {
             "horizon-1-16-5 surface hud sprite pipeline",
             format,
         );
+        let present_mode = if capabilities
+            .present_modes
+            .contains(&wgpu::PresentMode::Mailbox)
+        {
+            wgpu::PresentMode::Mailbox
+        } else {
+            wgpu::PresentMode::Fifo
+        };
         let (gui_pipeline, gui_layout) =
             create_gui_pipeline(&device, "horizon-1-16-5 surface gui pipeline", format);
         let depth = create_depth(&device, size[0], size[1]);
@@ -1642,8 +1732,12 @@ impl SurfaceRenderer {
             gui_pipeline,
             gui_layout,
             format,
+            present_mode,
             size,
             depth,
+            world: None,
+            camera_buffer: None,
+            world_bind_groups: None,
         };
         renderer.configure();
         Ok(renderer)
@@ -1740,7 +1834,6 @@ impl SurfaceRenderer {
         gui: Option<(&crate::gui::GuiSprites, &[HudSprite])>,
         _hand: &[SpriteVertex],
     ) -> Result<(), RenderError> {
-        let prepared = prepare_mesh(mesh, atlas, light)?;
         // The swapchain is not authoritative: Android can deliver the first
         // `Resized` late or not at all, and may hand back a frame a different
         // size than the surface was configured with. The acquired frame is
@@ -1780,101 +1873,80 @@ impl SurfaceRenderer {
             view_proj,
             eye: [camera.eye[0], camera.eye[1], camera.eye[2], 1.0],
         };
-        let uniform_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("horizon-1-16-5 camera"),
-                contents: bytemuck::bytes_of(&uniform),
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            });
-        let vertex_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("horizon-1-16-5 vertices"),
-                contents: bytemuck::cast_slice(&prepared.vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-        let opaque_indices = index_buffer(
-            &self.device,
-            "horizon-1-16-5 opaque indices",
-            &prepared.opaque_indices,
-        );
-        let translucent_indices = index_buffer(
-            &self.device,
-            "horizon-1-16-5 translucent indices",
-            &prepared.translucent_indices,
-        );
-
-        let atlas_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("horizon-1-16-5 atlas"),
-            size: wgpu::Extent3d {
-                width: atlas.width(),
-                height: atlas.height(),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        self.queue.write_texture(
-            atlas_texture.as_image_copy(),
-            atlas.rgba(),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(atlas.width().max(1) * 4),
-                rows_per_image: Some(atlas.height().max(1)),
-            },
-            wgpu::Extent3d {
-                width: atlas.width(),
-                height: atlas.height(),
-                depth_or_array_layers: 1,
-            },
-        );
-        let atlas_view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("horizon-1-16-5 atlas sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
-        // The two world pipelines get their own auto-generated bind group
-        // layouts, so the same camera/texture/sampler resources are bound
-        // once per pipeline.
-        let create_bind_group = |label: &str, layout: &wgpu::BindGroupLayout| {
-            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
-                layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: uniform_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&atlas_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&sampler),
-                    },
-                ],
-            })
+        // The camera moves every frame, so only its 64 bytes are rewritten
+        // into a buffer that lives across frames; the atlas, its sampler,
+        // the vertex data and the bind groups are rebuilt only when the world
+        // or the surface size changes.
+        let uniform_buffer = match &self.camera_buffer {
+            Some(buffer) => buffer.clone(),
+            None => {
+                let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("horizon-1-16-5 camera"),
+                    size: std::mem::size_of::<CameraUniform>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.camera_buffer = Some(buffer.clone());
+                buffer
+            }
         };
-        let opaque_bind_group = create_bind_group(
-            "horizon-1-16-5 opaque bind group",
-            &self.pipeline.get_bind_group_layout(0),
-        );
-        let translucent_bind_group = create_bind_group(
-            "horizon-1-16-5 translucent bind group",
-            &self.translucent_pipeline.get_bind_group_layout(0),
-        );
+        self.queue
+            .write_buffer(&uniform_buffer, 0, bytemuck::bytes_of(&uniform));
+        let stale = self
+            .world
+            .as_ref()
+            .is_none_or(|world| !world.matches(mesh, atlas, light));
+        if stale {
+            self.world = Some(WorldResources::build(
+                &self.device,
+                &self.queue,
+                mesh,
+                atlas,
+                light,
+            )?);
+            self.world_bind_groups = None;
+        }
+        let world = self.world.as_ref().expect("world resources exist");
+        let vertex_buffer = &world.vertices;
+        let opaque_indices = world.opaque_indices.as_ref();
+        let translucent_indices = world.translucent_indices.as_ref();
+        let (opaque_bind_group, translucent_bind_group) = match self.world_bind_groups.as_ref() {
+            Some(groups) => groups.clone(),
+            None => {
+                let create_bind_group = |label: &str, layout: &wgpu::BindGroupLayout| {
+                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(label),
+                        layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: uniform_buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(&world.atlas_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::Sampler(&world.sampler),
+                            },
+                        ],
+                    })
+                };
+                let groups = (
+                    create_bind_group(
+                        "horizon-1-16-5 opaque bind group",
+                        &self.pipeline.get_bind_group_layout(0),
+                    ),
+                    create_bind_group(
+                        "horizon-1-16-5 translucent bind group",
+                        &self.translucent_pipeline.get_bind_group_layout(0),
+                    ),
+                );
+                self.world_bind_groups = Some(groups.clone());
+                groups
+            }
+        };
 
         let view = frame
             .texture
@@ -1914,7 +1986,7 @@ impl SurfaceRenderer {
                 pass.set_bind_group(0, &opaque_bind_group, &[]);
                 pass.set_vertex_buffer(0, vertex_buffer.slice(..));
                 pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..prepared.opaque_indices.len() as u32, 0, 0..1);
+                pass.draw_indexed(0..world.opaque_count, 0, 0..1);
             }
         }
         if let Some(indices) = &translucent_indices {
@@ -1945,7 +2017,7 @@ impl SurfaceRenderer {
             pass.set_bind_group(0, &translucent_bind_group, &[]);
             pass.set_vertex_buffer(0, vertex_buffer.slice(..));
             pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..prepared.translucent_indices.len() as u32, 0, 0..1);
+            pass.draw_indexed(0..world.translucent_count, 0, 0..1);
         }
         if !hud.is_empty() {
             let hud_buffer = self
@@ -1999,11 +2071,11 @@ impl SurfaceRenderer {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&atlas_view),
+                        resource: wgpu::BindingResource::TextureView(&world.atlas_view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&sampler),
+                        resource: wgpu::BindingResource::Sampler(&world.sampler),
                     },
                 ],
             });
@@ -2088,7 +2160,7 @@ impl SurfaceRenderer {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&sampler),
+                        resource: wgpu::BindingResource::Sampler(&world.sampler),
                     },
                 ],
             });
@@ -2134,7 +2206,7 @@ impl SurfaceRenderer {
                 color_space: wgpu::SurfaceColorSpace::Auto,
                 width: self.size[0],
                 height: self.size[1],
-                present_mode: wgpu::PresentMode::Fifo,
+                present_mode: self.present_mode,
                 desired_maximum_frame_latency: 2,
                 alpha_mode: wgpu::CompositeAlphaMode::Auto,
                 view_formats: vec![],

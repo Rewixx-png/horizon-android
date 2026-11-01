@@ -8,13 +8,31 @@
 use crate::light::{BlockLightSource, LightSampler, ambient_occlusion};
 use crate::{BlockSource, Face, Mesh, ModelSource, Vertex};
 
-/// The three block states that count as transparent for face culling.
-/// Opacity-aware culling (e.g. treating glass, leaves, water as
-/// non-occluding) is future work; today every other neighbor hides the face.
+/// The three block states that count as empty space in the world.
 const AIR_NAMES: [&str; 3] = ["minecraft:air", "minecraft:cave_air", "minecraft:void_air"];
 
 fn is_air(name: &str) -> bool {
     AIR_NAMES.contains(&name)
+}
+
+/// Whether `name` is a see-through block whose own faces must still be drawn
+/// against a neighbour of the same kind (vanilla's implicit shape/canOcclude
+/// rules): glass, ice, water and the other transparent cubes.
+///
+/// Two touching glass blocks face each other with two coincident quads in
+/// vanilla, which is what makes a wall of glass read as a single sheet with
+/// no seam; unlike an opaque neighbour, the far pane must not hide the near
+/// one. `is_translucent_texture` names are the ones the renderer blends.
+fn is_see_through(name: &str) -> bool {
+    let path = name.strip_prefix("minecraft:").unwrap_or(name);
+    let sprite = path.strip_prefix("block/").unwrap_or(path);
+    sprite
+        .split('_')
+        .any(|token| matches!(token, "glass" | "water" | "ice" | "slime" | "honey"))
+        || matches!(
+            path,
+            "glass_pane" | "tinted_glass" | "beacon" | "seagrass" | "kelp"
+        )
 }
 
 /// Mesh every block in the box `min..min+size` (block units, exclusive on the
@@ -91,7 +109,19 @@ fn mesh_impl(
                             pos[1] + offset[1],
                             pos[2] + offset[2],
                         ) {
-                            if !is_air(&neighbor.name) {
+                            // An opaque neighbour hides the face. So does an
+                            // identical see-through block (glass on glass):
+                            // the two coincident quads would only double the
+                            // blend, and dropping both leaves the pane grid
+                            // without inner walls.
+                            let hidden = if is_air(&neighbor.name) {
+                                false
+                            } else if is_see_through(&state.name) {
+                                neighbor.name == state.name
+                            } else {
+                                true
+                            };
+                            if hidden {
                                 continue;
                             }
                         }
@@ -341,6 +371,55 @@ mod tests {
         assert_eq!(quads.len(), 5);
         assert!(quads.iter().any(|q| q.iter().all(|v| v.position[1] == 0.0)));
         assert!(!quads.iter().any(|q| q.iter().all(|v| v.position[1] == 1.0)));
+        assert_consistent_winding(&mesh);
+    }
+
+    /// Bakes the unit cube for stone and glass alike; every other state has
+    /// no model, which is how the real pack represents air.
+    struct GlassModels;
+
+    impl ModelSource for GlassModels {
+        fn model(&self, state: &BlockState) -> Option<BakedModel> {
+            matches!(state.name.as_str(), "minecraft:stone" | "minecraft:glass").then(cube_model)
+        }
+    }
+
+    fn glass() -> BlockState {
+        BlockState::new("minecraft:glass")
+    }
+
+    #[test]
+    fn glass_next_to_glass_shares_no_inner_wall() {
+        // A 2x1x1 strip of glass: the two touching faces must both be gone,
+        // leaving ten quads (6 + 6 minus the shared pair) and no quad on the
+        // plane between the blocks.
+        let mut source = MapSource::default();
+        source.states.insert([0, 0, 0], glass());
+        source.states.insert([1, 0, 0], glass());
+        let mesh = mesh_box(&source, &GlassModels, [0, 0, 0], [2, 1, 1]);
+        assert_eq!(mesh.vertices.len(), 10 * 4, "ten quads survive");
+        assert!(
+            !mesh
+                .vertices
+                .chunks_exact(4)
+                .any(|quad| quad.iter().all(|v| v.position[0] == 1.0)),
+            "no quad sits on the seam between the two panes"
+        );
+
+        // A glass block against stone keeps its face: the stone is opaque.
+        let mut source = MapSource::default();
+        source.states.insert([0, 0, 0], glass());
+        source.states.insert([1, 0, 0], stone());
+        let mesh = mesh_box(&source, &GlassModels, [0, 0, 0], [2, 1, 1]);
+        assert_eq!(mesh.vertices.len(), 11 * 4, "only the shared pair goes");
+    }
+
+    #[test]
+    fn glass_next_to_air_keeps_every_face() {
+        let mut source = MapSource::default();
+        source.states.insert([0, 0, 0], glass());
+        let mesh = mesh_box(&source, &GlassModels, [0, 0, 0], [1, 1, 1]);
+        assert_eq!(mesh.vertices.len(), 24);
         assert_consistent_winding(&mesh);
     }
 

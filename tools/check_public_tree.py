@@ -13,6 +13,11 @@ ORIGINAL_JDK_TOOLS = {"tools/JfrSummary.java", "tests/java/JfrFixture.java"}
 ANDROID_RESULT_BRIDGE = "packaging/android/java/dev/horizon/android/HorizonActivity.java"
 ANDROID_DOCUMENTS_BRIDGE = "packaging/android/java/dev/horizon/android/HorizonDocumentsProvider.java"
 ANDROID_UPDATE_BRIDGE = "packaging/android/java/dev/horizon/android/HorizonUpdateProvider.java"
+# The separate 1.16.5 slice ships its own NativeActivity host and the development
+# key that keeps its APK updatable in place; both are original Horizon code, in
+# history only (removed from the tree since).
+ANDROID_1165_HOST = "packaging/android-1165/java/dev/horizon/android1165/Horizon1165Activity.java"
+ANDROID_1165_KEY = "packaging/android-1165/keystore/horizon-1165-dev.jks"
 
 
 def prohibited(path):
@@ -29,6 +34,8 @@ def prohibited(path):
         ANDROID_RESULT_BRIDGE,
         ANDROID_DOCUMENTS_BRIDGE,
         ANDROID_UPDATE_BRIDGE,
+        ANDROID_1165_HOST,
+        ANDROID_1165_KEY,
     }:
         return False
     # Original Horizon mod sources may also be tracked.

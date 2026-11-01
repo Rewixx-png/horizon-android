@@ -1,6 +1,7 @@
 //! Multi-chunk mesh building for the 1.16.5 target.
 
 use crate::assets::ModelPack;
+use crate::light::BlockLightSource;
 use crate::world::World;
 use crate::{BlockSource, BlockState, BlockTable, Mesh, ModelSource};
 use std::collections::HashMap;
@@ -11,6 +12,17 @@ use std::time::Instant;
 /// Meshes one full 16x256x16 column at chunk coordinates `(x, z)`.
 pub fn mesh_chunk(world: &dyn BlockSource, models: &dyn ModelSource, x: i32, z: i32) -> Mesh {
     crate::mesh::mesh_box(world, models, [x * 16, 0, z * 16], [16, 256, 16])
+}
+
+/// [`mesh_chunk`] with per-vertex 1.16.5 light and ambient occlusion.
+pub fn mesh_chunk_lit(
+    world: &dyn BlockSource,
+    models: &dyn ModelSource,
+    light: &dyn BlockLightSource,
+    x: i32,
+    z: i32,
+) -> (Mesh, Vec<f32>) {
+    crate::mesh::mesh_box_lit(world, models, light, [x * 16, 0, z * 16], [16, 256, 16])
 }
 
 /// Merges meshes whose vertices already use world coordinates.
@@ -68,6 +80,26 @@ pub fn mesh_around(
     merge(meshes)
 }
 
+/// [`mesh_around`] with light: the merged mesh and one light value per
+/// vertex, in the same order.
+pub fn mesh_around_lit(
+    world: &dyn BlockSource,
+    models: &dyn ModelSource,
+    light: &dyn BlockLightSource,
+    center: [i32; 2],
+    radius: i32,
+) -> (Mesh, Vec<f32>) {
+    let chunks = chunks_around(center, radius);
+    let mut meshes = Vec::with_capacity(chunks.len());
+    let mut levels = Vec::new();
+    for [x, z] in chunks {
+        let (mesh, lit) = mesh_chunk_lit(world, models, light, x, z);
+        levels.extend_from_slice(&lit);
+        meshes.push(mesh);
+    }
+    (merge(meshes), levels)
+}
+
 /// The chunks [`mesh_around`] visits for a block-column `center`, in the
 /// order it visits them.
 pub fn chunks_around(center: [i32; 2], radius: i32) -> Vec<[i32; 2]> {
@@ -114,6 +146,8 @@ enum SnapshotStates {
 pub struct WorldSnapshot {
     chunks: HashMap<[i32; 2], Vec<u16>>,
     states: SnapshotStates,
+    /// Packed `(sky << 4) | block` pairs, 4096 per captured chunk.
+    light: HashMap<[i32; 2], Vec<u8>>,
 }
 
 impl WorldSnapshot {
@@ -167,6 +201,7 @@ impl WorldSnapshot {
         Self {
             chunks: captured,
             states: SnapshotStates::Interned(states),
+            light: HashMap::new(),
         }
     }
 
@@ -193,9 +228,28 @@ impl WorldSnapshot {
             }
             captured.insert(chunk, data);
         }
+        let mut light = HashMap::with_capacity(captured.len());
+        for &chunk in captured.keys() {
+            let Some(column) = world.chunk(chunk[0], chunk[1]) else {
+                continue;
+            };
+            let mut packed = vec![0u8; CHUNK_VOLUME];
+            for y in 0..256 {
+                for z in 0..16 {
+                    for x in 0..16 {
+                        if let Some([sky, block]) = column.light(x, y, z) {
+                            packed[chunk_index(x as usize, y as usize, z as usize)] =
+                                sky << 4 | block;
+                        }
+                    }
+                }
+            }
+            light.insert(chunk, packed);
+        }
         Self {
             chunks: captured,
             states: SnapshotStates::Table(table.clone()),
+            light,
         }
     }
 
@@ -203,6 +257,26 @@ impl WorldSnapshot {
         match &self.states {
             SnapshotStates::Interned(states) => states.get(usize::from(id)).cloned(),
             SnapshotStates::Table(table) => table.state(id).cloned(),
+        }
+    }
+}
+
+impl crate::light::BlockLightSource for WorldSnapshot {
+    /// Captured light; a chunk without captured light reads as open sky.
+    fn light_at(&self, x: i32, y: i32, z: i32) -> Option<[u8; 2]> {
+        if !(0..256).contains(&y) {
+            return None;
+        }
+        match self.light.get(&[x.div_euclid(16), z.div_euclid(16)]) {
+            Some(packed) => {
+                let value = packed[chunk_index(
+                    x.rem_euclid(16) as usize,
+                    y as usize,
+                    z.rem_euclid(16) as usize,
+                )];
+                Some([value >> 4, value & 15])
+            }
+            None => Some([15, 0]),
         }
     }
 }
@@ -234,12 +308,12 @@ impl BlockSource for WorldSnapshot {
 /// The worker's pure meshing entry point. Kept as a separate name so the
 /// background path cannot accidentally diverge from [`mesh_around`].
 pub fn mesh_snapshot(
-    snapshot: &dyn BlockSource,
+    snapshot: &WorldSnapshot,
     models: &dyn ModelSource,
     center: [i32; 2],
     radius: i32,
-) -> Mesh {
-    mesh_around(snapshot, models, center, radius)
+) -> (Mesh, Vec<f32>) {
+    mesh_around_lit(snapshot, models, snapshot, center, radius)
 }
 
 /// One chunk remesh request handed to the worker.
@@ -257,6 +331,8 @@ pub struct MeshJob {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MeshResult {
     pub mesh: Mesh,
+    /// One 1.16.5 light value per vertex, parallel to `mesh.vertices`.
+    pub light: Vec<f32>,
     pub textures: Vec<String>,
     pub generation: u64,
     /// Wall-clock time the mesher spent on this job.
@@ -312,11 +388,12 @@ impl MeshWorker {
             .spawn(move || {
                 while let Ok(WorkerJob { snapshot, job }) = job_rx.recv() {
                     let started = Instant::now();
-                    let mesh = mesh_snapshot(&*snapshot, &models, job.center, job.radius);
+                    let (mesh, light) = mesh_snapshot(&snapshot, &models, job.center, job.radius);
                     let textures = mesh.textures.clone();
                     let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                     let result = MeshResult {
                         mesh,
+                        light,
                         textures,
                         generation: job.generation,
                         millis,
@@ -658,7 +735,7 @@ mod tests {
         let snapshot = WorldSnapshot::capture(&world, &chunks);
 
         let direct = mesh_around(&world, &StoneModels, [0, 0], 1);
-        let through_snapshot = mesh_snapshot(&snapshot, &StoneModels, [0, 0], 1);
+        let (through_snapshot, _) = mesh_snapshot(&snapshot, &StoneModels, [0, 0], 1);
         assert_eq!(through_snapshot, direct);
         assert!(!through_snapshot.vertices.is_empty());
     }

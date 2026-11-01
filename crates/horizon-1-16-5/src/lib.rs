@@ -15,6 +15,7 @@ pub mod interact;
 pub mod inventory;
 pub mod inventory_ui;
 pub mod item_icons;
+pub mod light;
 pub mod loot;
 pub mod mesh;
 pub mod player;

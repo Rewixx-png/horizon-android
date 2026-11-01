@@ -17,13 +17,13 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::assets::ModelPack;
-use crate::atlas::{TextureAtlas, VanillaAssets};
+use crate::atlas::{MISSING_TEXTURE, TextureAtlas, VanillaAssets};
 use crate::chunk_mesh::{MeshWorker, WorldSnapshot, chunks_around};
 use crate::crafting::Recipes;
 use crate::inventory::{Inventory, ItemStack, MAX_STACK_SIZE, icon_texture_for_item};
 use crate::inventory_ui::{self, InventoryScreen};
 use crate::player::{Input, Player};
-use crate::render::{Camera, HudVertex, SurfaceRenderer, hud_rect};
+use crate::render::{Camera, HudSprite, HudVertex, SurfaceRenderer, hud_disc, hud_rect};
 use crate::server::{FrameInput, IntegratedServer};
 use crate::survival::{GameMode, MAX_FOOD, MAX_HEALTH, Survival};
 use crate::touch::TouchControls;
@@ -55,8 +55,12 @@ const HOTBAR_SLOT_COLOR: [f32; 4] = [0.05, 0.05, 0.05, 0.45];
 const HOTBAR_SELECTED_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.40];
 /// Fraction of a hotbar slot left free around the item swatch.
 const HOTBAR_SWATCH_INSET: f32 = 0.2;
-/// Number of colour bands a HUD block icon is drawn with.
-const ICON_GRID: usize = 8;
+/// How many leading [`TouchControls::hud_rects`] entries are the joystick
+/// base and knob, which are drawn as discs rather than rectangles.
+const JOYSTICK_DISCS: usize = 2;
+/// Wedges in one joystick disc: 24 keeps the rim smooth at phone widths for a
+/// few dozen vertices per circle.
+const DISC_SEGMENTS: usize = 24;
 /// Health points drawn as one heart-like cell each, ten to a row.
 const HEALTH_CELLS: usize = 20;
 const HEALTH_CELLS_PER_ROW: usize = 10;
@@ -234,6 +238,8 @@ struct Loaded {
     assets: VanillaAssets,
     atlas: TextureAtlas,
     mesh: Mesh,
+    /// One 1.16.5 light value per vertex of the current mesh.
+    light: Vec<f32>,
     /// Background remesher; owns the model pack after the first mesh.
     mesh_worker: MeshWorker,
     /// The world's block table, shared by every captured snapshot.
@@ -292,7 +298,24 @@ impl Loaded {
         // The first mesh stays synchronous so the first presented frame has
         // world geometry; every later remesh runs on the worker.
         let mesh = server.render_mesh(models.as_ref(), radius);
-        let atlas = TextureAtlas::load(&mut assets, mesh.textures.iter().cloned())?;
+        let light = {
+            let center = [
+                server.player.position[0].floor() as i32,
+                server.player.position[2].floor() as i32,
+            ];
+            crate::chunk_mesh::mesh_around_lit(
+                &server.world,
+                models.as_ref(),
+                &server.world,
+                center,
+                radius,
+            )
+            .1
+        };
+        let atlas = TextureAtlas::load(
+            &mut assets,
+            mesh.textures.iter().cloned().chain(hud_icon_textures()),
+        )?;
         let block_table = Arc::new(server.world.table.clone());
         let mesh_worker = MeshWorker::new(models);
         Ok(Self {
@@ -301,6 +324,7 @@ impl Loaded {
             assets,
             atlas,
             mesh,
+            light,
             mesh_worker,
             block_table,
         })
@@ -314,6 +338,7 @@ struct Pending {
     assets: VanillaAssets,
     atlas: TextureAtlas,
     mesh: Mesh,
+    light: Vec<f32>,
     mesh_worker: MeshWorker,
     block_table: Arc<BlockTable>,
     width: u32,
@@ -332,6 +357,8 @@ struct PlayState {
     assets: VanillaAssets,
     atlas: TextureAtlas,
     mesh: Mesh,
+    /// One 1.16.5 light value per vertex of the visible mesh.
+    light: Vec<f32>,
     /// Background remesher. The render thread only swaps its finished meshes.
     mesh_worker: MeshWorker,
     /// The world's block table, shared by every captured snapshot.
@@ -358,6 +385,8 @@ struct PlayState {
     touch_active: bool,
     /// Reused clip-space HUD vertices, refilled every frame.
     hud: Vec<HudVertex>,
+    /// Reused atlas-sampled HUD sprites, drawn after the flat vertices.
+    sprites: Vec<HudSprite>,
     /// The inventory and crafting screen: open flag, carried stack, grid.
     screen: InventoryScreen,
     /// Pointer position in normalized screen coordinates, so a mouse click
@@ -439,8 +468,12 @@ impl PlayState {
             if !mesh_supersedes(result.generation, self.installed_generation) {
                 continue;
             }
-            self.atlas = TextureAtlas::load(&mut self.assets, result.textures.iter().cloned())?;
+            self.atlas = TextureAtlas::load(
+                &mut self.assets,
+                result.textures.iter().cloned().chain(hud_icon_textures()),
+            )?;
             self.mesh = result.mesh;
+            self.light = result.light;
             self.installed_generation = result.generation;
         }
         if self.remesh_wanted {
@@ -482,6 +515,7 @@ pub fn run() -> Result<(), String> {
             assets: loaded.assets,
             atlas: loaded.atlas,
             mesh: loaded.mesh,
+            light: loaded.light,
             mesh_worker: loaded.mesh_worker,
             block_table: loaded.block_table,
             width: options.width,
@@ -536,6 +570,7 @@ pub fn run_android(
             assets: loaded.assets,
             atlas: loaded.atlas,
             mesh: loaded.mesh,
+            light: loaded.light,
             mesh_worker: loaded.mesh_worker,
             block_table: loaded.block_table,
             width: 1,
@@ -614,6 +649,7 @@ impl PlayApp {
         state.touch.set_selected(inventory.selected());
         fill_hud(
             &mut state.hud,
+            &mut state.sprites,
             &state.touch,
             inventory.slots(),
             inventory,
@@ -625,8 +661,16 @@ impl PlayApp {
         if survival.mode == GameMode::Survival {
             survival_hud(&mut state.hud, &state.touch, survival);
         }
+        // The inventory panel is flat geometry drawn over the hotbar, but
+        // sprite icons are drawn after every flat vertex; drop the hotbar
+        // icons so they cannot show through the open panel. The panel's own
+        // item sprites are appended below.
+        if state.screen.open {
+            state.sprites.clear();
+        }
         inventory_hud(
             &mut state.hud,
+            &mut state.sprites,
             &state.screen,
             inventory,
             survival.recipes.as_ref(),
@@ -637,7 +681,13 @@ impl PlayApp {
         );
         state
             .renderer
-            .render_with_hud(&state.mesh, &state.atlas, camera, &state.hud)
+            .render_with_hud(
+                &state.mesh,
+                &state.atlas,
+                camera,
+                &state.hud,
+                &state.sprites,
+            )
             .map_err(|error| error.to_string())?;
         state.frames_presented += 1;
         if state.frames_limit > 0 && state.frames_presented >= state.frames_limit {
@@ -729,9 +779,15 @@ impl ApplicationHandler for PlayApp {
         let Some(pending) = self.pending.take() else {
             return;
         };
-        let attributes = Window::default_attributes()
-            .with_title("Horizon 1.16.5")
-            .with_inner_size(LogicalSize::new(pending.width, pending.height));
+        // Android's window is the activity's surface, already measured in
+        // physical pixels by the compositor; asking for a logical size there
+        // would race the surface and can configure a swapchain smaller than
+        // the window, leaving a black band below the drawn content.
+        let mut attributes = Window::default_attributes().with_title("Horizon 1.16.5");
+        if !cfg!(target_os = "android") {
+            attributes =
+                attributes.with_inner_size(LogicalSize::new(pending.width, pending.height));
+        }
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {
@@ -740,7 +796,7 @@ impl ApplicationHandler for PlayApp {
                 return;
             }
         };
-        let renderer = match SurfaceRenderer::new(window.clone()) {
+        let mut renderer = match SurfaceRenderer::new(window.clone()) {
             Ok(renderer) => renderer,
             Err(error) => {
                 self.error = Some(format!("initializing the renderer: {error}"));
@@ -748,6 +804,18 @@ impl ApplicationHandler for PlayApp {
                 return;
             }
         };
+        // The surface can come up smaller than the window when Android
+        // misses the first `Resized`; follow the window before the first
+        // frame instead of presenting into a stale swapchain.
+        let window_size = window.inner_size();
+        let [native_width, native_height] = renderer.native_size();
+        if window_size.width != native_width || window_size.height != native_height {
+            eprintln!(
+                "surface {native_width}x{native_height}, window {}x{}",
+                window_size.width, window_size.height
+            );
+            renderer.resize(window_size.width, window_size.height);
+        }
         // A failed grab (e.g. a server without pointer constraints) just
         // leaves the cursor free; the loop itself keeps running.
         let _ = window.set_cursor_grab(CursorGrabMode::Locked);
@@ -764,6 +832,7 @@ impl ApplicationHandler for PlayApp {
             assets: pending.assets,
             atlas: pending.atlas,
             mesh: pending.mesh,
+            light: pending.light,
             mesh_worker: pending.mesh_worker,
             block_table: pending.block_table,
             installed_generation: 0,
@@ -779,6 +848,7 @@ impl ApplicationHandler for PlayApp {
             touch_active: cfg!(target_os = "android")
                 || std::env::var_os("HORIZON_1165_TOUCH_HUD").is_some(),
             hud: Vec::new(),
+            sprites: Vec::new(),
             screen: InventoryScreen::default(),
             pointer: [0.5, 0.5],
             look: None,
@@ -812,8 +882,20 @@ impl ApplicationHandler for PlayApp {
                 let state = self.state.as_mut().unwrap();
                 state.renderer.resize(size.width, size.height);
                 state.touch.resize(size.width as f32, size.height as f32);
+                state.window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
+                if let Some(state) = self.state.as_mut() {
+                    // Android can drop the first `Resized`, so the swapchain
+                    // is re-checked against the window on every frame the
+                    // loop still asks for.
+                    let size = state.window.inner_size();
+                    let [width, height] = state.renderer.native_size();
+                    if size.width != width || size.height != height {
+                        state.renderer.resize(size.width, size.height);
+                        state.touch.resize(size.width as f32, size.height as f32);
+                    }
+                }
                 if let Err(error) = self.render(event_loop) {
                     self.error = Some(error);
                     event_loop.exit();
@@ -1038,6 +1120,19 @@ fn merge_movement(keyboard: Input, touch: Input) -> Input {
     }
 }
 
+/// The block and item sprites the touch hotbar draws.
+///
+/// The world atlas is built from the visible chunks' textures, which may not
+/// include a block the creative hotbar holds, so these names are requested
+/// too. A name the pack does not ship still resolves to the missing sprite
+/// and the HUD keeps its flat swatch for it.
+fn hud_icon_textures() -> Vec<String> {
+    let inventory = Inventory::creative();
+    (0..crate::touch::HOTBAR_SLOTS)
+        .filter_map(|slot| inventory.icon_texture(slot))
+        .collect()
+}
+
 /// Combines a keyboard/mouse hotbar pick for this tick with a touch pick.
 ///
 /// A digit key pressed since the last tick wins over a simultaneous tap; at
@@ -1070,12 +1165,17 @@ fn apply_look_delta(base: [f32; 2], delta: [f32; 2]) -> [f32; 2] {
     [yaw, pitch]
 }
 
-/// Rebuilds `hud` for one frame: the touch controls and hotbar when they are
-/// active, plus a small crosshair. An inactive HUD is left empty, so the
+/// Rebuilds the HUD for one frame: the touch controls and hotbar when they
+/// are active, plus a small crosshair. An inactive HUD is left empty, so the
 /// desktop creative frame is identical to [`SurfaceRenderer::render`];
 /// survival vitals are appended separately by [`survival_hud`].
+///
+/// Flat [`HudVertex`] geometry goes to `hud`; hotbar and inventory item icons
+/// are the atlas-sampling [`HudSprite`]s in `sprites`, drawn over it by
+/// [`SurfaceRenderer::render_with_hud`].
 fn fill_hud(
     hud: &mut Vec<HudVertex>,
+    sprites: &mut Vec<HudSprite>,
     touch: &TouchControls,
     slots: &[Option<ItemStack>; 9],
     inventory: &Inventory,
@@ -1085,11 +1185,24 @@ fn fill_hud(
     height: u32,
 ) {
     hud.clear();
+    sprites.clear();
     if !active {
         return;
     }
-    for (rect, color) in touch.hud_rects() {
-        hud.extend_from_slice(&hud_rect(rect[0], rect[1], rect[2], rect[3], color));
+    for (index, (rect, color)) in touch.hud_rects().into_iter().enumerate() {
+        if index < JOYSTICK_DISCS {
+            // The joystick base and knob are circles. The rect's width and
+            // height differ on a non-square screen, and using each as a
+            // normalized radius keeps the disc round in pixels.
+            hud.extend(hud_disc(
+                [rect[0] + rect[2] * 0.5, rect[1] + rect[3] * 0.5],
+                [rect[2] * 0.5, rect[3] * 0.5],
+                color,
+                DISC_SEGMENTS,
+            ));
+        } else {
+            hud.extend_from_slice(&hud_rect(rect[0], rect[1], rect[2], rect[3], color));
+        }
     }
     let hotbar = touch.hotbar_rects();
     for (rect, _) in &hotbar {
@@ -1106,11 +1219,14 @@ fn fill_hud(
         let inset_y = rect[3] * HOTBAR_SWATCH_INSET;
         // Icons come from the creative preset's own textures: the HUD
         // slots show what the hotbar gives the player, not the slot array.
-        let icon = inventory
-            .icon_texture(slot)
-            .and_then(|texture| hud_icon_quads(atlas, &texture, *rect, inset_x, inset_y));
+        // Each icon is one atlas-sampling sprite, so the real block or item
+        // sprite is visible instead of averaged colour bands.
+        let icon = atlas.and_then(|atlas| {
+            let texture = inventory.icon_texture(slot)?;
+            hud_item_sprite(atlas, &texture, *rect, inset_x, inset_y)
+        });
         match icon {
-            Some(quads) => hud.extend(quads),
+            Some(sprite) => sprites.push(sprite),
             // No atlas entry (or no atlas yet): keep a flat swatch so the
             // slot still reads as filled.
             None => {
@@ -1129,7 +1245,8 @@ fn fill_hud(
             }
         }
     }
-    // The brighter overlay goes last so it also tints the item swatch.
+    // The brighter overlay is flat geometry drawn under the sprite icons, so
+    // its inset margin reads as a bright frame around the selected item.
     if let Some((rect, _)) = hotbar.iter().find(|(_, selected)| *selected) {
         hud.extend_from_slice(&hud_rect(
             rect[0],
@@ -1253,49 +1370,42 @@ fn block_swatch_color(name: &str) -> [f32; 4] {
     }
 }
 
-/// One hotbar block icon as a grid of HUD quads, sampled from the atlas.
+/// The atlas rectangle sampled for `texture`, or `None` when the atlas only
+/// has the missing-texture sprite for it.
 ///
-/// The HUD pipeline has no texture sampling, so `ICON_GRID` horizontal bands
-/// of row-averaged colours (with alpha, so glass reads as see-through) stand
-/// in for the real sprite. Returns `None` when the atlas lacks the texture,
-/// and the caller then draws a flat swatch.
-fn hud_icon_quads(
-    atlas: Option<&TextureAtlas>,
+/// [`TextureAtlas::sprite_rect`] is sprite-local (`[0, 0, 1, 1]`), which is
+/// what a single uploaded sprite is sampled with; the HUD samples the packed
+/// sheet, so the sprite's normalized atlas rectangle comes from
+/// [`TextureAtlas::uv`]. A name that resolved to `minecraft:missingno` counts
+/// as missing, so the caller can keep the flat swatch.
+fn sprite_uv(atlas: &TextureAtlas, texture: &str) -> Option<[f32; 4]> {
+    atlas.sprite_rect(texture)?;
+    let uv = atlas.uv(texture)?;
+    (atlas.uv(MISSING_TEXTURE) != Some(uv)).then_some(uv)
+}
+
+/// One hotbar or inventory item icon as an atlas-sampling HUD sprite, inset
+/// inside `slot`. Returns `None` when the atlas lacks the texture, so the
+/// caller draws the flat swatch instead.
+fn hud_item_sprite(
+    atlas: &TextureAtlas,
     texture: &str,
     slot: [f32; 4],
     inset_x: f32,
     inset_y: f32,
-) -> Option<Vec<HudVertex>> {
-    let atlas = atlas?;
-    atlas.sprite_rect(texture)?;
-    let x = slot[0] + inset_x;
-    let y = slot[1] + inset_y;
-    let width = slot[2] - inset_x * 2.0;
-    let height = slot[3] - inset_y * 2.0;
-    if width <= 0.0 || height <= 0.0 {
-        return None;
-    }
-    let cell_h = height / ICON_GRID as f32;
-    // The HUD has no texture sampling, so the icon is drawn as a vertical run
-    // of full-width bands whose colours average each row of cells. That keeps
-    // the vertex count at one quad per row and still shows the sprite's
-    // shape and alpha.
-    let mut quads = Vec::with_capacity(ICON_GRID * 6);
-    for row in 0..ICON_GRID {
-        let mut channels = [0.0f32; 4];
-        for column in 0..ICON_GRID {
-            let u = (column as f32 + 0.5) / ICON_GRID as f32;
-            let v = (row as f32 + 0.5) / ICON_GRID as f32;
-            let [r, g, b, a] = atlas.sample(texture, u, v)?;
-            channels[0] += f32::from(r) / 255.0;
-            channels[1] += f32::from(g) / 255.0;
-            channels[2] += f32::from(b) / 255.0;
-            channels[3] += f32::from(a) / 255.0;
-        }
-        let color = channels.map(|sum| sum / ICON_GRID as f32);
-        quads.extend_from_slice(&hud_rect(x, y + row as f32 * cell_h, width, cell_h, color));
-    }
-    Some(quads)
+) -> Option<HudSprite> {
+    let uv = sprite_uv(atlas, texture)?;
+    let rect = [
+        slot[0] + inset_x,
+        slot[1] + inset_y,
+        slot[2] - inset_x * 2.0,
+        slot[3] - inset_y * 2.0,
+    ];
+    (rect[2] > 0.0 && rect[3] > 0.0).then_some(HudSprite {
+        rect,
+        uv,
+        color: [1.0, 1.0, 1.0, 1.0],
+    })
 }
 
 /// Two thin quads forming a crosshair centred on the screen. Sizes are
@@ -1468,6 +1578,7 @@ fn fitting_capacity(inventory: &Inventory, item: &str) -> u32 {
 #[allow(clippy::too_many_arguments)]
 fn inventory_hud(
     hud: &mut Vec<HudVertex>,
+    sprites: &mut Vec<HudSprite>,
     screen: &InventoryScreen,
     inventory: &Inventory,
     recipes: Option<&Recipes>,
@@ -1505,7 +1616,7 @@ fn inventory_hud(
         let Some(stack) = stack.filter(|stack| !stack.is_empty()) else {
             continue;
         };
-        draw_stack(hud, atlas, stack, *rect);
+        draw_stack(hud, sprites, atlas, stack, *rect);
     }
     // The carried stack follows the pointer.
     if let Some(stack) = screen.cursor.as_ref().filter(|stack| !stack.is_empty()) {
@@ -1518,23 +1629,27 @@ fn inventory_hud(
             cell[3],
             INVENTORY_CURSOR_COLOR,
         ));
-        draw_stack(hud, atlas, stack, cell);
+        draw_stack(hud, sprites, atlas, stack, cell);
     }
 }
 
-/// Draws one stack's atlas icon, or a flat swatch when no sprite exists.
+/// Draws one stack's atlas icon sprite, or a flat swatch when no sprite
+/// exists.
 fn draw_stack(
     hud: &mut Vec<HudVertex>,
+    sprites: &mut Vec<HudSprite>,
     atlas: Option<&TextureAtlas>,
     stack: &ItemStack,
     rect: [f32; 4],
 ) {
     let inset_x = rect[2] * HOTBAR_SWATCH_INSET;
     let inset_y = rect[3] * HOTBAR_SWATCH_INSET;
-    let icon = icon_texture_for_item(&stack.item)
-        .and_then(|texture| hud_icon_quads(atlas, &texture, rect, inset_x, inset_y));
+    let icon = atlas.and_then(|atlas| {
+        let texture = icon_texture_for_item(&stack.item)?;
+        hud_item_sprite(atlas, &texture, rect, inset_x, inset_y)
+    });
     match icon {
-        Some(quads) => hud.extend(quads),
+        Some(sprite) => sprites.push(sprite),
         None => hud.extend_from_slice(&hud_rect(
             rect[0] + inset_x,
             rect[1] + inset_y,
@@ -1555,8 +1670,10 @@ mod tests {
         touch.resize(800.0, 600.0);
         let inventory = Inventory::creative();
         let mut hud = Vec::new();
+        let mut sprites = Vec::new();
         fill_hud(
             &mut hud,
+            &mut sprites,
             &touch,
             inventory.slots(),
             &inventory,
@@ -1566,9 +1683,11 @@ mod tests {
             600,
         );
         let baseline = hud.clone();
+        let sprite_baseline = sprites.clone();
         let screen = InventoryScreen::default();
         inventory_hud(
             &mut hud,
+            &mut sprites,
             &screen,
             &inventory,
             None,
@@ -1578,6 +1697,10 @@ mod tests {
             [0.5, 0.5],
         );
         assert_eq!(hud, baseline, "a closed screen must draw nothing");
+        assert_eq!(
+            sprites, sprite_baseline,
+            "a closed screen must draw no sprites"
+        );
     }
 
     #[test]
@@ -1586,8 +1709,10 @@ mod tests {
         let mut screen = InventoryScreen::default();
         screen.toggle();
         let mut hud = Vec::new();
+        let mut sprites = Vec::new();
         inventory_hud(
             &mut hud,
+            &mut sprites,
             &screen,
             &inventory,
             None,
@@ -1620,7 +1745,18 @@ mod tests {
         let point = [rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0];
         screen.hovered = inventory_ui::hit(&rects, point[0], point[1]);
         let mut hud = Vec::new();
-        inventory_hud(&mut hud, &screen, &inventory, None, None, 800, 600, point);
+        let mut sprites = Vec::new();
+        inventory_hud(
+            &mut hud,
+            &mut sprites,
+            &screen,
+            &inventory,
+            None,
+            None,
+            800,
+            600,
+            point,
+        );
         assert_eq!(screen.hovered, Some(5));
         assert!(
             hud.iter()
@@ -1645,7 +1781,7 @@ mod tests {
     }
 
     /// A pack holding one flat texture per creative hotbar block, enough for
-    /// the icon grid to sample.
+    /// the HUD sprite pass to sample every hotbar icon.
     fn test_atlas() -> TextureAtlas {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -1920,8 +2056,10 @@ mod tests {
         touch.resize(800.0, 600.0);
         let slots: [Option<ItemStack>; 9] = std::array::from_fn(|_| None);
         let mut hud = Vec::new();
+        let mut sprites = Vec::new();
         fill_hud(
             &mut hud,
+            &mut sprites,
             &touch,
             &slots,
             &Inventory::creative(),
@@ -1931,8 +2069,10 @@ mod tests {
             600,
         );
         assert!(hud.is_empty());
+        assert!(sprites.is_empty());
         fill_hud(
             &mut hud,
+            &mut sprites,
             &touch,
             &slots,
             &Inventory::creative(),
@@ -1941,15 +2081,11 @@ mod tests {
             800,
             600,
         );
-        // The five touch rectangles, nine hotbar backgrounds, the eight
-        // icon grid cells of every creative slot with an icon, the selected
-        // overlay and the two-quad crosshair.
-        // Empty slots keep the flat swatch; the atlas holds icons for every
-        // creative slot.
-        assert_eq!(
-            hud.len(),
-            touch.hud_rects().len() * 6 + 9 * 6 + 9 * 6 + 6 + 12
-        );
+        // The joystick discs, the three remaining control rectangles, nine
+        // hotbar backgrounds, the flat swatch of every creative slot (there is
+        // no atlas here), the selected overlay and the two-quad crosshair.
+        assert_eq!(hud.len(), flat_control_vertices(&touch) + 9 * 6);
+        assert!(sprites.is_empty(), "no atlas means no item sprites");
         for vertex in &hud {
             assert!(vertex.position[0].is_finite());
             assert!(vertex.position[1].is_finite());
@@ -1959,6 +2095,7 @@ mod tests {
         // The buffer is reused, not appended to, on the next frame.
         fill_hud(
             &mut hud,
+            &mut sprites,
             &touch,
             &slots,
             &Inventory::creative(),
@@ -1968,6 +2105,7 @@ mod tests {
             600,
         );
         assert!(hud.is_empty());
+        assert!(sprites.is_empty());
     }
 
     #[test]
@@ -2035,59 +2173,92 @@ mod tests {
     }
 
     #[test]
-    fn hud_draws_hotbar_icons_and_a_brighter_selection() {
+    fn hud_draws_hotbar_sprites_and_a_brighter_selection() {
         let mut touch = TouchControls::new();
         touch.resize(800.0, 600.0);
         touch.set_selected(3);
         let mut slots: [Option<ItemStack>; 9] = std::array::from_fn(|_| None);
         slots[3] = Some(ItemStack::new("minecraft:grass_block", 1));
+        let creative = Inventory::creative();
+        let atlas = test_atlas();
         let mut hud = Vec::new();
+        let mut sprites = Vec::new();
         fill_hud(
             &mut hud,
+            &mut sprites,
             &touch,
             &slots,
-            &Inventory::creative(),
-            Some(&test_atlas()),
+            &creative,
+            Some(&atlas),
             true,
             800,
             600,
         );
 
-        // The five controls, nine backgrounds and one banded icon per creative
-        // slot in the atlas, then the selection overlay.
-        let expected = touch.hud_rects().len() * 6 + 9 * 6 + 9 * ICON_GRID * 6 + 6 + 12;
-        assert_eq!(hud.len(), expected);
-        let selected = hud
-            .iter()
-            .filter(|vertex| vertex.color == HOTBAR_SELECTED_COLOR)
-            .count();
-        assert_eq!(selected, 6, "only the selected slot gets the overlay");
-        // The atlas icon stands in for the flat swatch: the swatch colour is
-        // absent and the bands carry the sampled colour instead.
+        // The flat geometry is the controls, the nine slot backgrounds, the
+        // selection overlay and the crosshair; every item icon is a sprite.
+        assert_eq!(hud.len(), flat_control_vertices(&touch));
+        assert_eq!(sprites.len(), 9, "one sprite per creative slot");
+
+        // Each sprite samples the atlas sprite inside its own hotbar slot.
+        let hotbar = touch.hotbar_rects();
+        for (slot, sprite) in sprites.iter().enumerate() {
+            let rect = hotbar[slot].0;
+            let inset_x = rect[2] * HOTBAR_SWATCH_INSET;
+            let inset_y = rect[3] * HOTBAR_SWATCH_INSET;
+            assert_eq!(
+                sprite.rect,
+                [
+                    rect[0] + inset_x,
+                    rect[1] + inset_y,
+                    rect[2] - inset_x * 2.0,
+                    rect[3] - inset_y * 2.0,
+                ]
+            );
+            assert_eq!(sprite.color, [1.0, 1.0, 1.0, 1.0]);
+            assert!(sprite.uv.iter().all(|value| (0.0..=1.0).contains(value)));
+            assert!(sprite.uv[2] > sprite.uv[0] && sprite.uv[3] > sprite.uv[1]);
+            // The packed sheet samples the sprite's own rectangle.
+            let texture = creative.icon_texture(slot).unwrap();
+            assert_eq!(Some(sprite.uv), atlas.uv(&texture));
+        }
+        // The atlas sprite stands in for the flat swatch.
         let swatch = hud
             .iter()
             .filter(|vertex| vertex.color == block_swatch_color("minecraft:grass_block"))
             .count();
         assert_eq!(swatch, 0);
-        let icon_cell = [120.0 / 255.0, 140.0 / 255.0, 90.0 / 255.0, 255.0 / 255.0];
-        let cells = hud
+        let selected = hud
             .iter()
-            .filter(|vertex| {
-                (vertex.color[0] - icon_cell[0]).abs() < 1e-6
-                    && (vertex.color[1] - icon_cell[1]).abs() < 1e-6
-                    && (vertex.color[2] - icon_cell[2]).abs() < 1e-6
-            })
+            .filter(|vertex| vertex.color == HOTBAR_SELECTED_COLOR)
             .count();
-        assert_eq!(cells, 9 * ICON_GRID * 6, "icon band vertices");
+        assert_eq!(selected, 6, "only the selected slot gets the overlay");
+
+        // Without an atlas (or a missing texture) the slot falls back to the
+        // flat swatch and no sprite is emitted at all.
+        fill_hud(
+            &mut hud,
+            &mut sprites,
+            &touch,
+            &slots,
+            &creative,
+            None,
+            true,
+            800,
+            600,
+        );
+        assert_eq!(hud.len(), flat_control_vertices(&touch) + 9 * 6);
+        assert!(sprites.is_empty());
 
         // Moving the selection moves the brighter overlay: the six selected
         // vertices sit inside the new slot's rect.
         touch.set_selected(7);
         fill_hud(
             &mut hud,
+            &mut sprites,
             &touch,
             &slots,
-            &Inventory::creative(),
+            &creative,
             None,
             true,
             800,
@@ -2110,12 +2281,23 @@ mod tests {
         }
     }
 
+    /// The flat HUD vertex count for the touch controls: the two joystick
+    /// discs, the remaining control rectangles, the nine hotbar backgrounds,
+    /// the selection overlay and the crosshair.
+    fn flat_control_vertices(touch: &TouchControls) -> usize {
+        let controls = touch.hud_rects();
+        let discs = JOYSTICK_DISCS.min(controls.len());
+        discs * DISC_SEGMENTS * 3 + (controls.len() - discs) * 6 + 9 * 6 + 6 + 12
+    }
+
     /// One frame of HUD vertices for a survival/creative player, mirroring the
     /// order in [`PlayApp::render`].
     fn vital_hud(touch: &TouchControls, survival: &Survival) -> Vec<HudVertex> {
         let mut hud = Vec::new();
+        let mut sprites = Vec::new();
         fill_hud(
             &mut hud,
+            &mut sprites,
             touch,
             survival.inventory.slots(),
             &survival.inventory,
@@ -2137,10 +2319,11 @@ mod tests {
         let survival = Survival::creative();
         let hud = vital_hud(&touch, &survival);
 
-        // Exactly the pre-survival creative frame: controls, nine slot
-        // backgrounds, nine flat swatches (no atlas), the selection overlay
-        // and the crosshair. No health, food or tint vertices.
-        let expected = touch.hud_rects().len() * 6 + 9 * 6 + 9 * 6 + 6 + 12;
+        // Exactly the pre-survival creative frame: the joystick discs, the
+        // remaining controls, nine slot backgrounds, nine flat swatches (no
+        // atlas), the selection overlay and the crosshair. No health, food or
+        // tint vertices.
+        let expected = flat_control_vertices(&touch) + 9 * 6;
         assert_eq!(hud.len(), expected);
         let mut overlay = Vec::new();
         survival_hud(&mut overlay, &touch, &survival);
@@ -2156,8 +2339,10 @@ mod tests {
 
         let without_vitals = {
             let mut hud = Vec::new();
+            let mut sprites = Vec::new();
             fill_hud(
                 &mut hud,
+                &mut sprites,
                 &touch,
                 survival.inventory.slots(),
                 &survival.inventory,

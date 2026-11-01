@@ -15,7 +15,8 @@
 //! foliage textures get the fixed plains biome tint while the CPU mesh is
 //! expanded into GPU vertices.
 //! [`SurfaceRenderer`] can additionally draw a clip-space HUD overlay with
-//! alpha blending on top of the world.
+//! alpha blending on top of the world, and atlas-sampled [`HudSprite`] icons
+//! for the hotbar and inventory items.
 
 use crate::Mesh;
 use crate::atlas::{MISSING_TEXTURE, TextureAtlas};
@@ -148,6 +149,8 @@ struct GpuVertex {
     normal: [f32; 3],
     /// Linear RGB biome tint applied to the sampled texel.
     tint: [f32; 3],
+    /// Per-vertex 1.16.5 light (sky/block plus ambient occlusion), 0.05..1.
+    level: f32,
 }
 
 /// A screen-space HUD vertex: a clip-space position and a straight
@@ -179,6 +182,121 @@ pub fn hud_rect(x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) -> [HudVertex; 
     ]
 }
 
+/// One textured screen-space HUD sprite: where it goes on screen, the atlas
+/// rectangle it samples and a straight RGBA multiplier.
+///
+/// [`hud_sprite`] expands it into six [`SpriteVertex`]es, and
+/// [`SurfaceRenderer::render_with_hud`] draws them with the atlas-sampling
+/// pipeline after the flat HUD, so the hotbar icons show the real block and
+/// item sprites instead of averaged colour bands.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HudSprite {
+    /// Normalized `0..=1` screen rectangle with a top-left origin:
+    /// `x, y, width, height`.
+    pub rect: [f32; 4],
+    /// The atlas rectangle to sample as `u0, v0, u1, v1`. Sprite-local
+    /// coordinates are `[0.0, 0.0, 1.0, 1.0]`; a packed sheet uses the
+    /// sprite's own normalized atlas rectangle instead.
+    pub uv: [f32; 4],
+    /// Straight RGBA in `0..=1`, multiplied with the sampled texel.
+    pub color: [f32; 4],
+}
+
+impl HudSprite {
+    /// A sprite over `rect` sampling `uv`, drawn untinted.
+    pub fn new(rect: [f32; 4], uv: [f32; 4]) -> Self {
+        Self {
+            rect,
+            uv,
+            color: [1.0, 1.0, 1.0, 1.0],
+        }
+    }
+}
+
+/// A textured screen-space HUD vertex: clip-space position, sprite UV and a
+/// straight (unpremultiplied) RGBA colour. [`hud_sprite`] builds quads from
+/// these and the sprite pipeline samples the atlas with their UVs.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
+pub struct SpriteVertex {
+    /// Clip space, `-1..=1` on both axes, with `y` pointing up.
+    pub position: [f32; 2],
+    /// The atlas `u, v` this corner samples.
+    pub uv: [f32; 2],
+    /// Straight RGBA in `0..=1`; the alpha channel is used for blending.
+    pub color: [f32; 4],
+}
+
+/// Expands a sprite into six clip-space vertices in the same order as
+/// [`hud_rect`]: top-left, top-right, bottom-right, then top-left,
+/// bottom-right, bottom-left, each carrying its corner of the `uv` rectangle.
+pub fn hud_sprite(rect: [f32; 4], uv: [f32; 4], color: [f32; 4]) -> [SpriteVertex; 6] {
+    let [x, y, w, h] = rect;
+    let [u0, v0, u1, v1] = uv;
+    let corner = |x: f32, y: f32, u: f32, v: f32| SpriteVertex {
+        position: [x * 2.0 - 1.0, 1.0 - y * 2.0],
+        uv: [u, v],
+        color,
+    };
+    [
+        corner(x, y, u0, v0),
+        corner(x + w, y, u1, v0),
+        corner(x + w, y + h, u1, v1),
+        corner(x, y, u0, v0),
+        corner(x + w, y + h, u1, v1),
+        corner(x, y + h, u0, v1),
+    ]
+}
+
+/// Flattens `sprites` into the vertex stream the sprite pipeline draws. An
+/// empty slice yields no vertices at all, so a frame without sprites draws
+/// exactly the same pixels as the flat HUD alone.
+pub fn sprite_vertices(sprites: &[HudSprite]) -> Vec<SpriteVertex> {
+    let mut vertices = Vec::with_capacity(sprites.len() * 6);
+    for sprite in sprites {
+        vertices.extend_from_slice(&hud_sprite(sprite.rect, sprite.uv, sprite.color));
+    }
+    vertices
+}
+
+/// Expands a filled ellipse into `segments` triangle wedges (a fan around the
+/// centre), so the touch joystick reads as a circle instead of a square.
+///
+/// `center` and `radius` are normalized `0..=1` screen units with a top-left
+/// origin, matching [`hud_rect`]; passing `radius[0] / radius[1] == width /
+/// height` keeps the disc circular in pixels on a non-square screen. Every
+/// triangle is counter-clockwise in clip space, with at least three segments.
+pub fn hud_disc(
+    center: [f32; 2],
+    radius: [f32; 2],
+    color: [f32; 4],
+    segments: usize,
+) -> Vec<HudVertex> {
+    let segments = segments.max(3);
+    let clip = |x: f32, y: f32| HudVertex {
+        position: [x * 2.0 - 1.0, 1.0 - y * 2.0],
+        color,
+    };
+    let rim = |step: usize| {
+        let angle = std::f32::consts::TAU * step as f32 / segments as f32;
+        clip(
+            center[0] + angle.cos() * radius[0],
+            center[1] + angle.sin() * radius[1],
+        )
+    };
+    let hub = clip(center[0], center[1]);
+    let mut vertices = Vec::with_capacity(segments * 3);
+    for step in 0..segments {
+        // Hub, next rim point, this rim point: a positive (counter-clockwise)
+        // signed area in clip space, unlike the top-left-first `hud_rect`
+        // quads, which the HUD pipeline draws with culling disabled.
+        vertices.push(hub);
+        vertices.push(rim(step + 1));
+        vertices.push(rim(step));
+    }
+    vertices
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CameraUniform {
@@ -198,6 +316,7 @@ struct VertexInput {
     @location(1) uv: vec2<f32>,
     @location(2) normal: vec3<f32>,
     @location(3) tint: vec3<f32>,
+    @location(4) level: f32,
 };
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
@@ -213,10 +332,10 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     output.uv = input.uv;
     output.tint = input.tint;
     let normal = normalize(input.normal);
-    let sun = normalize(vec3<f32>(0.35, 1.0, 0.25));
-    let diffuse = max(dot(normal, sun), 0.0);
-    let sky = 0.5 + 0.5 * normal.y;
-    output.light = 0.45 + 0.40 * diffuse + 0.15 * sky;
+    // Vanilla's directional terms on top of the baked sky/block light: top
+    // faces are brightest, bottom faces darkest, the four sides between.
+    let face = 0.6 + 0.4 * max(normal.y, 0.0) - 0.2 * max(-normal.y, 0.0);
+    output.light = input.level * face;
     return output;
 }
 
@@ -263,6 +382,41 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     return input.color;
+}
+"#;
+
+// The textured HUD pass samples the same packed atlas as the world, with the
+// nearest/clamp sampler bound by the renderer, so a hotbar icon keeps its
+// crisp pixels at any screen size. The vertex colour tints the texel and its
+// alpha (straight, alpha blending) lets glass items stay see-through.
+const HUD_SPRITE_SHADER: &str = r#"
+@group(0) @binding(0) var atlas_texture: texture_2d<f32>;
+@group(0) @binding(1) var atlas_sampler: sampler;
+
+struct VertexInput {
+    @location(0) position: vec2<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) color: vec4<f32>,
+};
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+};
+
+@vertex
+fn vs_main(input: VertexInput) -> VertexOutput {
+    var output: VertexOutput;
+    output.clip_position = vec4<f32>(input.position, 0.0, 1.0);
+    output.uv = input.uv;
+    output.color = input.color;
+    return output;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    let texel = textureSample(atlas_texture, atlas_sampler, input.uv);
+    return vec4<f32>(texel.rgb * input.color.rgb, texel.a * input.color.a);
 }
 "#;
 
@@ -327,10 +481,23 @@ impl OffscreenRenderer {
         width: u32,
         height: u32,
     ) -> Result<Frame, RenderError> {
+        self.render_lit(mesh, atlas, camera, width, height, &[])
+    }
+
+    /// [`Self::render`] with one 1.16.5 light value per mesh vertex.
+    pub fn render_lit(
+        &self,
+        mesh: &Mesh,
+        atlas: &TextureAtlas,
+        camera: Camera,
+        width: u32,
+        height: u32,
+        light: &[f32],
+    ) -> Result<Frame, RenderError> {
         if width == 0 || height == 0 {
             return Err(RenderError::Failed("frame size must be non-zero".into()));
         }
-        let prepared = prepare_mesh(mesh, atlas)?;
+        let prepared = prepare_mesh(mesh, atlas, light)?;
 
         let view_proj = view_projection(camera, width as f32 / height as f32, mesh);
         let uniform = CameraUniform { view_proj };
@@ -621,6 +788,7 @@ fn create_pipeline(
         1 => Float32x2,
         2 => Float32x3,
         3 => Float32x3,
+        4 => Float32,
     ];
     let (entry_point, blend, depth_write) = match pass {
         WorldPass::Opaque => ("fs_main", None, true),
@@ -725,6 +893,91 @@ fn create_hud_pipeline(
     })
 }
 
+/// Builds the textured HUD pipeline: clip-space position/UV/colour triangles
+/// that sample the atlas through the renderer's nearest/clamp sampler, with
+/// alpha blending and no depth attachment, drawn after the flat HUD.
+fn create_hud_sprite_pipeline(
+    device: &wgpu::Device,
+    label: &str,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("horizon-1-16-5 hud sprite shader"),
+        source: wgpu::ShaderSource::Wgsl(HUD_SPRITE_SHADER.into()),
+    });
+    // An explicit layout, so the sprite pass binds the same atlas texture and
+    // sampler resources the world pass uses instead of the shader inferred
+    // without knowing the filter mode.
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("horizon-1-16-5 hud sprite bind group layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("horizon-1-16-5 hud sprite pipeline layout"),
+        bind_group_layouts: &[Some(&bind_group_layout)],
+        ..Default::default()
+    });
+    let attributes = wgpu::vertex_attr_array![
+        0 => Float32x2,
+        1 => Float32x2,
+        2 => Float32x4,
+    ];
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[Some(wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<SpriteVertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &attributes,
+            })],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 /// Decodes a packed sRGB colour (`0xRRGGBB`) into linear RGB, as the atlas
 /// samples are linear after the sRGB texture decode.
 fn srgb_to_linear(color: u32) -> [f32; 3] {
@@ -765,6 +1018,19 @@ pub fn is_translucent_texture(name: &str) -> bool {
         .any(|token| matches!(token, "glass" | "water" | "ice" | "slime" | "honey"))
 }
 
+/// Vanilla's face shading: top faces brightest, bottom darkest, sides between.
+fn face_shade(normal: [f32; 3]) -> f32 {
+    let length = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+    let up = if length > 1e-6 {
+        normal[1] / length
+    } else {
+        0.0
+    };
+    // The baked light already carries sky/block light; this term keeps faces
+    // distinguishable under uniform lighting.
+    0.6 + 0.4 * up.max(0.0) - 0.2 * (-up).max(0.0)
+}
+
 /// The fixed plains biome tint for a quad's texture name.
 ///
 /// Vanilla leaves grass and foliage sprites untinted and multiplies them by
@@ -796,7 +1062,11 @@ pub fn tint_for_texture(name: &str) -> [f32; 3] {
 
 /// Validates a mesh and expands it into GPU vertices, mapping each quad's
 /// per-face UVs (sixteenths of a tile) into its atlas region.
-fn build_vertices(mesh: &Mesh, atlas: &TextureAtlas) -> Result<Vec<GpuVertex>, RenderError> {
+fn build_vertices(
+    mesh: &Mesh,
+    atlas: &TextureAtlas,
+    light: &[f32],
+) -> Result<Vec<GpuVertex>, RenderError> {
     if mesh.vertices.len() % 4 != 0 {
         return Err(RenderError::Failed(
             "mesh vertex count is not a multiple of four".into(),
@@ -816,12 +1086,23 @@ fn build_vertices(mesh: &Mesh, atlas: &TextureAtlas) -> Result<Vec<GpuVertex>, R
         .uv(MISSING_TEXTURE)
         .ok_or_else(|| RenderError::Failed("atlas has no missing sprite".into()))?;
 
+    if !light.is_empty() && light.len() != mesh.vertices.len() {
+        return Err(RenderError::Failed(format!(
+            "{} light values for {} vertices",
+            light.len(),
+            mesh.vertices.len()
+        )));
+    }
     let mut vertices = Vec::with_capacity(mesh.vertices.len());
     for (quad_index, quad) in mesh.vertices.chunks_exact(4).enumerate() {
         let uv_rect = atlas.uv(&mesh.textures[quad_index]).unwrap_or(missing_uv);
         let tint = tint_for_texture(&mesh.textures[quad_index]);
-        for vertex in quad {
+        for (corner, vertex) in quad.iter().enumerate() {
             let local = [vertex.uv[0] / 16.0, vertex.uv[1] / 16.0];
+            let vertex_index = quad_index * 4 + corner;
+            // No captured light (tests, synthetic meshes): full daylight on
+            // the face, so shading still comes from the face normal.
+            let level = light.get(vertex_index).copied().unwrap_or(1.0);
             vertices.push(GpuVertex {
                 position: vertex.position,
                 uv: [
@@ -830,6 +1111,7 @@ fn build_vertices(mesh: &Mesh, atlas: &TextureAtlas) -> Result<Vec<GpuVertex>, R
                 ],
                 normal: vertex.normal,
                 tint,
+                level: level * face_shade(vertex.normal),
             });
         }
     }
@@ -878,8 +1160,12 @@ fn split_indices(mesh: &Mesh) -> Result<(Vec<u32>, Vec<u32>), RenderError> {
 
 /// Validates `mesh`, expands it into GPU vertices and splits its triangles
 /// into the two world passes.
-fn prepare_mesh(mesh: &Mesh, atlas: &TextureAtlas) -> Result<PreparedMesh, RenderError> {
-    let vertices = build_vertices(mesh, atlas)?;
+fn prepare_mesh(
+    mesh: &Mesh,
+    atlas: &TextureAtlas,
+    light: &[f32],
+) -> Result<PreparedMesh, RenderError> {
+    let vertices = build_vertices(mesh, atlas, light)?;
     let (opaque_indices, translucent_indices) = split_indices(mesh)?;
     Ok(PreparedMesh {
         vertices,
@@ -922,6 +1208,44 @@ fn create_depth(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture
         .create_view(&wgpu::TextureViewDescriptor::default())
 }
 
+/// The extent a frame is drawn into: the acquired swapchain texture always
+/// wins over the configured size.
+///
+/// `wgpu` can hand back a frame whose extent differs from the configuration:
+/// Android's compositor resizes the native window under the surface, and a
+/// missed `Resized` leaves the configuration stale. Drawing into the frame's
+/// own extent covers every pixel the compositor shows instead of leaving the
+/// uncovered part black. A zero-sized frame is impossible in practice and
+/// falls back to the configured size.
+fn fit_extent(configured: [u32; 2], frame: [u32; 2]) -> [u32; 2] {
+    if frame[0] == 0 || frame[1] == 0 {
+        configured
+    } else {
+        frame
+    }
+}
+
+/// The swapchain extent a renderer starts from.
+///
+/// `Window::inner_size` is already in physical pixels (the surface extent) on
+/// every backend, Android included, so it is never scaled by the window's
+/// factor. A window that reports zero (it has not been laid out yet) becomes
+/// 1, and anything past the device's texture limit is clamped, because `wgpu`
+/// cannot configure either; the frame read back on the first draw corrects a
+/// window that was still reporting a placeholder size here.
+fn initial_extent(inner: [u32; 2], max: u32) -> [u32; 2] {
+    let max = max.max(1);
+    [inner[0].clamp(1, max), inner[1].clamp(1, max)]
+}
+
+/// The pixel aspect ratio a frame is projected with.
+///
+/// The camera must use the extent actually drawn into rather than the
+/// configured one, or a stale swapchain stretches the world.
+fn aspect_of(extent: [u32; 2]) -> f32 {
+    extent[0].max(1) as f32 / extent[1].max(1) as f32
+}
+
 /// A wgpu device, world and HUD pipelines, and swapchain that presents one
 /// [`Mesh`] into a winit window. Creating one asks the system for a graphics
 /// adapter that can present to that window, which can fail
@@ -933,6 +1257,7 @@ pub struct SurfaceRenderer {
     pipeline: wgpu::RenderPipeline,
     translucent_pipeline: wgpu::RenderPipeline,
     hud_pipeline: wgpu::RenderPipeline,
+    hud_sprite_pipeline: wgpu::RenderPipeline,
     format: wgpu::TextureFormat,
     size: [u32; 2],
     depth: wgpu::TextureView,
@@ -940,8 +1265,14 @@ pub struct SurfaceRenderer {
 
 impl SurfaceRenderer {
     pub fn new(window: std::sync::Arc<winit::window::Window>) -> Result<Self, RenderError> {
+        // `inner_size` is the physical surface extent on every backend,
+        // Android included, so it is taken as-is: converting it through the
+        // window's scale factor would configure a swapchain narrower than
+        // the surface and leave the uncovered part black. The frame read
+        // back on the first draw corrects a window that still reports a
+        // placeholder size here.
         let inner = window.inner_size();
-        let size = [inner.width.max(1), inner.height.max(1)];
+        let requested = [inner.width, inner.height];
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
             Box::new(window.clone()),
         ));
@@ -972,7 +1303,7 @@ impl SurfaceRenderer {
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
                 .map_err(|error| RenderError::Failed(format!("requesting a device: {error}")))?;
         let max = device.limits().max_texture_dimension_2d;
-        let size = [size[0].min(max), size[1].min(max)];
+        let size = initial_extent(requested, max);
         let pipeline = create_pipeline(
             &device,
             "horizon-1-16-5 surface pipeline",
@@ -987,6 +1318,11 @@ impl SurfaceRenderer {
         );
         let hud_pipeline =
             create_hud_pipeline(&device, "horizon-1-16-5 surface hud pipeline", format);
+        let hud_sprite_pipeline = create_hud_sprite_pipeline(
+            &device,
+            "horizon-1-16-5 surface hud sprite pipeline",
+            format,
+        );
         let depth = create_depth(&device, size[0], size[1]);
         let renderer = Self {
             surface,
@@ -995,6 +1331,7 @@ impl SurfaceRenderer {
             pipeline,
             translucent_pipeline,
             hud_pipeline,
+            hud_sprite_pipeline,
             format,
             size,
             depth,
@@ -1003,9 +1340,12 @@ impl SurfaceRenderer {
         Ok(renderer)
     }
 
-    /// Follows the window to `width` x `height`. A zero dimension (a
-    /// minimized window) or a dimension past the device's texture limit
-    /// keeps the last swapchain, which `wgpu` cannot configure.
+    /// Follows the window to `width` x `height`, both in physical pixels.
+    ///
+    /// On Android these come from the compositor's surface and are already
+    /// physical, so they are applied without a scale-factor conversion. A
+    /// zero dimension (a minimized window) or a dimension past the device's
+    /// texture limit keeps the last swapchain, which `wgpu` cannot configure.
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
@@ -1017,6 +1357,15 @@ impl SurfaceRenderer {
         self.size = [width, height];
         self.depth = create_depth(&self.device, width, height);
         self.configure();
+    }
+
+    /// The extent the swapchain was last configured with.
+    ///
+    /// `app` compares this against `Window::inner_size` on every redraw:
+    /// Android can miss the `Resized` that would otherwise report a new
+    /// surface size, and a stale swapchain leaves part of the window black.
+    pub fn native_size(&self) -> [u32; 2] {
+        self.size
     }
 
     /// Rasterizes `mesh`, sampling `atlas` by each quad's texture name, and
@@ -1035,23 +1384,71 @@ impl SurfaceRenderer {
         atlas: &TextureAtlas,
         camera: Camera,
     ) -> Result<(), RenderError> {
-        self.render_with_hud(mesh, atlas, camera, &[])
+        self.render_with_hud(mesh, atlas, camera, &[], &[])
     }
 
     /// Rasterizes `mesh` exactly like [`Self::render`], then draws `hud`
-    /// clip-space triangles over it with alpha blending and no depth writes
-    /// before presenting the combined frame. An empty slice draws nothing
-    /// extra, so `render` keeps its original output.
+    /// clip-space triangles and, after them, the `sprites` sampled from
+    /// `atlas` with alpha blending and no depth writes before presenting the
+    /// combined frame. Empty slices draw nothing extra, so `render` keeps its
+    /// original output.
     pub fn render_with_hud(
         &mut self,
         mesh: &Mesh,
         atlas: &TextureAtlas,
         camera: Camera,
         hud: &[HudVertex],
+        sprites: &[HudSprite],
     ) -> Result<(), RenderError> {
-        let prepared = prepare_mesh(mesh, atlas)?;
-        let [width, height] = self.size;
-        let view_proj = view_projection(camera, width as f32 / height as f32, mesh);
+        self.render_with_hud_lit(mesh, atlas, camera, hud, sprites, &[])
+    }
+
+    /// [`Self::render_with_hud`] with one 1.16.5 light value per mesh vertex.
+    pub fn render_with_hud_lit(
+        &mut self,
+        mesh: &Mesh,
+        atlas: &TextureAtlas,
+        camera: Camera,
+        hud: &[HudVertex],
+        sprites: &[HudSprite],
+        light: &[f32],
+    ) -> Result<(), RenderError> {
+        let prepared = prepare_mesh(mesh, atlas, light)?;
+        // The swapchain is not authoritative: Android can deliver the first
+        // `Resized` late or not at all, and may hand back a frame a different
+        // size than the surface was configured with. The acquired frame is
+        // exactly what the compositor will show, so its own extent drives the
+        // depth buffer, the camera aspect and the render passes.
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                self.configure();
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                return Err(RenderError::Failed(
+                    "the window surface was lost and needs a new renderer".into(),
+                ));
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err(RenderError::Failed(
+                    "the surface rejected the swapchain configuration".into(),
+                ));
+            }
+        };
+        let extent = fit_extent(self.size, [frame.texture.width(), frame.texture.height()]);
+        // The depth attachment must match the colour attachment, so it
+        // follows the frame whenever the two disagree with the swapchain.
+        let stale_swapchain = extent != self.size;
+        if stale_swapchain {
+            self.size = extent;
+            self.depth = create_depth(&self.device, extent[0], extent[1]);
+        }
+        let view_proj = view_projection(camera, aspect_of(extent), mesh);
         let uniform = CameraUniform { view_proj };
         let uniform_buffer = self
             .device
@@ -1148,28 +1545,6 @@ impl SurfaceRenderer {
             "horizon-1-16-5 translucent bind group",
             &self.translucent_pipeline.get_bind_group_layout(0),
         );
-
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(frame)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Outdated => {
-                self.configure();
-                return Ok(());
-            }
-            wgpu::CurrentSurfaceTexture::Lost => {
-                return Err(RenderError::Failed(
-                    "the window surface was lost and needs a new renderer".into(),
-                ));
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                return Err(RenderError::Failed(
-                    "the surface rejected the swapchain configuration".into(),
-                ));
-            }
-        };
 
         let view = frame
             .texture
@@ -1274,8 +1649,61 @@ impl SurfaceRenderer {
             pass.set_vertex_buffer(0, hud_buffer.slice(..));
             pass.draw(0..hud.len() as u32, 0..1);
         }
+        if !sprites.is_empty() {
+            let vertices = sprite_vertices(sprites);
+            let sprite_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("horizon-1-16-5 hud sprites"),
+                    contents: bytemuck::cast_slice(&vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+            // The sprite pass binds the world atlas and its nearest/clamp
+            // sampler, so hotbar icons sample the real block and item sprites
+            // with the same filtering as the world.
+            let sprite_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("horizon-1-16-5 hud sprite bind group"),
+                layout: &self.hud_sprite_pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&atlas_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                ],
+            });
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("horizon-1-16-5 hud sprite pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.hud_sprite_pipeline);
+            pass.set_bind_group(0, &sprite_bind_group, &[]);
+            pass.set_vertex_buffer(0, sprite_buffer.slice(..));
+            pass.draw(0..vertices.len() as u32, 0..1);
+        }
         self.queue.submit([encoder.finish()]);
         self.queue.present(frame);
+        // `Surface::configure` panics while a `SurfaceTexture` is still
+        // alive, so the swapchain only follows the frame after it is shown;
+        // the next acquire then returns the frame's own extent.
+        if stale_swapchain {
+            self.configure();
+        }
         Ok(())
     }
 
@@ -1697,7 +2125,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let vertices = build_vertices(&mesh, &atlas).unwrap();
+        let vertices = build_vertices(&mesh, &atlas, &[]).unwrap();
         assert_eq!(vertices.len(), 4);
         for vertex in &vertices {
             assert_eq!(
@@ -1705,7 +2133,8 @@ mod tests {
                 tint_for_texture("minecraft:block/grass_block_top")
             );
         }
-        assert_eq!(std::mem::size_of::<GpuVertex>(), 44);
+        // position 12 + uv 8 + normal 12 + tint 12 + light 4.
+        assert_eq!(std::mem::size_of::<GpuVertex>(), 48);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1975,5 +2404,170 @@ mod tests {
     fn hud_vertices_are_packed_for_the_gpu_layout() {
         assert_eq!(std::mem::size_of::<HudVertex>(), 24);
         assert_eq!(std::mem::align_of::<HudVertex>(), 4);
+    }
+
+    #[test]
+    fn fit_extent_prefers_the_acquired_frame() {
+        // A stale 1280x720 swapchain inside a 2400x1080 surface must draw
+        // into the frame's own extent, never the smaller configured one.
+        assert_eq!(fit_extent([1280, 720], [2400, 1080]), [2400, 1080]);
+        assert_eq!(fit_extent([2400, 1080], [2400, 1080]), [2400, 1080]);
+        // A frame larger than the configured surface is still what the
+        // compositor shows, so it wins too.
+        assert_eq!(fit_extent([1920, 1080], [2400, 1080]), [2400, 1080]);
+        // Only an impossible zero-sized frame falls back to the config.
+        assert_eq!(fit_extent([1280, 720], [0, 0]), [1280, 720]);
+        assert_eq!(fit_extent([1280, 720], [2400, 0]), [1280, 720]);
+    }
+
+    #[test]
+    fn the_camera_aspect_follows_the_frame_extent() {
+        // 2400x1080 is 20:9; projecting with a stale 1280x720 (16:9) would
+        // stretch the world.
+        assert_eq!(aspect_of([2400, 1080]), 2400.0 / 1080.0);
+        assert_eq!(aspect_of([1280, 720]), 1280.0 / 720.0);
+        assert_eq!(aspect_of([0, 0]), 1.0);
+
+        // `perspective` stores `f / aspect` first, so the projection widens
+        // exactly as much as the frame does.
+        let fov = 70.0_f32.to_radians();
+        let f = 1.0 / (fov * 0.5).tan();
+        let narrow = perspective(fov, aspect_of([1280, 720]), 0.1, 100.0);
+        let wide = perspective(fov, aspect_of([2400, 1080]), 0.1, 100.0);
+        assert_eq!(narrow[0], f / (1280.0 / 720.0));
+        assert_eq!(wide[0], f / (2400.0 / 1080.0));
+        assert!(wide[0] < narrow[0]);
+    }
+
+    #[test]
+    fn initial_extent_takes_physical_pixels_and_clamps() {
+        // `inner_size` is already physical on every backend, Android
+        // included, so it is used unchanged.
+        assert_eq!(initial_extent([2400, 1080], 8192), [2400, 1080]);
+        // A window that has not been laid out yet becomes 1x1, the smallest
+        // extent wgpu can configure.
+        assert_eq!(initial_extent([0, 0], 8192), [1, 1]);
+        // Past the device limit is clamped to what the device can create.
+        assert_eq!(initial_extent([9000, 1080], 8192), [8192, 1080]);
+    }
+
+    #[test]
+    fn hud_sprite_maps_rect_and_uv_corners_to_clip_space() {
+        let color = [0.25, 0.5, 0.75, 1.0];
+        let uv = [0.25, 0.5, 0.75, 1.0];
+        let [
+            top_left,
+            top_right,
+            bottom_right,
+            top_left_2,
+            bottom_right_2,
+            bottom_left,
+        ] = hud_sprite([0.1, 0.2, 0.4, 0.5], uv, color);
+
+        assert_eq!(top_left.position, clip(0.1, 0.2));
+        assert_eq!(top_right.position, clip(0.5, 0.2));
+        assert_eq!(bottom_right.position, clip(0.5, 0.7));
+        assert_eq!(top_left_2.position, top_left.position);
+        assert_eq!(bottom_right_2.position, bottom_right.position);
+        assert_eq!(bottom_left.position, clip(0.1, 0.7));
+
+        // The sprite's own corners, in the same order as `hud_rect`.
+        assert_eq!(top_left.uv, [0.25, 0.5]);
+        assert_eq!(top_right.uv, [0.75, 0.5]);
+        assert_eq!(bottom_right.uv, [0.75, 1.0]);
+        assert_eq!(bottom_left.uv, [0.25, 1.0]);
+
+        for vertex in [
+            top_left,
+            top_right,
+            bottom_right,
+            top_left_2,
+            bottom_right_2,
+            bottom_left,
+        ] {
+            assert_eq!(vertex.color, color);
+        }
+    }
+
+    #[test]
+    fn sprite_vertices_flatten_every_sprite_in_order() {
+        // A frame without sprites has no sprite geometry at all.
+        assert!(sprite_vertices(&[]).is_empty());
+
+        let first = HudSprite::new([0.0, 0.0, 0.5, 0.5], [0.0, 0.0, 0.5, 0.5]);
+        let second = HudSprite {
+            rect: [0.5, 0.5, 0.5, 0.5],
+            uv: [0.5, 0.5, 1.0, 1.0],
+            color: [1.0, 0.5, 0.25, 0.75],
+        };
+        let vertices = sprite_vertices(&[first, second]);
+        assert_eq!(vertices.len(), 12);
+        assert_eq!(vertices[..6], hud_sprite(first.rect, first.uv, first.color));
+        assert_eq!(
+            vertices[6..],
+            hud_sprite(second.rect, second.uv, second.color)
+        );
+    }
+
+    #[test]
+    fn a_frame_without_sprites_keeps_the_flat_hud_stream() {
+        // `render` forwards an empty sprite list to `render_with_hud`; with no
+        // sprites the sprite pass is skipped, so the frame is exactly the flat
+        // HUD geometry the pre-sprite renderer drew.
+        let hud = hud_rect(0.25, 0.5, 0.5, 0.25, [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(std::mem::size_of_val(&hud), 6 * 24);
+        assert!(sprite_vertices(&[]).is_empty());
+        assert_eq!(
+            hud.iter().map(|vertex| vertex.position).collect::<Vec<_>>(),
+            vec![
+                clip(0.25, 0.5),
+                clip(0.75, 0.5),
+                clip(0.75, 0.75),
+                clip(0.25, 0.5),
+                clip(0.75, 0.75),
+                clip(0.25, 0.75),
+            ]
+        );
+    }
+
+    #[test]
+    fn sprite_vertex_is_packed_for_the_gpu_layout() {
+        assert_eq!(std::mem::size_of::<SpriteVertex>(), 32);
+        assert_eq!(std::mem::align_of::<SpriteVertex>(), 4);
+    }
+
+    #[test]
+    fn hud_disc_emits_three_vertices_per_wedge_counter_clockwise() {
+        let color = [1.0, 1.0, 1.0, 0.5];
+        let center = [0.5, 0.5];
+        let radius = [0.25, 0.25];
+        let disc = hud_disc(center, radius, color, 16);
+
+        assert_eq!(disc.len(), 16 * 3);
+        // At least a triangle comes out, however small the request.
+        assert_eq!(hud_disc(center, radius, color, 0).len(), 3 * 3);
+
+        for triangle in disc.chunks_exact(3) {
+            assert_eq!(triangle[0].position, clip(0.5, 0.5));
+            // Counter-clockwise in clip space: a positive signed area for
+            // every wedge of the fan.
+            let area = signed_area(
+                triangle[0].position,
+                triangle[1].position,
+                triangle[2].position,
+            );
+            assert!(area > 0.0, "wedge must be counter-clockwise, got {area}");
+            for vertex in triangle {
+                assert_eq!(vertex.color, color);
+            }
+        }
+        // Every rim point sits on the circle, so the base reads round rather
+        // than as the rectangle `hud_rect` would emit.
+        for vertex in disc.chunks_exact(3).flat_map(|t| &t[1..]) {
+            let dx = vertex.position[0];
+            let dy = vertex.position[1];
+            let distance = (dx * dx + dy * dy).sqrt();
+            assert!((distance - 0.5).abs() < 1e-5, "rim at {distance}");
+        }
     }
 }

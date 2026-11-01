@@ -436,6 +436,16 @@ fn preserved_root(
     }
 }
 
+impl crate::light::BlockLightSource for World {
+    /// The stored sky/block light at a block position; `None` outside the
+    /// loaded chunks, which the light sampler treats as open sky.
+    fn light_at(&self, x: i32, y: i32, z: i32) -> Option<[u8; 2]> {
+        self.chunks
+            .get(&(x >> 4, z >> 4))
+            .and_then(|column| column.light(x, y, z))
+    }
+}
+
 impl BlockSource for World {
     /// The block state at world coordinates.
     ///
@@ -462,6 +472,9 @@ pub struct ChunkColumn {
     pub x: i32,
     pub z: i32,
     sections: [Option<Section>; SECTIONS],
+    /// Packed `(sky << 4) | block` light per section, 2048 bytes each, or
+    /// `None` for a section saved without light layers.
+    lights: [Option<Vec<u8>>; SECTIONS],
     biomes: [i32; BIOMES],
     /// The whole chunk NBT root this column was decoded from, kept so a save
     /// can rebuild everything but the block data (`Level.Sections` and
@@ -515,8 +528,9 @@ impl ChunkColumn {
             return Ok(None);
         }
         let mut decoded: [Option<Section>; SECTIONS] = std::array::from_fn(|_| None);
+        let mut lights: [Option<Vec<u8>>; SECTIONS] = std::array::from_fn(|_| None);
         for section in sections {
-            let Some((y, blocks)) = decode_section(section, &at, table)? else {
+            let Some((y, blocks, light)) = decode_section(section, &at, table)? else {
                 // 1.16.5 saves empty sections outside the block range (a
                 // flat world has an empty Y=-1 section). They carry no
                 // blocks and are ignored; a nonempty out-of-range section
@@ -527,6 +541,9 @@ impl ChunkColumn {
                 return Err(format!("{at}: duplicate section Y {y}"));
             }
             decoded[y] = Some(blocks);
+            if let Some(light) = light {
+                lights[y] = Some(light);
+            }
         }
         let mut biomes = [0i32; BIOMES];
         match level.get("Biomes") {
@@ -543,9 +560,43 @@ impl ChunkColumn {
             x,
             z,
             sections: decoded,
+            lights,
             biomes,
             original: Some(root.clone()),
         }))
+    }
+
+    /// The `(sky, block)` light of one block, each 0..=15.
+    ///
+    /// A section saved without light layers reports full sky light for its
+    /// lower half and none for the rest of the column, which is what a
+    /// surface world looks like before relighting; `None` outside the column.
+    pub fn light(&self, x: i32, y: i32, z: i32) -> Option<[u8; 2]> {
+        if !(0..256).contains(&y) {
+            return None;
+        }
+        let index = ((y & 15) << 8 | (z & 15) << 4 | (x & 15)) as usize;
+        match self.lights[(y >> 4) as usize].as_deref() {
+            Some(packed) => {
+                let value = packed[index];
+                Some([value >> 4, value & 15])
+            }
+            None => Some([if y <= self.surface_y() { 15 } else { 0 }, 0]),
+        }
+    }
+
+    /// Height of the highest non-air block, used as a light fallback for
+    /// chunks saved without light layers.
+    fn surface_y(&self) -> i32 {
+        for section in (0..SECTIONS).rev() {
+            let Some(blocks) = self.sections[section].as_deref() else {
+                continue;
+            };
+            if let Some(index) = blocks.iter().position(|&id| id != 0) {
+                return (section * 16) as i32 + (index >> 8) as i32;
+            }
+        }
+        0
     }
 
     /// The section at index 0..16: its 4096 block-table state ids in YZX
@@ -607,7 +658,7 @@ fn decode_section(
     tag: &Tag,
     at: &str,
     table: &BlockTable,
-) -> Result<Option<(usize, Section)>, String> {
+) -> Result<Option<(usize, Section, Option<Vec<u8>>)>, String> {
     let Tag::Compound(_) = tag else {
         return Err(format!("{at}: a Sections entry is not a compound"));
     };
@@ -678,7 +729,26 @@ fn decode_section(
     } else {
         return Err(format!("{at}: section {y} BlockStates is not a long array"));
     }
-    Ok(Some((y, blocks)))
+    // 2048 bytes per light layer, interleaved as (sky << 4) | block per block
+    // in the section's YZX order. A section without stored light is `None`.
+    let layer = |name: &str| match tag.get(name) {
+        Some(Tag::ByteArray(bytes)) if bytes.len() == 2048 => Some(&bytes[..]),
+        _ => None,
+    };
+    let light = match (layer("SkyLight"), layer("BlockLight")) {
+        (Some(sky), Some(block)) => {
+            let mut packed = vec![0u8; 2048];
+            for index in 0..4096 {
+                let byte = index / 2;
+                let shift = (index % 2) * 4;
+                let value = (sky[byte] >> shift) << 4 & 0xF0 | (block[byte] >> shift) & 15;
+                packed[byte] |= if index % 2 == 0 { value } else { value << 4 };
+            }
+            Some(packed)
+        }
+        _ => None,
+    };
+    Ok(Some((y, blocks, light)))
 }
 
 /// `max(4, ceillog2(palette_len))`, the 1.16.5 per-index bit width.
@@ -1640,6 +1710,7 @@ mod tests {
             x: 0,
             z: 0,
             sections: std::array::from_fn(|_| None),
+            lights: std::array::from_fn(|_| None),
             biomes: [3; BIOMES],
             original: None,
         };

@@ -5,7 +5,8 @@
 //! model-space quad (0..16) into block units (0..1) and turning it into two
 //! triangles.
 
-use crate::{BlockSource, Mesh, ModelSource, Vertex};
+use crate::light::{BlockLightSource, LightSampler, ambient_occlusion};
+use crate::{BlockSource, Face, Mesh, ModelSource, Vertex};
 
 /// The three block states that count as transparent for face culling.
 /// Opacity-aware culling (e.g. treating glass, leaves, water as
@@ -35,7 +36,43 @@ pub fn mesh_box(
     min: [i32; 3],
     size: [u32; 3],
 ) -> Mesh {
+    mesh_impl(source, models, None, min, size).0
+}
+
+/// Mesh the box like [`mesh_box`], and additionally sample one light value per
+/// vertex.
+///
+/// The returned `Vec<f32>` is parallel to `Mesh::vertices`: `lights[i]` belongs
+/// to `vertices[i]`. Each value is
+/// [`LightSampler::vertex_light`](crate::light::LightSampler::vertex_light) for
+/// that vertex's block, corner and normal multiplied by
+/// [`ambient_occlusion`](crate::light::ambient_occlusion), so it is in
+/// `0.05..=1.0`. `light` supplies the sky/block levels and `source` supplies the
+/// block states the occlusion test needs. A shader is expected to multiply the
+/// sampled texture by this value.
+///
+/// Faces and vertex order are identical to [`mesh_box`]; the two functions emit
+/// the same mesh.
+pub fn mesh_box_lit(
+    source: &dyn BlockSource,
+    models: &dyn ModelSource,
+    light: &dyn BlockLightSource,
+    min: [i32; 3],
+    size: [u32; 3],
+) -> (Mesh, Vec<f32>) {
+    let (mesh, lights) = mesh_impl(source, models, Some(light), min, size);
+    (mesh, lights.unwrap_or_default())
+}
+
+fn mesh_impl(
+    source: &dyn BlockSource,
+    models: &dyn ModelSource,
+    light: Option<&dyn BlockLightSource>,
+    min: [i32; 3],
+    size: [u32; 3],
+) -> (Mesh, Option<Vec<f32>>) {
     let mut mesh = Mesh::default();
+    let mut lights = light.map(|_| Vec::new());
     for x in 0..size[0] {
         for y in 0..size[1] {
             for z in 0..size[2] {
@@ -71,6 +108,13 @@ pub fn mesh_box(
                             uv: vertex.uv,
                             normal: vertex.normal,
                         });
+                        if let (Some(lights), Some(light)) = (&mut lights, light) {
+                            let corner = corner_signs(vertex.position);
+                            let normal = normal_signs(vertex.normal);
+                            let occlusion = ambient_occlusion(source, pos, face_of(normal), corner);
+                            let value = LightSampler::vertex_light(light, pos, corner, normal);
+                            lights.push(value * occlusion);
+                        }
                     }
                     mesh.indices.extend_from_slice(&[
                         base,
@@ -84,7 +128,39 @@ pub fn mesh_box(
             }
         }
     }
-    mesh
+    (mesh, lights)
+}
+
+/// The corner a model-space vertex sits at, as `-1`/`1` per axis.
+fn corner_signs(position: [f32; 3]) -> [i32; 3] {
+    position.map(|value| if value < 8.0 { -1 } else { 1 })
+}
+
+/// A face normal as `-1`/`0`/`1` per axis.
+fn normal_signs(normal: [f32; 3]) -> [i32; 3] {
+    normal.map(|value| {
+        if value > 0.5 {
+            1
+        } else if value < -0.5 {
+            -1
+        } else {
+            0
+        }
+    })
+}
+
+/// The face a (sign-only) normal points along.
+fn face_of(normal: [i32; 3]) -> Face {
+    let [x, y, z] = normal;
+    if x != 0 {
+        if x < 0 { Face::West } else { Face::East }
+    } else if y != 0 {
+        if y < 0 { Face::Down } else { Face::Up }
+    } else if z < 0 {
+        Face::North
+    } else {
+        Face::South
+    }
 }
 
 #[cfg(test)]
@@ -313,5 +389,42 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.vertices.len(), 40); // 2 cubes, one shared face culled
         assert_eq!(first.indices.len(), 60);
+    }
+
+    /// Open sky everywhere, no block light.
+    struct OpenSky;
+
+    impl BlockLightSource for OpenSky {
+        fn light_at(&self, _x: i32, _y: i32, _z: i32) -> Option<[u8; 2]> {
+            Some([15, 0])
+        }
+    }
+
+    #[test]
+    fn lit_mesh_matches_mesh_box_vertex_for_vertex() {
+        let mut source = MapSource::default();
+        source.states.insert([0, 0, 0], stone());
+        source.states.insert([0, 1, 0], stone());
+        let plain = mesh_box(&source, &StoneModels, [0, 0, 0], [1, 2, 1]);
+        let (lit, lights) = mesh_box_lit(&source, &StoneModels, &OpenSky, [0, 0, 0], [1, 2, 1]);
+        assert_eq!(lit, plain);
+        assert_eq!(lights.len(), lit.vertices.len());
+        // Open sky with no obstructing blocks is unshadowed.
+        assert!(lights.iter().all(|value| (value - 1.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn lit_mesh_applies_ambient_occlusion() {
+        let mut source = MapSource::default();
+        source.states.insert([0, 0, 0], stone());
+        // Touches the up face's (+x, +z) corners without sharing a face.
+        source.states.insert([1, 1, 0], stone());
+        let (mesh, lights) = mesh_box_lit(&source, &StoneModels, &OpenSky, [0, 0, 0], [1, 1, 1]);
+        assert_eq!(lights.len(), mesh.vertices.len());
+        assert!(
+            lights.iter().any(|value| (value - 0.8).abs() < 1e-6),
+            "expected a shaded corner: {lights:?}"
+        );
+        assert!(lights.iter().all(|value| *value >= 0.05 && *value <= 1.0));
     }
 }

@@ -516,6 +516,29 @@ const RU: &[(&str, &str)] = &[
         "The installer could not be opened. Allow installs from Horizon and try again.",
         "Не удалось открыть установщик. Разрешите установку из Horizon и попробуйте снова.",
     ),
+    // The Journal: what this device recorded, for the player to read.
+    ("Journal", "Журнал"),
+    ("Imports, errors and exits on this device", "Импорт, ошибки и выходы на этом устройстве"),
+    ("Nothing recorded yet.", "Пока ничего не записано."),
+    (
+        "Previous session ended without a clean exit; last phase: {phase}. This may be a crash or an Android process kill. Export diagnostics before reporting.",
+        "Прошлая сессия завершилась без штатного выхода; последняя фаза: {phase}. Это может быть сбой или остановка процесса Android. Перед сообщением об ошибке выгрузите диагностику.",
+    ),
+    (
+        "Local logs and Android exit history are available in Reports. Export diagnostics to attach a ZIP; review it before sharing.",
+        "Локальные журналы и история выходов Android доступны в «Отчётах». Выгрузите диагностику, чтобы приложить ZIP; просмотрите его перед отправкой.",
+    ),
+    (
+        "Recent errors and imports",
+        "Недавние ошибки и импорт",
+    ),
+    (
+        "The installer stopped without finishing. Run it again.",
+        "Установщик остановился, не завершив работу. Запустите его снова.",
+    ),
+    ("Minecraft {version}: downloading {files} files", "Minecraft {version}: скачивание {files} файлов"),
+    ("{n} min", "{n} мин"),
+    ("{n} s", "{n} с"),
 ];
 
 /// Translate one fixed English launcher string.
@@ -620,6 +643,29 @@ mod tests {
     }
 
     #[test]
+    /// Every page tab and the Journal's own lines have a Russian string: a
+    /// missing entry falls back to English silently, which reads as a half
+    /// translated launcher.
+    #[test]
+    fn the_journal_and_every_page_tab_are_translated() {
+        for name in [
+            "Play", "Mods", "Packs", "Shaders", "Installed", "Settings", "Journal",
+        ] {
+            assert_ne!(
+                tr(Language::Russian, name),
+                name,
+                "{name} has no Russian translation"
+            );
+        }
+        for line in [
+            "Imports, errors and exits on this device",
+            "Nothing recorded yet.",
+            "Recent errors and imports",
+        ] {
+            assert_ne!(tr(Language::Russian, line), line, "{line} has no Russian translation");
+        }
+    }
+
     fn language_round_trips_through_serde() {
         for language in Language::ALL {
             let json = serde_json::to_string(&language).unwrap();

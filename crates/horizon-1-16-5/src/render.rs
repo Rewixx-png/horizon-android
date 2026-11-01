@@ -367,6 +367,9 @@ struct Camera {
 @group(0) @binding(0) var<uniform> camera: Camera;
 
 const SKY: vec3<f32> = vec3<f32>(0.47, 0.65, 1.0);
+// Fixed noon: no time-of-day darkening, only the vanilla face shading.
+const DAYLIGHT_FLOOR: f32 = 0.65;
+const FACE_GAIN: f32 = 1.15;
 // The sky reads lighter at the horizon and deeper overhead.
 const SKY_HORIZON: vec3<f32> = vec3<f32>(0.62, 0.74, 1.0);
 const SKY_ZENITH: vec3<f32> = vec3<f32>(0.30, 0.48, 0.92);
@@ -406,8 +409,10 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     output.world = input.position;
     output.tint = input.tint;
     // The CPU already multiplied in vanilla's per-face shade (1.0 / 0.8 /
-    // 0.6 / 0.5), so the vertex value is the final brightness.
-    output.light = input.level;
+    // 0.6 / 0.5). The world runs at a fixed noon, so the stored sky/block
+    // light only dims what is actually under a roof: an unlit column is lit
+    // from above, and nothing is black just because the time of day.
+    output.light = max(input.level, DAYLIGHT_FLOOR) * FACE_GAIN;
     return output;
 }
 

@@ -383,18 +383,12 @@ impl Loaded {
         if gui.is_none() {
             eprintln!("vanilla GUI textures are missing from the pack");
         }
-        // Optional Bedrock touch sprites: prepared privately by
-        // `tools/android_bedrock_controls.py`, never in Git.
-        if let Some(gui) = gui.as_mut() {
-            let controls = client_jar
-                .parent()
-                .map(|directory| directory.join("bedrock-controls.zip"))
-                .filter(|path| path.is_file());
-            if let Some(controls) = controls.as_deref()
-                && let Err(error) = gui.add_bedrock_zip(controls)
-            {
-                eprintln!("bedrock controls from {}: {error}", controls.display());
-            }
+        // Bedrock touch sprites: baked into the binary by `build.rs`, so they
+        // are present even when the private files are not on the device.
+        if let Some(gui) = gui.as_mut()
+            && let Err(error) = gui.add_baked_bedrock()
+        {
+            eprintln!("baked bedrock controls: {error}");
         }
         let block_table = Arc::new(server.world.table.clone());
         let net = match server_address {
@@ -498,8 +492,6 @@ struct PlayState {
     gui: Option<crate::gui::GuiSprites>,
     /// Sprite quads sampled from `gui`.
     gui_sprites: Vec<HudSprite>,
-    /// Rotated geometry for the held block, drawn from the world atlas.
-    hand: Vec<crate::render::SpriteVertex>,
     /// The inventory and crafting screen: open flag, carried stack, grid.
     screen: InventoryScreen,
     /// Pointer position in normalized screen coordinates, so a mouse click
@@ -858,6 +850,7 @@ impl PlayApp {
             inventory.slots(),
             inventory,
             Some(&state.atlas),
+            state.gui.as_ref(),
             state.touch_active,
             size.width,
             size.height,
@@ -883,24 +876,6 @@ impl PlayApp {
             size.height,
             state.pointer,
         );
-        state.hand.clear();
-        let held = inventory.icon_texture(inventory.selected());
-        let hand = held.and_then(|texture| {
-            let atlas = &state.atlas;
-            let uv = atlas.uv(&texture)?;
-            let sway = (state.bob_phase * 0.5).sin() * 0.012;
-            let rise = state.bob_phase.sin().abs() * 0.02;
-            Some(crate::render::hud_sprite_rotated(
-                [0.66 + sway, 0.90 - rise],
-                [0.13, 0.13],
-                -0.35,
-                uv,
-                [1.0; 4],
-            ))
-        });
-        if let Some(vertices) = hand {
-            state.hand.extend_from_slice(&vertices);
-        }
         fill_gui(
             &mut state.hud,
             &mut state.gui_sprites,
@@ -924,7 +899,7 @@ impl PlayApp {
                     .gui
                     .as_ref()
                     .map(|gui| (gui, state.gui_sprites.as_slice())),
-                &state.hand,
+                &[],
             )
             .map_err(|error| error.to_string())?;
         state.frames_presented += 1;
@@ -1092,7 +1067,6 @@ impl ApplicationHandler for PlayApp {
             hud: Vec::new(),
             sprites: Vec::new(),
             gui_sprites: Vec::new(),
-            hand: Vec::new(),
             screen: InventoryScreen::default(),
             pointer: [0.5, 0.5],
             look: None,
@@ -1375,9 +1349,9 @@ fn merge_movement(keyboard: Input, touch: Input) -> Input {
 }
 
 /// Height of the vanilla hotbar strip as a fraction of the screen height.
-const HOTBAR_GUI_SCALE: f32 = 0.23;
-/// Width of the hotbar sheet's nine slots in GUI pixels (182 - borders).
-const HOTBAR_GUI_SLOTS: f32 = 18.2;
+const HOTBAR_GUI_HEIGHT: f32 = 0.115;
+/// Gap between the hotbar strip and the bottom screen edge, in pixels.
+const HOTBAR_GUI_MARGIN_PX: f32 = 20.0;
 
 /// The block and item sprites the touch hotbar draws.
 ///
@@ -1439,6 +1413,7 @@ fn fill_hud(
     slots: &[Option<ItemStack>; 9],
     inventory: &Inventory,
     atlas: Option<&TextureAtlas>,
+    gui: Option<&crate::gui::GuiSprites>,
     active: bool,
     width: u32,
     height: u32,
@@ -1466,14 +1441,24 @@ fn fill_hud(
     // Place and break read as a plus and a cross instead of bare squares.
     hud.extend(action_glyphs(touch));
     let hotbar = touch.hotbar_rects();
-    for (rect, _) in &hotbar {
-        hud.extend_from_slice(&hud_rect(
-            rect[0],
-            rect[1],
-            rect[2],
-            rect[3],
-            HOTBAR_SLOT_COLOR,
-        ));
+    // With the vanilla GUI atlas the strip already draws its nine slots; the
+    // drawn backgrounds would only sit on top of it as grey boxes.
+    let vanilla_strip = atlas.is_some() && gui.is_some_and(|gui| gui.has_vanilla());
+    if !vanilla_strip {
+        for (rect, _) in &hotbar {
+            hud.extend_from_slice(&hud_rect(
+                rect[0],
+                rect[1],
+                rect[2],
+                rect[3],
+                HOTBAR_SLOT_COLOR,
+            ));
+        }
+    }
+    // The vanilla strip draws its own selection frame, so the fallback
+    // swatches and the bright overlay would only sit on top of it.
+    if vanilla_strip {
+        return;
     }
     for (slot, (rect, _)) in hotbar.iter().enumerate() {
         let inset_x = rect[2] * HOTBAR_SWATCH_INSET;
@@ -1545,37 +1530,46 @@ fn fill_gui(
     if panel_open {
         return;
     }
-    // The hotbar sprite is 182x22 vanilla pixels, nine 20x20 slots plus the
-    // 2-pixel border. Scale it so one slot matches a touch slot when the
-    // touch HUD is up, otherwise keep the classic anchored size.
-    let slot = if touch_active {
-        touch.hotbar_rects()[0].0[2]
-    } else {
-        (height as f32 * HOTBAR_GUI_SCALE) / height as f32
-    };
-    let strip_width = slot * (HOTBAR_GUI_SLOTS / 9.0) * 9.0;
-    let strip_height = slot * (HOTBAR_GUI_SLOTS / 9.0);
-    let x = 0.5 - strip_width * 0.5;
-    let y = if touch_active {
-        let first = touch.hotbar_rects()[0].0;
-        first[1] + first[3] * 0.02 - strip_height + first[3] * 0.98
-    } else {
-        1.0 - strip_height - 0.01
-    };
+    // The vanilla sheet is 182x22 pixels (nine 20x20 slots plus a 1-pixel
+    // border). Its aspect is fixed, so the on-screen height decides the
+    // width — never the other way round.
+    let screen_h = height.max(1) as f32;
+    let screen_w = width.max(1) as f32;
+    let mut strip_h = screen_h * HOTBAR_GUI_HEIGHT;
+    let mut strip_w = strip_h * (182.0 / 22.0);
+    if strip_w > screen_w * 0.98 {
+        // A narrow window shrinks the strip by width, keeping the aspect.
+        strip_w = screen_w * 0.98;
+        strip_h = strip_w * (22.0 / 182.0);
+    }
+    // Pinned to the bottom edge, 10 px above it, centred.
+    let margin = (HOTBAR_GUI_MARGIN_PX / screen_h).min(0.06);
+    let x = 0.5 - (strip_w / screen_w) * 0.5;
+    let y = 1.0 - margin - strip_h / screen_h;
+    let strip = [x, y, strip_w / screen_w, strip_h / screen_h];
     if let Some(uv) = gui.uv("hotbar") {
         gui_sprites.push(HudSprite {
-            rect: [x, y, strip_width, strip_height],
+            rect: strip,
             uv,
             color: [1.0; 4],
         });
     }
-    // The selection frame is centred on the selected slot.
-    let frame = slot * (24.0 / 20.0);
-    let slot_x = x + strip_width * (selected as f32 + 0.5) / 9.0;
-    let slot_y = y + strip_height * 0.5;
+    // One slot is 20x20 of the 182 pixels; the selection frame is 24x24 and
+    // must stay square, so both axes scale identically.
+    let scale = strip_h / 22.0;
+    let slot_w = 20.0 * scale / screen_w;
+    let frame_w = 24.0 * scale / screen_w;
+    let frame_h = 24.0 * scale / screen_h;
+    let slot_x = x + 1.0 * scale / screen_w + slot_w * (selected as f32 + 0.5);
+    let slot_y = y + strip[3] * 0.5;
     if let Some(uv) = gui.uv("hotbar_selected") {
         gui_sprites.push(HudSprite {
-            rect: [slot_x - frame * 0.5, slot_y - frame * 0.5, frame, frame],
+            rect: [
+                slot_x - frame_w * 0.5,
+                slot_y - frame_h * 0.5,
+                frame_w,
+                frame_h,
+            ],
             uv,
             color: [1.0; 4],
         });
@@ -1616,7 +1610,7 @@ fn fill_gui(
     }
     // The vanilla crosshair icon is 15x15 pixels of a 256-pixel sheet; draw
     // it at the same GUI scale as a hotbar slot.
-    let cross = (slot * 15.0 / 20.0).max(0.008);
+    let cross = ((15.0 * scale) / screen_h).max(0.008);
     if let Some(uv) = gui.uv("crosshair") {
         gui_sprites.push(HudSprite {
             rect: [0.5 - cross * 0.5, 0.5 - cross * 0.5, cross, cross],
@@ -2117,6 +2111,7 @@ mod tests {
             inventory.slots(),
             &inventory,
             None,
+            None,
             true,
             800,
             600,
@@ -2503,6 +2498,7 @@ mod tests {
             &slots,
             &Inventory::creative(),
             None,
+            None,
             false,
             800,
             600,
@@ -2515,6 +2511,7 @@ mod tests {
             &touch,
             &slots,
             &Inventory::creative(),
+            None,
             None,
             true,
             800,
@@ -2542,6 +2539,7 @@ mod tests {
             &touch,
             &slots,
             &Inventory::creative(),
+            None,
             None,
             false,
             800,
@@ -2633,6 +2631,7 @@ mod tests {
             &slots,
             &creative,
             Some(&atlas),
+            None,
             true,
             800,
             600,
@@ -2689,6 +2688,7 @@ mod tests {
             &slots,
             &creative,
             None,
+            None,
             true,
             800,
             600,
@@ -2708,6 +2708,7 @@ mod tests {
             &touch,
             &slots,
             &creative,
+            None,
             None,
             true,
             800,
@@ -2750,6 +2751,7 @@ mod tests {
             touch,
             survival.inventory.slots(),
             &survival.inventory,
+            None,
             None,
             true,
             800,
@@ -2795,6 +2797,7 @@ mod tests {
                 &touch,
                 survival.inventory.slots(),
                 &survival.inventory,
+                None,
                 None,
                 true,
                 800,

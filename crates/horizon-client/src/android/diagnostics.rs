@@ -231,29 +231,23 @@ pub fn previous_unclean(home: &Path) -> bool {
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
         .is_some_and(|v| v["clean_exit"] != true)
 }
-pub fn summary(home: &Path) -> String {
-    summary_in(home, crate::launcher_i18n::Language::English)
-}
+/// The two sentences [`summary`] answers with, so the launcher can render them in its
+/// own language while this module stays free of the rest of the client.
+pub const SUMMARY_UNCLEAN: &str = "Previous session ended without a clean exit; last phase: {phase}. This may be a crash or an Android process kill. Export diagnostics before reporting.";
+pub const SUMMARY_CLEAN: &str = "Local logs and Android exit history are available in Reports. Export diagnostics to attach a ZIP; review it before sharing.";
 
-/// [`summary`] in the launcher's language, for the line the status bar shows.
-pub fn summary_in(home: &Path, language: crate::launcher_i18n::Language) -> String {
-    use crate::launcher_i18n::tr;
+pub fn summary(home: &Path) -> String {
+    // This module is also built on its own by tools/test_android_diagnostics.py, without
+    // the rest of the client, so it names its two sentences here and the launcher's
+    // translation table learns them (launcher_i18n.rs) rather than the other way round.
     let previous = fs::read(home.join("performance/previous-session.json"))
         .ok()
         .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
     match previous {
         Some(v) if v["clean_exit"] != true => {
-            let template = tr(
-                language,
-                "Previous session ended without a clean exit; last phase: {phase}. This may be a crash or an Android process kill. Export diagnostics before reporting.",
-            );
-            template.replace("{phase}", v["phase"].as_str().unwrap_or("unknown"))
+            SUMMARY_UNCLEAN.replace("{phase}", v["phase"].as_str().unwrap_or("unknown"))
         }
-        _ => tr(
-            language,
-            "Local logs and Android exit history are available in Reports. Export diagnostics to attach a ZIP; review it before sharing.",
-        )
-        .to_owned(),
+        _ => SUMMARY_CLEAN.into(),
     }
 }
 /// Best-effort redaction, not a promise that arbitrary third-party text is public.

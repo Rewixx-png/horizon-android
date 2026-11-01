@@ -1988,8 +1988,7 @@ impl Launcher {
                 // The journal: what failed and what was imported, newest last, so a
                 // refused mod can be read on the phone without exporting anything.
                 let lines = crate::diagnostics::recent_lines(&self.home, 40);
-                let summary =
-                    crate::diagnostics::summary_in(&self.home, self.catalog.config.language);
+                let summary = crate::diagnostics::summary(&self.home);
                 self.catalog.status = if lines.is_empty() {
                     summary
                 } else {

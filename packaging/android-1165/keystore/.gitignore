@@ -1,0 +1,3 @@
+# Signing material is normally ignored (see the repository .gitignore), but the
+# 1.16.5 developer key is committed on purpose, see README.md.
+!horizon-1165-dev.jks

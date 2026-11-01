@@ -59,7 +59,7 @@ const HOTBAR_SELECTED_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.40];
 const HOTBAR_SWATCH_INSET: f32 = 0.2;
 /// How many leading [`TouchControls::hud_rects`] entries are the joystick
 /// base and knob, which are drawn as discs rather than rectangles.
-const JOYSTICK_DISCS: usize = 2;
+const JOYSTICK_DISCS: usize = 5;
 /// Wedges in one joystick disc: 24 keeps the rim smooth at phone widths for a
 /// few dozen vertices per circle.
 const DISC_SEGMENTS: usize = 24;
@@ -421,6 +421,8 @@ struct PlayState {
     net: Option<crate::net::NetHandle>,
     /// Last position reported to the server, to avoid redundant packets.
     sent_position: Option<[f64; 3]>,
+    /// View-bob phase, advanced while walking on the ground.
+    bob_phase: f32,
     assets: VanillaAssets,
     atlas: TextureAtlas,
     mesh: Mesh,
@@ -724,8 +726,10 @@ impl PlayApp {
         };
         let touch = state.touch.frame();
         let mut movement = merge_movement(state.movement, touch.movement);
-        // A joystick-zone tap is a one-tick jump, ORed with a held Space.
+        // The Jump button (or a held Space) is a one-tick pulse.
         movement.jump |= touch.jump;
+        // The D-pad's centre cell is a sticky sneak toggle.
+        movement.sneak |= touch.sneak;
         let input = FrameInput {
             movement,
             look: merged_look(
@@ -762,6 +766,18 @@ impl PlayApp {
                 state.sent_position = Some(position);
             }
         }
+        // View bobbing: phase follows horizontal speed and only runs on the
+        // ground, like vanilla's `bobView`.
+        let player = &state.server.player;
+        let speed = (player.velocity[0] * player.velocity[0]
+            + player.velocity[2] * player.velocity[2])
+            .sqrt();
+        if player.on_ground && speed > 0.02 {
+            state.bob_phase =
+                (state.bob_phase + speed as f32 * 0.6) % (std::f32::consts::TAU * 4.0);
+        } else {
+            state.bob_phase *= 0.8;
+        }
         let chunk = player_chunk(&state.server.player);
         let changed = state.server.dirty || chunk != state.last_chunk;
         if changed {
@@ -778,7 +794,7 @@ impl PlayApp {
         let Some(state) = self.state.as_mut() else {
             return Ok(());
         };
-        let camera = camera_for(&state.server.player);
+        let camera = camera_for_with_bob(&state.server.player, state.bob_phase);
         let size = state.window.inner_size();
         // Keyboard digits, the wheel and touch all converge on the active
         // inventory, so mirror its selection into the touch HUD's highlight.
@@ -973,6 +989,7 @@ impl ApplicationHandler for PlayApp {
             world_root: pending.world_root,
             net: pending.net,
             sent_position: None,
+            bob_phase: 0.0,
             assets: pending.assets,
             atlas: pending.atlas,
             mesh: pending.mesh,
@@ -1220,9 +1237,16 @@ fn mesh_supersedes(result_generation: u64, installed_generation: u64) -> bool {
 }
 
 /// A first-person camera at the player's eye looking along [`Player::look`].
-fn camera_for(player: &Player) -> Camera {
+/// The first-person camera, with vanilla-ish view bobbing.
+///
+/// `phase` advances while the player walks on the ground; the eye rises and
+/// falls by up to 5 cm and sways sideways by 3 cm, which is the amount the
+/// 1.16.5 `bobView` uses at normal speed.
+fn camera_for_with_bob(player: &Player, phase: f32) -> Camera {
     let eye = player.eye();
-    let eye = [eye[0] as f32, eye[1] as f32, eye[2] as f32];
+    let sway_x = (phase * 0.5).sin() * 0.03;
+    let bob_y = phase.sin().abs() * 0.05;
+    let eye = [eye[0] as f32 + sway_x, eye[1] as f32 - bob_y, eye[2] as f32];
     let look = player.look();
     Camera::looking_at(eye, [eye[0] + look[0], eye[1] + look[1], eye[2] + look[2]])
 }
@@ -1602,7 +1626,7 @@ fn action_glyphs(screen: &crate::touch::TouchControls) -> Vec<HudVertex> {
     let rects = screen.hud_rects();
     let mut glyphs = Vec::with_capacity(18);
     // Place: a plus.
-    if let Some((rect, _)) = rects.get(2) {
+    if let Some((rect, _)) = rects.get(6) {
         let (cx, cy) = (rect[0] + rect[2] * 0.5, rect[1] + rect[3] * 0.5);
         let arm = rect[2] * 0.28;
         let thin = rect[2] * 0.055;
@@ -1617,7 +1641,7 @@ fn action_glyphs(screen: &crate::touch::TouchControls) -> Vec<HudVertex> {
         ));
     }
     // Attack: a cross.
-    if let Some((rect, _)) = rects.get(3) {
+    if let Some((rect, _)) = rects.get(7) {
         let (cx, cy) = (rect[0] + rect[2] * 0.5, rect[1] + rect[3] * 0.5);
         let arm = rect[2] * 0.22;
         let thin = rect[2] * 0.055;

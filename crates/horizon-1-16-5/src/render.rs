@@ -313,6 +313,9 @@ struct Camera {
 @group(0) @binding(0) var<uniform> camera: Camera;
 
 const SKY: vec3<f32> = vec3<f32>(0.47, 0.65, 1.0);
+// The sky reads lighter at the horizon and deeper overhead.
+const SKY_HORIZON: vec3<f32> = vec3<f32>(0.62, 0.74, 1.0);
+const SKY_ZENITH: vec3<f32> = vec3<f32>(0.30, 0.48, 0.92);
 const FOG_NEAR: f32 = 48.0;
 const FOG_FAR: f32 = 96.0;
 
@@ -320,7 +323,8 @@ const FOG_FAR: f32 = 96.0;
 fn fogged(color: vec3<f32>, world: vec3<f32>) -> vec3<f32> {
     let distance = length(world - camera.eye.xyz);
     let amount = clamp((distance - FOG_NEAR) / (FOG_FAR - FOG_NEAR), 0.0, 1.0);
-    return mix(color, SKY, amount);
+    let horizon = mix(SKY_HORIZON, SKY_ZENITH, clamp((world.y - camera.eye.y + 48.0) / 160.0, 0.0, 1.0));
+    return mix(color, horizon, amount);
 }
 @group(0) @binding(1) var atlas_texture: texture_2d<f32>;
 @group(0) @binding(2) var atlas_sampler: sampler;
@@ -347,11 +351,9 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     output.uv = input.uv;
     output.world = input.position;
     output.tint = input.tint;
-    let normal = normalize(input.normal);
-    // Vanilla's directional terms on top of the baked sky/block light: top
-    // faces are brightest, bottom faces darkest, the four sides between.
-    let face = 0.6 + 0.4 * max(normal.y, 0.0) - 0.2 * max(-normal.y, 0.0);
-    output.light = input.level * face;
+    // The CPU already multiplied in vanilla's per-face shade (1.0 / 0.8 /
+    // 0.6 / 0.5), so the vertex value is the final brightness.
+    output.light = input.level;
     return output;
 }
 
@@ -1053,15 +1055,18 @@ pub fn sky_clear() -> wgpu::Color {
 
 /// Vanilla's face shading: top faces brightest, bottom darkest, sides between.
 fn face_shade(normal: [f32; 3]) -> f32 {
-    let length = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
-    let up = if length > 1e-6 {
-        normal[1] / length
+    // Vanilla's per-face brightness (`Block.getShade`/`Direction` constants):
+    // top 1.0, north/south 0.8, east/west 0.6, bottom 0.5.
+    let x = normal[0].abs();
+    let y = normal[1].abs();
+    let z = normal[2].abs();
+    if y >= x && y >= z {
+        if normal[1] >= 0.0 { 1.0 } else { 0.5 }
+    } else if z >= x {
+        0.8
     } else {
-        0.0
-    };
-    // The baked light already carries sky/block light; this term keeps faces
-    // distinguishable under uniform lighting.
-    0.6 + 0.4 * up.max(0.0) - 0.2 * (-up).max(0.0)
+        0.6
+    }
 }
 
 /// The fixed plains biome tint for a quad's texture name.

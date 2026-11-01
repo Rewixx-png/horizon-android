@@ -1,22 +1,30 @@
 plugins { id 'com.android.application' version '8.11.1' }
 
+// The developer signing key is committed at packaging/android-1165/keystore/
+// horizon-1165-dev.jks. tools/android_build_1165.py exports its path and
+// password through the environment; a CI secret can override the password.
+def devKeystorePath = System.getenv('HORIZON_1165_KEYSTORE') ?:
+        file('keystore/horizon-1165-dev.jks').absolutePath
+def devKeystorePassword = System.getenv('HORIZON_1165_KEYSTORE_PASSWORD') ?:
+        'horizon1165'
+
 android {
     namespace 'dev.horizon.android1165'
     compileSdk 35
     defaultConfig {
-        applicationId 'dev.horizon.android1165'
+        applicationId 'com.rewixx.horizon1165'
         minSdk 28
         targetSdk 35
-        versionCode 9
-        versionName '0.1.8-dev'
+        versionCode 10
+        versionName '0.1.9-dev'
         ndk { abiFilters providers.gradleProperty('abi').getOrElse('arm64-v8a') }
     }
     signingConfigs {
         development {
-            storeFile file('../../.local/android-1165/debug.keystore')
-            storePassword 'android'
-            keyAlias 'androiddebugkey'
-            keyPassword 'android'
+            storeFile file(devKeystorePath)
+            storePassword devKeystorePassword
+            keyAlias 'horizon1165'
+            keyPassword devKeystorePassword
         }
     }
     buildTypes {

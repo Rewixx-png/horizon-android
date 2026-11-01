@@ -6,7 +6,9 @@
 //! sneak x0.3), air acceleration 0.02 and a jump velocity of 0.42. Collision
 //! is axis-separated AABB overlap against [`crate::blocks::is_solid`] with a
 //! grounded 0.6 step-up, so a full block still stops the player while
-//! half-block ledges can be walked onto.
+//! half-block ledges can be walked onto. A grounded player holding sneak is
+//! additionally stopped at ledges: a horizontal step that would leave the
+//! collision box without ground beneath it is refused.
 
 use crate::BlockSource;
 use crate::blocks::is_solid;
@@ -229,6 +231,17 @@ impl Player {
     /// Moves along one axis by `delta`, resolving collisions against solid
     /// blocks. Grounded horizontal moves attempt the 0.6 step-up.
     fn move_axis(&mut self, world: &dyn BlockSource, axis: usize, delta: f64) {
+        // A sneaking, grounded player stops at ledges instead of walking
+        // over the edge: shrink the horizontal step until the collision box
+        // still has ground under it (vanilla `adjustMovementForSneaking`).
+        let delta = if axis != 1 {
+            self.sneak_guard(world, axis, delta)
+        } else {
+            delta
+        };
+        if delta == 0.0 {
+            return;
+        }
         self.position[axis] += delta;
         let Some(face) = self.face_hit(world, axis, delta) else {
             if axis == 1 {
@@ -387,6 +400,85 @@ impl Player {
             true
         }
     }
+
+    /// Vanilla's sneak edge guard: shrinks a horizontal move until the
+    /// player box, dropped one block, still overlaps solid ground. Returns
+    /// the largest safe step, or zero when even a hair of movement would
+    /// leave the player over the void.
+    fn sneak_guard(&self, world: &dyn BlockSource, axis: usize, delta: f64) -> f64 {
+        const STEP: f64 = 0.05;
+        if !self.sneaking || !self.on_ground || self.flying {
+            return delta;
+        }
+        let mut allowed = delta;
+        loop {
+            if allowed == 0.0 {
+                return 0.0;
+            }
+            if self.has_ground_beneath(world, axis, allowed) {
+                return allowed;
+            }
+            if allowed.abs() <= STEP {
+                return 0.0;
+            }
+            allowed -= STEP.copysign(delta);
+        }
+    }
+
+    /// Whether the collision box moved by `offset` along `axis` and dropped
+    /// one block still touches a solid block (vanilla `isSpaceEmpty` of the
+    /// box offset down by one).
+    fn has_ground_beneath(&self, world: &dyn BlockSource, axis: usize, offset: f64) -> bool {
+        let mut position = self.position;
+        position[axis] += offset;
+        let half = Self::HALF_WIDTH;
+        solid_in_box(
+            world,
+            [position[0] - half, position[1] - 1.0, position[2] - half],
+            [
+                position[0] + half,
+                position[1] + Self::HEIGHT - 1.0,
+                position[2] + half,
+            ],
+        )
+    }
+}
+
+/// Whether any solid block overlaps the axis-aligned box `min..max`.
+fn solid_in_box(world: &dyn BlockSource, min: [f64; 3], max: [f64; 3]) -> bool {
+    const EPSILON: f64 = 1e-9;
+    let x0 = min[0].floor() as i32;
+    let y0 = min[1].floor() as i32;
+    let z0 = min[2].floor() as i32;
+    let x1 = max[0].floor() as i32;
+    let y1 = max[1].floor() as i32;
+    let z1 = max[2].floor() as i32;
+    for y in y0..=y1 {
+        for z in z0..=z1 {
+            for x in x0..=x1 {
+                let bx = x as f64;
+                let by = y as f64;
+                let bz = z as f64;
+                if min[0] >= bx + 1.0 - EPSILON
+                    || max[0] <= bx + EPSILON
+                    || min[1] >= by + 1.0 - EPSILON
+                    || max[1] <= by + EPSILON
+                    || min[2] >= bz + 1.0 - EPSILON
+                    || max[2] <= bz + EPSILON
+                {
+                    continue;
+                }
+                if world
+                    .state_at(x, y, z)
+                    .map(|state| is_solid(&state.name))
+                    .unwrap_or(false)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -490,6 +582,49 @@ mod tests {
         assert!(player.position[0] + Player::HALF_WIDTH <= 1.0 + 1e-12);
         assert!(player.position[0] < 1.0);
         assert_eq!(player.position[1], 0.0);
+    }
+
+    #[test]
+    fn sneaking_stops_at_a_bridge_edge() {
+        // A one-wide bridge along X; walking toward +Z steps off its side.
+        let mut world = MapSource::default();
+        for x in -6..=6 {
+            world.states.insert([x, -1, 0], stone());
+        }
+        let sneak = Input {
+            forward: true,
+            sneak: true,
+            ..Input::default()
+        };
+        let mut sneaker = Player::new([0.0, 0.0, 0.0]);
+        sneaker.on_ground = true;
+        for _ in 0..60 {
+            sneaker.tick(&world, &sneak);
+        }
+        assert!(sneaker.sneaking);
+        assert!(sneaker.on_ground, "{:?}", sneaker.position);
+        assert_eq!(sneaker.position[1], 0.0);
+        // Moved onto the bridge edge and stopped there instead of falling.
+        assert!(sneaker.position[2] > 0.0);
+        assert!(
+            sneaker.position[2] <= 1.0 + Player::HALF_WIDTH + 1e-9,
+            "{:?}",
+            sneaker.position
+        );
+
+        // The same input without sneak walks off and drops into the void.
+        let walk = Input {
+            forward: true,
+            ..Input::default()
+        };
+        let mut walker = Player::new([0.0, 0.0, 0.0]);
+        walker.on_ground = true;
+        for _ in 0..60 {
+            walker.tick(&world, &walk);
+        }
+        assert!(walker.position[2] > 1.0, "{:?}", walker.position);
+        assert!(!walker.on_ground, "{:?}", walker.position);
+        assert!(walker.position[1] < 0.0, "{:?}", walker.position);
     }
 
     #[test]

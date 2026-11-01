@@ -7,20 +7,28 @@ the prepared private inputs bundled as ``assets/1165.zip`` (``world/...``,
 ``tables.json`` and ``client.jar`` at the zip root).
 
 The inputs stay in ``.local/`` and never enter Git.  The Rust library is built
-with the workspace's fast profile; APK staging, the throwaway debug keystore,
-Gradle's build directory and the finished APK all stay under
-``.local/android-1165``.
+with the workspace's fast profile; APK staging, Gradle's build directory and
+the finished APK all stay under ``.local/android-1165``.  Every APK is signed
+with the repository's committed developer key
+(``packaging/android-1165/keystore/horizon-1165-dev.jks``), so consecutive
+builds share one certificate and install over each other.
 
 Usage:
     python3 tools/android_build_1165.py --abi arm64-v8a
     python3 tools/android_build_1165.py --abi arm64-v8a --skip-rust
-    python3 tools/android_build_1165.py --abi arm64-v8a \\
-        --sdk /opt/android-sdk --java-home /usr/lib/jvm/java-21-openjdk-amd64 \\
+    python3 tools/android_build_1165.py --abi arm64-v8a \
+        --sdk /opt/android-sdk --java-home /usr/lib/jvm/java-21-openjdk-amd64 \
         --gradle /opt/gradle/gradle-8.14.3/bin/gradle
 
+Signing always uses the committed developer keystore
+``packaging/android-1165/keystore/horizon-1165-dev.jks`` (alias ``horizon1165``,
+password ``horizon1165``); ``--keystore PATH`` and ``--keystore-password VALUE``
+exist only for local experiments.  The script never generates a key: a missing
+keystore is an error, because a fresh key would break APK updates.
+
 The script is non-interactive.  It needs the Android SDK (build-tools and an
-NDK with the ``aarch64-linux-android28-clang`` driver), Java/keytool, Gradle
-8.13-8.x, and a Rust toolchain with the matching Android target.  The
+NDK with the ``aarch64-linux-android28-clang`` driver), Java (for apksigner),
+Gradle 8.13-8.x, and a Rust toolchain with the matching Android target.  The
 APK is written to ``.local/android-1165/apk/<abi>/horizon-1165-dev.apk`` and
 verified with ``apksigner`` before the script exits.
 """
@@ -46,6 +54,16 @@ TARGETS = {
     'x86': 'i686-linux-android',
 }
 MIN_SDK = 28
+
+# The developer signing key is committed on purpose: every APK must carry the
+# same certificate so a new build installs over an older one.  It signs only
+# this private dev APK and must never be used for a public release.
+DEV_KEYSTORE = PROJECT / 'keystore' / 'horizon-1165-dev.jks'
+DEV_KEY_ALIAS = 'horizon1165'
+DEV_KEYSTORE_PASSWORD = 'horizon1165'
+# Gradle reads these so the password never appears in the logged command line.
+DEV_KEYSTORE_ENV = 'HORIZON_1165_KEYSTORE'
+DEV_KEYSTORE_PASSWORD_ENV = 'HORIZON_1165_KEYSTORE_PASSWORD'
 
 
 class BuildError(RuntimeError):
@@ -173,6 +191,20 @@ def build_assets_zip(output, world, tables, client_jar):
         f'({len(world_files)} world files, {output.stat().st_size / (1024 * 1024):.1f} MiB)')
 
 
+def resolve_keystore(override):
+    """Return the signing keystore, refusing to invent one when it is missing."""
+    keystore = (Path(override).expanduser() if override else DEV_KEYSTORE).resolve()
+    require(
+        keystore.is_file(),
+        f'signing keystore not found: {keystore}\n'
+        'The developer key is committed at '
+        f'{DEV_KEYSTORE.relative_to(ROOT).as_posix()}. Restore it with '
+        '"git checkout -- packaging/android-1165/keystore"; never generate a '
+        'new key, because a different certificate makes Android refuse to '
+        'install the APK over an older build.')
+    return keystore
+
+
 def build(args):
     abi = args.abi
     target = TARGETS[abi]
@@ -217,9 +249,7 @@ def build(args):
     require(strip.is_file(), f'NDK strip tool not found: {strip}')
 
     java = java_home / 'bin' / f'java{suffix}'
-    keytool = java_home / 'bin' / f'keytool{suffix}'
     require(java.is_file(), f'Java executable not found: {java}; pass --java-home PATH')
-    require(keytool.is_file(), f'keytool not found: {keytool}; pass --java-home PATH')
 
     world = VERSION_DIR / 'world'
     tables = VERSION_DIR / 'tables.json'
@@ -287,15 +317,10 @@ def build(args):
     shutil.copyfile(notices, assets / 'THIRD_PARTY_NOTICES.md')
     build_assets_zip(assets / ASSET_NAME, world, tables, client_jar)
 
-    keystore = LOCAL / 'debug.keystore'
-    if not keystore.is_file():
-        keystore.parent.mkdir(parents=True, exist_ok=True)
-        run([keytool, '-genkeypair', '-keystore', keystore,
-             '-storepass', 'android', '-keypass', 'android',
-             '-alias', 'androiddebugkey', '-keyalg', 'RSA', '-keysize', '2048',
-             '-validity', '3650',
-             '-dname', 'CN=Horizon 1.16.5 Development'])
-    require(keystore.is_file(), f'debug keystore was not created: {keystore}')
+    keystore = resolve_keystore(args.keystore)
+    environment[DEV_KEYSTORE_ENV] = str(keystore)
+    environment[DEV_KEYSTORE_PASSWORD_ENV] = args.keystore_password
+    log(f'Signing keystore: {keystore} (alias {DEV_KEY_ALIAS})')
 
     run([gradle, '--no-daemon', '-p', PROJECT, f'-Pabi={abi}', 'assembleDebug'],
         cwd=ROOT, env=environment)
@@ -335,11 +360,21 @@ def main(argv=None):
     parser.add_argument('--sdk', type=Path,
                         help='Android SDK root (default: ANDROID_HOME or /opt/android-sdk)')
     parser.add_argument('--java-home', type=Path,
-                        help='JDK root containing bin/java and bin/keytool')
+                        help='JDK root containing bin/java')
     parser.add_argument('--gradle', type=Path,
                         help='Gradle 8.13-8.x executable (otherwise discover it)')
     parser.add_argument('--skip-rust', action='store_true',
                         help='Reuse the existing cargo fast-profile library')
+    parser.add_argument('--keystore', type=Path,
+                        help='Signing keystore override (default: the committed '
+                             'packaging/android-1165/keystore/horizon-1165-dev.jks)')
+    parser.add_argument('--keystore-password',
+                        default=os.environ.get(DEV_KEYSTORE_PASSWORD_ENV,
+                                              DEV_KEYSTORE_PASSWORD),
+                        help='Keystore and key password (default: the '
+                             f'{DEV_KEYSTORE_PASSWORD_ENV} environment variable '
+                             f'or {DEV_KEYSTORE_PASSWORD}); never put it on the '
+                             'Gradle command line')
     args = parser.parse_args(argv)
     try:
         build(args)

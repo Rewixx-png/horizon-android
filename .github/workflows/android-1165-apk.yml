@@ -28,6 +28,17 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Check the committed developer keystore
+        run: |
+          keystore=packaging/android-1165/keystore/horizon-1165-dev.jks
+          if [ ! -f "$keystore" ]; then
+            echo "::error::$keystore is missing; restore it from Git. Never generate a new key: a different certificate breaks APK updates."
+            exit 1
+          fi
+          keytool_bin="$(command -v keytool || echo "${JAVA_HOME:-/usr/lib/jvm/default-java}/bin/keytool")"
+          "$keytool_bin" -list -v -keystore "$keystore" -storepass horizon1165 \
+            | grep -F "C7:13:F9:5E:2F:4A:CF:48:14:FC:F3:35:F3:C3:A0:04:3A:DD:10:C2:31:4B:84:13:30:2F:0D:99:0C:9B:CE:06"
+
       - name: Free runner disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android/sdk/ndk/26.* /usr/local/lib/android/sdk/system-images
@@ -74,6 +85,12 @@ jobs:
             --sdk "$ANDROID_HOME" \
             --gradle "$GRADLE"
 
+      - name: Verify the APK carries the committed developer certificate
+        run: |
+          apk=.local/android-1165/apk/arm64-v8a/horizon-1165-dev.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$apk" \
+            | grep -F "c713f95e2f4acf4814fcf335f3c3a0043add10c2314b8413302f0d990c9bce06"
+
       - name: Write checksums
         run: |
           cd .local/android-1165/apk/arm64-v8a
@@ -94,7 +111,9 @@ jobs:
           tag="v1.16.5-dev.${GITHUB_RUN_ID}"
           apk=".local/android-1165/apk/arm64-v8a/horizon-1165-dev.apk"
           sums=".local/android-1165/apk/arm64-v8a/SHA256SUMS.txt"
-          notes="Developer 1.16.5 slice built from ${GITHUB_SHA} for arm64-v8a. This APK bundles the private prepared client jar, tables and fixture world; it is a draft and must not be published as a public redistribution. Touch: left joystick, right look/tap-break, bottom-right place. No save/load yet."
+          key="packaging/android-1165/keystore/horizon-1165-dev.jks"
+          sha256="C7:13:F9:5E:2F:4A:CF:48:14:FC:F3:35:F3:C3:A0:04:3A:DD:10:C2:31:4B:84:13:30:2F:0D:99:0C:9B:CE:06"
+          notes="Developer 1.16.5 slice built from ${GITHUB_SHA} for arm64-v8a. This APK bundles the private prepared client jar, tables and fixture world; it is a draft and must not be published as a public redistribution. It is signed with the repository developer key ${key} (SHA-256 ${sha256}), so it installs over older dev builds; that key is development-only and must never sign a public release. Touch: left joystick, right look/tap-break, bottom-right place. No save/load yet."
           gh release create "$tag" "$apk" "$sums" LICENSE THIRD_PARTY_NOTICES.md \
             --draft \
             --target "$GITHUB_SHA" \

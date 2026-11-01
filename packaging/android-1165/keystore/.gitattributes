@@ -1,0 +1,2 @@
+# Keep the committed developer keystore byte-exact (no EOL conversion).
+*.jks binary

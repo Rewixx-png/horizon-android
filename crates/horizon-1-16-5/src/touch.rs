@@ -1,27 +1,31 @@
 //! On-screen touch controls for the 1.16.5 Android target.
 //!
-//! The phone layout is deliberately simple and fixed so that every gesture is
+//! The phone layout mirrors Bedrock's fixed controls so that every gesture is
 //! deterministic and testable without an Android device:
 //!
-//! - the left 45% of the screen is a virtual joystick whose base sits in the
-//!   bottom-left corner. Direction and magnitude (relative to the smaller
-//!   screen side) drive [`Input::forward`], [`Input::back`], [`Input::left`]
-//!   and [`Input::right`]; a short tap with no drag jumps;
-//! - the rest of the screen is the look zone: dragging reports degree deltas
-//!   in the desktop mouse convention (`yaw -= look[0]`, `pitch += look[1]`),
-//!   and a short tap breaks the targeted block;
-//! - a square place button in the bottom-right corner places the held block on
-//!   press and never starts a look drag; a same-sized attack button sits just
-//!   to its left and triggers one attack/break on press;
-//! - a nine-slot hotbar sits centred just above the joystick and place button.
-//!   Tapping a slot selects it; because the hotbar is hit-tested first, such a
-//!   touch never starts a look drag, breaks a block or jumps.
+//! - the bottom-left holds a D-pad: a cross of four direction buttons around a
+//!   centre cell. Up, down, left and right drive [`Input::forward`],
+//!   [`Input::back`], [`Input::left`] and [`Input::right`]. Several buttons
+//!   may be held at once and a finger sliding between adjacent buttons ORs
+//!   their flags, so a diagonal reads as two directions;
+//! - the centre cell toggles sneak. It is sticky: the flag stays set until
+//!   the cell is pressed again, and [`TouchFrame::sneak`] reports it every
+//!   tick. The cell is tinted while sneak is active;
+//! - a large jump button sits in the bottom-right corner; the place and
+//!   attack buttons sit in a row just above it, inside the look zone;
+//! - the rest of the right half is the look zone: dragging reports degree
+//!   deltas in the desktop mouse convention (`yaw -= look[0]`,
+//!   `pitch += look[1]`), and a short tap breaks the targeted block;
+//! - a nine-slot hotbar sits centred above the D-pad and the right-hand
+//!   buttons. Tapping a slot selects it; because the hotbar is hit-tested
+//!   first, such a touch never starts a look drag, breaks a block or acts on
+//!   a button.
 //!
 //! [`TouchControls::frame`] drains the one-shot actions and the accumulated
-//! look delta for one tick while held movement keeps being reported, so it can
-//! be called unconditionally every frame. [`TouchControls::hud_rects`] and
-//! [`TouchControls::hotbar_rects`] expose the same layout as normalized
-//! rectangles for the HUD renderer.
+//! look delta for one tick while held movement and the sticky sneak flag keep
+//! being reported, so it can be called unconditionally every frame.
+//! [`TouchControls::hud_rects`] and [`TouchControls::hotbar_rects`] expose the
+//! same layout as normalized rectangles for the HUD renderer.
 //!
 //! Coordinates are physical pixels from winit with a top-left origin.
 
@@ -30,24 +34,25 @@ use std::time::{Duration, Instant};
 
 use crate::player::Input;
 
-/// Fraction of the width that belongs to the movement joystick.
-const STICK_ZONE: f32 = 0.45;
-/// Joystick radius as a fraction of the smaller screen side.
-const STICK_RADIUS: f32 = 0.12;
-/// Knob radius as a fraction of the smaller screen side (about half the base).
-const KNOB_RADIUS: f32 = 0.055;
-/// Distance between the joystick and the screen edges. Wide enough that the
-/// knob stays on screen when the stick is pushed fully into the corner.
-const STICK_MARGIN: f32 = 0.06;
-/// Deadzone as a fraction of the joystick radius: smaller offsets read neutral.
-const STICK_DEADZONE: f32 = 0.25;
-/// Side of the square place button as a fraction of the smaller screen side.
-const PLACE_SIZE: f32 = 0.18;
-/// Distance between the place button and the bottom-right corner.
-const PLACE_MARGIN: f32 = 0.03;
-/// Gap between the attack and place buttons, as a fraction of the smaller
-/// screen side. Both buttons share the same bottom row.
-const ATTACK_GAP: f32 = 0.02;
+/// Fraction of the width that belongs to the movement pad. Touches left of
+/// this line that miss every pad button are inert instead of starting a look
+/// drag.
+const PAD_ZONE: f32 = 0.45;
+/// Side of one D-pad button (and of the centre cell) as a fraction of the
+/// smaller screen side.
+const PAD_CELL: f32 = 0.18;
+/// Distance between the D-pad and the screen edges.
+const PAD_MARGIN: f32 = 0.03;
+/// Side of the large jump button as a fraction of the smaller screen side.
+const JUMP_SIZE: f32 = 0.25;
+/// Side of the place and attack buttons as a fraction of the smaller screen
+/// side.
+const ACTION_SIZE: f32 = 0.18;
+/// Distance between the right-hand controls and the screen edges.
+const ACTION_MARGIN: f32 = 0.03;
+/// Gap between the attack and place buttons, and between the place/attack row
+/// and the jump button below it, as a fraction of the smaller screen side.
+const ACTION_GAP: f32 = 0.02;
 /// Height of the faint break-zone hint at the top of the look zone.
 const BREAK_HINT_HEIGHT: f32 = 0.07;
 /// Number of hotbar slots.
@@ -57,9 +62,9 @@ const HOTBAR_SLOT_SIZE: f32 = 0.085;
 /// Gap between two hotbar slots, as a fraction of the smaller screen side.
 const HOTBAR_GAP: f32 = 0.007;
 /// Distance from the bottom edge to the hotbar, as a fraction of the smaller
-/// screen side. Larger than the joystick's `STICK_MARGIN + 2 * STICK_RADIUS`
-/// so the bar always clears the joystick and the place button.
-const HOTBAR_BOTTOM: f32 = 0.335;
+/// screen side. Larger than the D-pad's `PAD_MARGIN + 3 * PAD_CELL` so the
+/// bar always clears the pad and the right-hand buttons.
+const HOTBAR_BOTTOM: f32 = 0.60;
 
 /// Longest press that still counts as a tap instead of a hold.
 const TAP_TIME: Duration = Duration::from_millis(250);
@@ -68,13 +73,17 @@ const TAP_SLOP: f32 = 10.0;
 /// Look sensitivity in degrees per physical pixel.
 const LOOK_DEGREES_PER_PIXEL: f32 = 0.15;
 
-/// `sin(22.5deg)`: a normalized direction component at least this large
-/// selects that axis, giving eight evenly sized movement sectors.
-const SECTOR: f32 = 0.382_683_43;
+/// Direction bits held by D-pad fingers.
+const DIR_UP: u8 = 1 << 0;
+const DIR_DOWN: u8 = 1 << 1;
+const DIR_LEFT: u8 = 1 << 2;
+const DIR_RIGHT: u8 = 1 << 3;
 
 // Subtle translucent white controls, drawn over the world.
-const STICK_BASE_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.10];
-const STICK_KNOB_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.30];
+const PAD_BUTTON_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.18];
+/// The sneak cell turns cool blue while the sticky flag is set.
+const SNEAK_ACTIVE_COLOR: [f32; 4] = [0.45, 0.85, 1.0, 0.55];
+const JUMP_BUTTON_COLOR: [f32; 4] = [0.72, 0.94, 1.0, 0.26];
 const PLACE_BUTTON_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.22];
 /// The attack button is a warm tint so it reads apart from the place button.
 const ATTACK_BUTTON_COLOR: [f32; 4] = [1.0, 0.68, 0.55, 0.24];
@@ -82,13 +91,15 @@ const BREAK_HINT_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.05];
 
 /// One tick of touch input.
 ///
-/// `movement` is the held joystick state and is therefore still set on the
+/// `movement` and `sneak` are held states and are therefore still set on the
 /// next call; everything else is a one-shot (or, for `look`, an accumulated
 /// delta) that [`TouchControls::frame`] drains.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TouchFrame {
-    /// Held movement direction from the virtual joystick.
+    /// Held movement direction from the D-pad.
     pub movement: Input,
+    /// Sticky sneak toggle from the D-pad's centre cell.
+    pub sneak: bool,
     /// Look delta in degrees, desktop mouse convention: the caller applies
     /// `yaw -= look[0]` and `pitch += look[1]`.
     pub look: [f32; 2],
@@ -98,7 +109,7 @@ pub struct TouchFrame {
     pub place_block: bool,
     /// Set once when the attack button is pressed.
     pub attack: bool,
-    /// Set once for a short joystick-zone tap.
+    /// Set once when the jump button is pressed.
     pub jump: bool,
     /// Hotbar slot selected by a touch on the hotbar, if any.
     pub select: Option<usize>,
@@ -107,7 +118,12 @@ pub struct TouchFrame {
 /// Which gesture a finger owns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Role {
-    Stick,
+    /// One or more held D-pad direction bits.
+    Pad(u8),
+    /// The centre sneak cell; toggles on press.
+    Sneak,
+    /// The jump button; jumps once on press.
+    Jump,
     Look,
     Place,
     /// The attack button; pressing it breaks/attacks once.
@@ -128,19 +144,16 @@ struct Finger {
     travel: f32,
 }
 
-/// Virtual joystick, look area, place/attack buttons and hotbar for one touch
-/// screen.
+/// Bedrock-style D-pad, look area, jump/place/attack buttons and hotbar for
+/// one touch screen.
 #[derive(Clone, Debug, Default)]
 pub struct TouchControls {
     width: f32,
     height: f32,
-    /// Finger id currently driving the joystick, if any.
-    stick: Option<u64>,
-    /// Normalized joystick offset: `[-1, 1]` on both axes, length at most 1,
-    /// `+y` pointing down the screen.
-    stick_axis: [f32; 2],
     fingers: BTreeMap<u64, Finger>,
     look: [f32; 2],
+    /// Sticky sneak state toggled by the D-pad's centre cell.
+    sneak: bool,
     jump: bool,
     break_block: bool,
     place_block: bool,
@@ -158,17 +171,11 @@ impl TouchControls {
 
     /// Updates the layout to a new physical size in pixels.
     ///
-    /// A finger already holding the joystick keeps its role; its direction is
-    /// recomputed against the new base so a resize never strands a held stick.
+    /// Fingers keep their roles; only the rectangles they are measured
+    /// against change, so a resize never strands a held gesture.
     pub fn resize(&mut self, width: f32, height: f32) {
         self.width = width.max(0.0);
         self.height = height.max(0.0);
-        if let Some(id) = self.stick {
-            if let Some(finger) = self.fingers.get(&id) {
-                let last = finger.last;
-                self.stick_axis = self.axis_at(last);
-            }
-        }
     }
 
     /// Feeds one winit touch event in physical pixels.
@@ -181,11 +188,20 @@ impl TouchControls {
 
     /// Drains the one-shot actions and the look delta for this tick.
     ///
-    /// Held movement is not cleared: it is derived from the still-touching
-    /// fingers. Safe to call every tick, whether or not anything happened.
+    /// Held movement and the sticky sneak flag are not cleared: they are
+    /// derived from the still-touching fingers and the toggle state. Safe to
+    /// call every tick, whether or not anything happened.
     pub fn frame(&mut self) -> TouchFrame {
+        let pad = self
+            .fingers
+            .values()
+            .fold(0u8, |mask, finger| match finger.role {
+                Role::Pad(directions) => mask | directions,
+                _ => mask,
+            });
         let frame = TouchFrame {
-            movement: movement_from_axis(self.stick_axis),
+            movement: movement_from_pad(pad),
+            sneak: self.sneak,
             look: self.look,
             break_block: self.break_block,
             place_block: self.place_block,
@@ -219,7 +235,7 @@ impl TouchControls {
     ///
     /// Rects use the same top-left `0..=1` convention as
     /// [`TouchControls::hud_rects`]; the bar is centred horizontally and sits
-    /// above the joystick and place button.
+    /// above the D-pad and the right-hand buttons.
     pub fn hotbar_rects(&self) -> [([f32; 4], bool); HOTBAR_SLOTS] {
         std::array::from_fn(|slot| {
             let rect = self.hotbar_slot_rect(slot);
@@ -233,75 +249,103 @@ impl TouchControls {
     /// The visible controls as `(rect, color)` pairs in normalized `0..=1`
     /// coordinates with a top-left origin.
     ///
-    /// The order is fixed: joystick base, joystick knob, place button, attack
-    /// button (same row, immediately left of place) and the faint break-zone
-    /// hint at the top of the look area.
+    /// The order is fixed: D-pad up, left, centre (sneak), right, down, then
+    /// jump, place, attack and the faint break-zone hint at the top of the
+    /// look area.
     pub fn hud_rects(&self) -> Vec<([f32; 4], [f32; 4])> {
-        let min_side = self.min_side();
-        let radius = min_side * STICK_RADIUS;
-        let center = self.stick_center();
-        let knob_center = [
-            center[0] + self.stick_axis[0] * radius,
-            center[1] + self.stick_axis[1] * radius,
-        ];
-        let knob_radius = min_side * KNOB_RADIUS;
+        let up = self.pad_cell_rect(1, 0);
+        let left = self.pad_cell_rect(0, 1);
+        let centre = self.sneak_rect();
+        let right = self.pad_cell_rect(2, 1);
+        let down = self.pad_cell_rect(1, 2);
+        let jump = self.jump_rect();
         let place = self.place_rect();
         let attack = self.attack_rect();
+        let sneak_color = if self.sneak {
+            SNEAK_ACTIVE_COLOR
+        } else {
+            PAD_BUTTON_COLOR
+        };
         vec![
-            (
-                self.normalize(
-                    center[0] - radius,
-                    center[1] - radius,
-                    radius * 2.0,
-                    radius * 2.0,
-                ),
-                STICK_BASE_COLOR,
-            ),
-            (
-                self.normalize(
-                    knob_center[0] - knob_radius,
-                    knob_center[1] - knob_radius,
-                    knob_radius * 2.0,
-                    knob_radius * 2.0,
-                ),
-                STICK_KNOB_COLOR,
-            ),
-            (
-                self.normalize(place[0], place[1], place[2], place[3]),
-                PLACE_BUTTON_COLOR,
-            ),
-            (
-                self.normalize(attack[0], attack[1], attack[2], attack[3]),
-                ATTACK_BUTTON_COLOR,
-            ),
+            (self.rect(up), PAD_BUTTON_COLOR),
+            (self.rect(left), PAD_BUTTON_COLOR),
+            (self.rect(centre), sneak_color),
+            (self.rect(right), PAD_BUTTON_COLOR),
+            (self.rect(down), PAD_BUTTON_COLOR),
+            (self.rect(jump), JUMP_BUTTON_COLOR),
+            (self.rect(place), PLACE_BUTTON_COLOR),
+            (self.rect(attack), ATTACK_BUTTON_COLOR),
             (
                 // Already a screen fraction: keep the exact normalized edges
                 // so the hint always abuts the right edge of the screen.
-                [STICK_ZONE, 0.0, 1.0 - STICK_ZONE, BREAK_HINT_HEIGHT],
+                [PAD_ZONE, 0.0, 1.0 - PAD_ZONE, BREAK_HINT_HEIGHT],
                 BREAK_HINT_COLOR,
             ),
         ]
     }
 
-    /// Position of the joystick base in pixels.
-    fn stick_center(&self) -> [f32; 2] {
-        let radius = self.stick_radius();
-        let margin = self.min_side() * STICK_MARGIN;
-        [margin + radius, self.height - margin - radius]
-    }
-
-    fn stick_radius(&self) -> f32 {
-        self.min_side() * STICK_RADIUS
+    fn rect(&self, rect: [f32; 4]) -> [f32; 4] {
+        self.normalize(rect[0], rect[1], rect[2], rect[3])
     }
 
     fn min_side(&self) -> f32 {
         self.width.min(self.height)
     }
 
-    /// `(x, y, width, height)` of the place button in pixels.
-    fn place_rect(&self) -> [f32; 4] {
-        let side = self.min_side() * PLACE_SIZE;
-        let margin = self.min_side() * PLACE_MARGIN;
+    fn pad_cell(&self) -> f32 {
+        self.min_side() * PAD_CELL
+    }
+
+    /// Top-left pixel origin of the 3x3 D-pad footprint.
+    fn pad_origin(&self) -> [f32; 2] {
+        let cell = self.pad_cell();
+        let margin = self.min_side() * PAD_MARGIN;
+        [margin, self.height - margin - cell * 3.0]
+    }
+
+    /// `(x, y, width, height)` of the D-pad cell at `column`/`row`.
+    fn pad_cell_rect(&self, column: usize, row: usize) -> [f32; 4] {
+        let cell = self.pad_cell();
+        let origin = self.pad_origin();
+        [
+            origin[0] + cell * column as f32,
+            origin[1] + cell * row as f32,
+            cell,
+            cell,
+        ]
+    }
+
+    /// The sneak toggle cell, at the centre of the D-pad.
+    fn sneak_rect(&self) -> [f32; 4] {
+        self.pad_cell_rect(1, 1)
+    }
+
+    /// The four direction buttons with their bits, for hit-testing.
+    fn pad_buttons(&self) -> [(u8, [f32; 4]); 4] {
+        [
+            (DIR_UP, self.pad_cell_rect(1, 0)),
+            (DIR_RIGHT, self.pad_cell_rect(2, 1)),
+            (DIR_DOWN, self.pad_cell_rect(1, 2)),
+            (DIR_LEFT, self.pad_cell_rect(0, 1)),
+        ]
+    }
+
+    /// Direction bits whose button contains `point`. Buttons share edges, so
+    /// a touch on a corner reports both adjacent directions.
+    fn directions_at(&self, point: [f32; 2]) -> u8 {
+        let mut directions = 0;
+        for (direction, rect) in self.pad_buttons() {
+            if contains(rect, point) {
+                directions |= direction;
+            }
+        }
+        directions
+    }
+
+    /// `(x, y, width, height)` of the jump button in pixels.
+    fn jump_rect(&self) -> [f32; 4] {
+        let side = self.min_side() * JUMP_SIZE;
+        let margin = self.min_side() * ACTION_MARGIN;
         [
             self.width - margin - side,
             self.height - margin - side,
@@ -310,15 +354,25 @@ impl TouchControls {
         ]
     }
 
+    /// `(x, y, width, height)` of the place button in pixels.
+    ///
+    /// Right-aligned with the jump button and sitting one gap above it.
+    fn place_rect(&self) -> [f32; 4] {
+        let side = self.min_side() * ACTION_SIZE;
+        let margin = self.min_side() * ACTION_MARGIN;
+        let gap = self.min_side() * ACTION_GAP;
+        let jump = self.jump_rect();
+        [self.width - margin - side, jump[1] - gap - side, side, side]
+    }
+
     /// `(x, y, width, height)` of the attack button in pixels.
     ///
     /// It is the place button's size, shifted one button plus a gap to the
     /// left so the two never overlap.
     fn attack_rect(&self) -> [f32; 4] {
-        let side = self.min_side() * PLACE_SIZE;
-        let gap = self.min_side() * ATTACK_GAP;
         let place = self.place_rect();
-        [place[0] - gap - side, place[1], side, side]
+        let gap = self.min_side() * ACTION_GAP;
+        [place[0] - gap - place[2], place[1], place[2], place[3]]
     }
 
     /// `(x, y, width, height)` of hotbar `slot` in pixels.
@@ -345,25 +399,6 @@ impl TouchControls {
             (w / self.width).clamp(0.0, 1.0),
             (h / self.height).clamp(0.0, 1.0),
         ]
-    }
-
-    /// Normalized joystick offset for a finger position.
-    fn axis_at(&self, point: [f32; 2]) -> [f32; 2] {
-        let radius = self.stick_radius();
-        if radius <= 0.0 {
-            return [0.0; 2];
-        }
-        let center = self.stick_center();
-        let mut axis = [
-            (point[0] - center[0]) / radius,
-            (point[1] - center[1]) / radius,
-        ];
-        let length = (axis[0] * axis[0] + axis[1] * axis[1]).sqrt();
-        if length > 1.0 {
-            axis[0] /= length;
-            axis[1] /= length;
-        }
-        axis
     }
 
     fn has_role(&self, role: Role) -> bool {
@@ -398,10 +433,25 @@ impl TouchControls {
             travel: 0.0,
         };
 
+        // The D-pad's centre cell toggles sneak. It is tested before every
+        // other control: the four direction cells meet at the middle, so a
+        // corner touch there would otherwise read as a movement.
+        if contains(self.sneak_rect(), point) && self.directions_at(point) == 0 {
+            self.sneak = !self.sneak;
+            self.fingers.insert(
+                id,
+                Finger {
+                    role: Role::Sneak,
+                    ..finger
+                },
+            );
+            return;
+        }
+
         // The hotbar is checked first: a slot tap must never become a look
-        // drag, a block break or a jump, even though the bar overlays the
-        // tail of the look zone. Selection takes effect immediately and is
-        // queued for the next tick.
+        // drag or press a control, even though the bar overlays the tail of
+        // the look zone. Selection takes effect immediately and is queued for
+        // the next tick.
         let side = self.hotbar_slot_rect(0)[2];
         if side > 0.0 {
             for slot in 0..HOTBAR_SLOTS {
@@ -418,6 +468,23 @@ impl TouchControls {
                     return;
                 }
             }
+        }
+
+        // The jump button is the largest control in the look zone and is
+        // checked before the buttons above it.
+        if contains(self.jump_rect(), point) {
+            if self.has_role(Role::Jump) {
+                return;
+            }
+            self.jump = true;
+            self.fingers.insert(
+                id,
+                Finger {
+                    role: Role::Jump,
+                    ..finger
+                },
+            );
+            return;
         }
 
         // The attack button is checked next to the place button so a touch on
@@ -448,19 +515,23 @@ impl TouchControls {
             return;
         }
 
-        if point[0] < self.width * STICK_ZONE {
-            if self.stick.is_some() {
-                return;
-            }
-            self.stick = Some(id);
-            self.stick_axis = self.axis_at(point);
+        // Direction buttons: several may be held at once. A corner press
+        // reports both adjacent directions.
+        let directions = self.directions_at(point);
+        if directions != 0 {
             self.fingers.insert(
                 id,
                 Finger {
-                    role: Role::Stick,
+                    role: Role::Pad(directions),
                     ..finger
                 },
             );
+            return;
+        }
+
+        // Dead space around the D-pad stays inert, but the left half itself
+        // still belongs to the pad rather than the look zone.
+        if point[0] < self.width * PAD_ZONE {
             return;
         }
 
@@ -483,23 +554,37 @@ impl TouchControls {
             return;
         };
         let delta = [point[0] - finger.last[0], point[1] - finger.last[1]];
+        // A pad finger accumulates directions as it slides: adjacent buttons
+        // OR their flags, while an opposite direction replaces the old one.
+        let role = match finger.role {
+            Role::Pad(held) => {
+                let here = self.directions_at(point);
+                // Sliding onto a corner between two buttons keeps both; the
+                // centre cell alone keeps what was held.
+                Role::Pad(if here == 0 {
+                    held
+                } else {
+                    merge_directions(held, here)
+                })
+            }
+            other => other,
+        };
         if let Some(tracked) = self.fingers.get_mut(&id) {
             tracked.last = point;
             tracked.travel = tracked.travel.max(distance(finger.start, point));
+            tracked.role = role;
         }
 
-        match finger.role {
-            Role::Stick => self.stick_axis = self.axis_at(point),
+        match role {
             Role::Look => {
                 // Desktop mouse convention: pixels add degrees directly.
                 self.look[0] += delta[0] * LOOK_DEGREES_PER_PIXEL;
                 self.look[1] += delta[1] * LOOK_DEGREES_PER_PIXEL;
             }
-            Role::Place => {}
-            // The attack button acts once on press; dragging is inert.
-            Role::Attack => {}
-            // A hotbar finger owns the slot; dragging must not look or act.
-            Role::Hotbar => {}
+            // Movement is re-derived from the accumulated direction bits.
+            Role::Pad(_) => {}
+            // Press-only controls are inert while dragged.
+            Role::Sneak | Role::Jump | Role::Place | Role::Attack | Role::Hotbar => {}
         }
     }
 
@@ -509,10 +594,6 @@ impl TouchControls {
         let Some(finger) = self.fingers.remove(&id) else {
             return;
         };
-        if finger.role == Role::Stick && self.stick == Some(id) {
-            self.stick = None;
-            self.stick_axis = [0.0; 2];
-        }
         if !ended {
             return;
         }
@@ -521,36 +602,52 @@ impl TouchControls {
             return;
         }
         match finger.role {
-            Role::Stick => self.jump = true,
             Role::Look => self.break_block = true,
-            Role::Place => {}
-            // The attack acted on press; releasing never acts again.
-            Role::Attack => {}
-            // Selection already happened on press; releasing never acts.
-            Role::Hotbar => {}
+            // The direction buttons act while held; the sneak cell, jump,
+            // place, attack and hotbar already acted on press.
+            Role::Pad(_) | Role::Sneak | Role::Jump | Role::Place | Role::Attack | Role::Hotbar => {
+            }
         }
     }
 }
 
-/// Maps a normalized joystick offset to the four movement flags.
-///
-/// The offset is split into eight 45 degree sectors so a diagonal reads as
-/// two directions instead of silently falling between axis thresholds.
-fn movement_from_axis(axis: [f32; 2]) -> Input {
-    let magnitude = (axis[0] * axis[0] + axis[1] * axis[1]).sqrt();
-    if magnitude < STICK_DEADZONE {
-        return Input::default();
-    }
-    let x = axis[0] / magnitude;
-    // Screen space has +y pointing down, so up the screen is -y.
-    let y = -axis[1] / magnitude;
+/// The movement flags for the held D-pad direction bits.
+fn movement_from_pad(directions: u8) -> Input {
     Input {
-        forward: y >= SECTOR,
-        back: -y >= SECTOR,
-        left: -x >= SECTOR,
-        right: x >= SECTOR,
+        forward: directions & DIR_UP != 0,
+        back: directions & DIR_DOWN != 0,
+        left: directions & DIR_LEFT != 0,
+        right: directions & DIR_RIGHT != 0,
         ..Input::default()
     }
+}
+
+/// The bits opposite to `directions`.
+fn opposites(directions: u8) -> u8 {
+    let mut opposite = 0;
+    if directions & DIR_UP != 0 {
+        opposite |= DIR_DOWN;
+    }
+    if directions & DIR_DOWN != 0 {
+        opposite |= DIR_UP;
+    }
+    if directions & DIR_LEFT != 0 {
+        opposite |= DIR_RIGHT;
+    }
+    if directions & DIR_RIGHT != 0 {
+        opposite |= DIR_LEFT;
+    }
+    opposite
+}
+
+/// Merges a newly touched direction into the bits a pad finger already
+/// holds: adjacent buttons OR together (a diagonal), while an opposite
+/// direction replaces its counterpart so opposing flags never cancel out.
+fn merge_directions(held: u8, touched: u8) -> u8 {
+    if touched == 0 {
+        return 0;
+    }
+    (held & !opposites(touched)) | touched
 }
 
 fn distance(a: [f32; 2], b: [f32; 2]) -> f32 {
@@ -574,7 +671,7 @@ mod tests {
     const W: f32 = 1080.0;
     const H: f32 = 1920.0;
 
-    fn controls() -> TouchControls {
+    fn new_controls() -> TouchControls {
         let mut controls = TouchControls::new();
         controls.resize(W, H);
         controls
@@ -584,84 +681,197 @@ mod tests {
         base + Duration::from_millis(millis)
     }
 
-    #[test]
-    fn joystick_sets_movement_and_clears_on_release() {
-        let mut controls = controls();
-        let now = Instant::now();
-        let center = controls.stick_center();
-        let radius = controls.stick_radius();
+    fn rect_center(rect: [f32; 4]) -> [f32; 2] {
+        [rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0]
+    }
 
-        // Push 80% of the radius toward the top of the screen.
-        let push = [center[0], center[1] - radius * 0.8];
-        controls.touch_at(1, TouchPhase::Started, push, now);
-        let frame = controls.frame();
-        assert!(frame.movement.forward);
-        assert!(!frame.movement.back);
-        assert!(!frame.movement.left);
-        assert!(!frame.movement.right);
-        assert_eq!(frame.look, [0.0, 0.0]);
-        assert!(!frame.jump);
+    /// Float comparison for layout edges, tolerant of one-pixel rounding.
+    fn near(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-3
+    }
 
-        // Held movement is still reported on the next tick.
-        assert!(controls.frame().movement.forward);
+    /// A normalized HUD rect in physical pixels.
+    fn pixel(rect: [f32; 4]) -> [f32; 4] {
+        [rect[0] * W, rect[1] * H, rect[2] * W, rect[3] * H]
+    }
 
-        // A real drag (> slop) then release moves and does not jump.
-        let dragged = [push[0] + 30.0, push[1]];
-        controls.touch_at(1, TouchPhase::Moved, dragged, at(now, 20));
-        controls.touch_at(1, TouchPhase::Ended, dragged, at(now, 40));
-        let frame = controls.frame();
-        assert_eq!(frame.movement, Input::default());
-        assert!(!frame.jump);
+    /// Centre of HUD entry `index` in physical pixels.
+    fn hud_center(controls: &TouchControls, index: usize) -> [f32; 2] {
+        rect_center(pixel(controls.hud_rects()[index].0))
     }
 
     #[test]
-    fn joystick_deadzone_and_sectors() {
-        let mut controls = controls();
+    fn pad_directions_map_to_movement_and_clear_on_release() {
         let now = Instant::now();
-        let center = controls.stick_center();
-        let radius = controls.stick_radius();
+        let cases: [(usize, fn(&Input) -> bool); 4] = [
+            (0, |movement| movement.forward),
+            (1, |movement| movement.left),
+            (3, |movement| movement.right),
+            (4, |movement| movement.back),
+        ];
+        for (index, held) in cases {
+            let mut controls = new_controls();
+            let point = hud_center(&controls, index);
+            controls.touch_at(1, TouchPhase::Started, point, now);
+            let frame = controls.frame();
+            assert!(held(&frame.movement), "HUD index {index}");
+            assert_eq!(frame.look, [0.0, 0.0]);
+            assert!(!frame.jump);
+            assert!(!frame.sneak);
 
-        // Inside the deadzone: neutral.
-        controls.touch_at(
-            1,
-            TouchPhase::Started,
-            [center[0] + radius * 0.2, center[1]],
-            now,
-        );
-        assert_eq!(controls.frame().movement, Input::default());
+            // Held movement keeps being reported until the finger lifts.
+            assert!(held(&controls.frame().movement), "HUD index {index}");
+            controls.touch_at(1, TouchPhase::Ended, point, at(now, 40));
+            assert_eq!(controls.frame().movement, Input::default());
+            assert!(!controls.frame().jump);
+        }
+    }
 
-        // Straight up from the deadzone edge: only forward.
-        controls.touch_at(
-            1,
-            TouchPhase::Moved,
-            [center[0], center[1] - radius * 0.5],
-            at(now, 1),
-        );
+    #[test]
+    fn several_direction_buttons_can_be_held_at_once() {
+        let mut controls = new_controls();
+        let now = Instant::now();
+        let up = hud_center(&controls, 0);
+        let left = hud_center(&controls, 1);
+
+        controls.touch_at(1, TouchPhase::Started, up, now);
+        controls.touch_at(2, TouchPhase::Started, left, at(now, 1));
         let movement = controls.frame().movement;
         assert!(movement.forward);
-        assert!(!movement.back);
-        assert!(!movement.left);
+        assert!(movement.left);
         assert!(!movement.right);
+        assert!(!movement.back);
 
-        // Top-right diagonal: forward and right.
-        controls.touch_at(
-            1,
-            TouchPhase::Moved,
-            [center[0] + radius * 0.5, center[1] - radius * 0.5],
-            at(now, 2),
-        );
+        // Lifting one finger leaves the other direction held.
+        controls.touch_at(1, TouchPhase::Ended, up, at(now, 30));
         let movement = controls.frame().movement;
-        assert!(movement.forward);
+        assert!(!movement.forward);
+        assert!(movement.left);
+        controls.touch_at(2, TouchPhase::Ended, left, at(now, 40));
+        assert_eq!(controls.frame().movement, Input::default());
+    }
+
+    #[test]
+    fn sliding_between_adjacent_buttons_ors_their_flags() {
+        let mut controls = new_controls();
+        let now = Instant::now();
+        let up = hud_center(&controls, 0);
+        let right = hud_center(&controls, 3);
+
+        controls.touch_at(1, TouchPhase::Started, up, now);
+        assert!(controls.frame().movement.forward);
+        // Slide from up to right: the diagonal holds both directions.
+        controls.touch_at(1, TouchPhase::Moved, right, at(now, 20));
+        let movement = controls.frame().movement;
+        assert!(movement.forward, "diagonal keeps the old direction");
         assert!(movement.right);
         assert!(!movement.left);
         assert!(!movement.back);
+
+        // Sliding onto the centre cell keeps the held directions without
+        // toggling sneak (only a press toggles it).
+        let centre = hud_center(&controls, 2);
+        controls.touch_at(1, TouchPhase::Moved, centre, at(now, 30));
+        let held = controls.frame().movement;
+        assert!(held.forward && held.right, "directions survive the slide");
+        assert!(!controls.frame().sneak);
+        controls.touch_at(1, TouchPhase::Ended, centre, at(now, 40));
+        assert_eq!(controls.frame().movement, Input::default());
+
+        // A touch exactly on the shared corner reports both buttons.
+        let up_rect = pixel(controls.hud_rects()[0].0);
+        let corner = [up_rect[0] + up_rect[2], up_rect[1] + up_rect[3]];
+        controls.touch_at(2, TouchPhase::Started, corner, at(now, 100));
+        let movement = controls.frame().movement;
+        assert!(movement.forward);
+        assert!(movement.right);
+    }
+
+    #[test]
+    fn sneak_centre_toggles_and_is_sticky() {
+        let mut controls = new_controls();
+        let now = Instant::now();
+        let point = hud_center(&controls, 2);
+
+        controls.touch_at(1, TouchPhase::Started, point, now);
+        let frame = controls.frame();
+        assert!(frame.sneak);
+        assert_eq!(frame.movement, Input::default());
+        assert!(!frame.jump);
+        assert_eq!(frame.look, [0.0, 0.0]);
+        // Holding the cell toggles exactly once.
+        assert!(controls.frame().sneak);
+        controls.touch_at(1, TouchPhase::Ended, point, at(now, 80));
+        assert!(controls.frame().sneak, "sticky after release");
+
+        // A second finger on the cell toggles it once more: the toggle is
+        // per press, not per finger, so two fingers flip it twice.
+        controls.touch_at(2, TouchPhase::Started, point, at(now, 100));
+        assert!(!controls.frame().sneak, "second finger flipped it off");
+        controls.touch_at(2, TouchPhase::Ended, point, at(now, 140));
+        assert!(!controls.frame().sneak);
+        // A third press turns it back on.
+        controls.touch_at(3, TouchPhase::Started, point, at(now, 200));
+        assert!(controls.frame().sneak);
+        controls.touch_at(3, TouchPhase::Ended, point, at(now, 240));
+        assert!(controls.frame().sneak);
+        assert!(!controls.frame().jump);
+        assert!(!controls.frame().break_block);
+    }
+
+    #[test]
+    fn sneak_cell_colour_marks_the_active_toggle() {
+        let mut controls = new_controls();
+        let now = Instant::now();
+        let inactive = controls.hud_rects()[2].1;
+        let point = hud_center(&controls, 2);
+
+        controls.touch_at(1, TouchPhase::Started, point, now);
+        controls.touch_at(1, TouchPhase::Ended, point, at(now, 40));
+        let active = controls.hud_rects()[2].1;
+        assert_ne!(active, inactive);
+        assert_ne!(active, controls.hud_rects()[0].1, "distinct from the pad");
+
+        controls.touch_at(2, TouchPhase::Started, point, at(now, 60));
+        controls.touch_at(2, TouchPhase::Ended, point, at(now, 100));
+        assert_eq!(controls.hud_rects()[2].1, inactive);
+    }
+
+    #[test]
+    fn jump_button_fires_once_on_press() {
+        let mut controls = new_controls();
+        let now = Instant::now();
+        let point = hud_center(&controls, 5);
+
+        controls.touch_at(1, TouchPhase::Started, point, now);
+        let frame = controls.frame();
+        assert!(frame.jump);
+        assert!(!frame.place_block);
+        assert!(!frame.attack);
+        assert!(!frame.break_block);
+        assert_eq!(frame.look, [0.0, 0.0]);
+        assert_eq!(frame.movement, Input::default());
+        // One-shot even while the button stays held.
+        assert!(!controls.frame().jump);
+
+        let dragged = [point[0] - 60.0, point[1] - 80.0];
+        controls.touch_at(1, TouchPhase::Moved, dragged, at(now, 40));
+        assert_eq!(controls.frame().look, [0.0, 0.0]);
+        controls.touch_at(1, TouchPhase::Ended, dragged, at(now, 80));
+        let frame = controls.frame();
+        assert!(!frame.jump);
+        assert!(!frame.break_block);
+
+        // A fresh press jumps again.
+        controls.touch_at(2, TouchPhase::Started, point, at(now, 120));
+        assert!(controls.frame().jump);
     }
 
     #[test]
     fn look_drag_reports_scaled_degrees_with_mouse_sign() {
-        let mut controls = controls();
+        let mut controls = new_controls();
         let now = Instant::now();
-        let start = [W * 0.72, H * 0.4];
+        let start = [W * 0.80, H * 0.30];
 
         controls.touch_at(7, TouchPhase::Started, start, now);
         // Pressing without moving reports nothing yet.
@@ -678,6 +888,7 @@ mod tests {
         assert!((frame.look[0] - 6.0).abs() < 1e-4);
         assert!((frame.look[1] + 3.0).abs() < 1e-4);
         assert!(!frame.break_block);
+        assert_eq!(frame.movement, Input::default());
 
         // The delta was drained by the first frame.
         assert_eq!(controls.frame().look, [0.0, 0.0]);
@@ -685,7 +896,7 @@ mod tests {
 
     #[test]
     fn short_look_tap_breaks_exactly_once() {
-        let mut controls = controls();
+        let mut controls = new_controls();
         let now = Instant::now();
         let point = [W * 0.72, H * 0.5];
 
@@ -695,6 +906,7 @@ mod tests {
         assert!(frame.break_block);
         assert!(!frame.place_block);
         assert!(!frame.jump);
+        assert!(!frame.sneak);
         assert_eq!(frame.look, [0.0, 0.0]);
 
         // One-shot: the next tick is clean.
@@ -703,7 +915,7 @@ mod tests {
 
     #[test]
     fn long_look_press_and_drag_do_not_break() {
-        let mut controls = controls();
+        let mut controls = new_controls();
         let now = Instant::now();
         let point = [W * 0.72, H * 0.5];
 
@@ -722,15 +934,15 @@ mod tests {
 
     #[test]
     fn place_button_presses_without_starting_look() {
-        let mut controls = controls();
+        let mut controls = new_controls();
         let now = Instant::now();
-        let rect = controls.place_rect();
-        let center = [rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0];
+        let center = hud_center(&controls, 6);
 
         controls.touch_at(3, TouchPhase::Started, center, now);
         let frame = controls.frame();
         assert!(frame.place_block);
         assert!(!frame.break_block);
+        assert!(!frame.jump);
         assert_eq!(frame.look, [0.0, 0.0]);
 
         // Dragging off the button still belongs to the button, not the look
@@ -743,50 +955,11 @@ mod tests {
         assert!(!controls.frame().place_block);
     }
 
-    /// Whether two pixel rectangles share any area.
-    fn overlaps(a: [f32; 4], b: [f32; 4]) -> bool {
-        a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3]
-    }
-
-    #[test]
-    fn attack_button_sits_left_of_place_without_overlapping() {
-        let controls = controls();
-        let place = controls.place_rect();
-        let attack = controls.attack_rect();
-
-        // Same size, same row, immediately left of the place button.
-        assert_eq!(attack[2], place[2]);
-        assert_eq!(attack[3], place[3]);
-        assert_eq!(attack[1], place[1]);
-        assert!(attack[0] + attack[2] < place[0], "gap between the buttons");
-        assert!(!overlaps(attack, place));
-
-        // On screen, and clear of every hotbar slot.
-        assert!(attack[0] > 0.0, "{attack:?}");
-        assert!(attack[0] + attack[2] <= W);
-        assert!(attack[1] + attack[3] <= H);
-        for slot in 0..HOTBAR_SLOTS {
-            let rect = controls.hotbar_slot_rect(slot);
-            assert!(!overlaps(attack, rect), "slot {slot}");
-            assert!(!overlaps(place, rect), "slot {slot}");
-        }
-
-        // The HUD exposes the same rectangle at index 3, with its own colour.
-        let rects = controls.hud_rects();
-        let normalized = rects[3].0;
-        assert!((normalized[0] - attack[0] / W).abs() < 1e-5);
-        assert!((normalized[1] - attack[1] / H).abs() < 1e-5);
-        assert!((normalized[2] - attack[2] / W).abs() < 1e-5);
-        assert!((normalized[3] - attack[3] / H).abs() < 1e-5);
-        assert_ne!(rects[3].1, rects[2].1, "the buttons read differently");
-    }
-
     #[test]
     fn attack_button_triggers_attack_once_without_other_actions() {
-        let mut controls = controls();
+        let mut controls = new_controls();
         let now = Instant::now();
-        let rect = controls.attack_rect();
-        let center = [rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0];
+        let center = hud_center(&controls, 7);
 
         controls.touch_at(5, TouchPhase::Started, center, now);
         let frame = controls.frame();
@@ -820,12 +993,10 @@ mod tests {
 
     #[test]
     fn attack_and_place_buttons_are_independent() {
-        let mut controls = controls();
+        let mut controls = new_controls();
         let now = Instant::now();
-        let place = controls.place_rect();
-        let attack = controls.attack_rect();
-        let place_center = [place[0] + place[2] / 2.0, place[1] + place[3] / 2.0];
-        let attack_center = [attack[0] + attack[2] / 2.0, attack[1] + attack[3] / 2.0];
+        let place_center = hud_center(&controls, 6);
+        let attack_center = hud_center(&controls, 7);
 
         // Both buttons held at once: both one-shots fire.
         controls.touch_at(7, TouchPhase::Started, attack_center, now);
@@ -843,98 +1014,126 @@ mod tests {
     }
 
     #[test]
-    fn short_stick_tap_jumps_once() {
-        let mut controls = controls();
+    fn multitouch_direction_look_and_jump_are_isolated() {
+        let mut controls = new_controls();
         let now = Instant::now();
-        let center = controls.stick_center();
+        let up = hud_center(&controls, 0);
+        let jump = hud_center(&controls, 5);
+        let look_start = [W * 0.80, H * 0.30];
 
-        controls.touch_at(4, TouchPhase::Started, center, now);
-        assert_eq!(controls.frame().movement, Input::default());
-        controls.touch_at(4, TouchPhase::Ended, center, at(now, 100));
-        assert!(controls.frame().jump);
-        assert!(!controls.frame().jump);
-    }
-
-    #[test]
-    fn multitouch_isolates_the_zones() {
-        let mut controls = controls();
-        let now = Instant::now();
-        let center = controls.stick_center();
-        let radius = controls.stick_radius();
-        let look_start = [W * 0.75, H * 0.5];
-
-        // Finger 0 drives the joystick, finger 1 looks around.
-        controls.touch_at(
-            0,
-            TouchPhase::Started,
-            [center[0], center[1] - radius * 0.7],
-            now,
-        );
+        // Finger 0 holds forward, finger 1 looks around, finger 2 jumps.
+        controls.touch_at(0, TouchPhase::Started, up, now);
         controls.touch_at(1, TouchPhase::Started, look_start, at(now, 1));
         controls.touch_at(
             1,
             TouchPhase::Moved,
-            [look_start[0] + 30.0, look_start[1]],
+            [look_start[0] + 40.0, look_start[1] - 20.0],
             at(now, 2),
         );
-
-        // Extra fingers in the occupied look and stick zones are ignored.
-        controls.touch_at(2, TouchPhase::Started, [W * 0.8, H * 0.6], at(now, 3));
-        controls.touch_at(2, TouchPhase::Moved, [W * 0.9, H * 0.9], at(now, 4));
-        controls.touch_at(
-            3,
-            TouchPhase::Started,
-            [center[0] + radius, center[1]],
-            at(now, 5),
-        );
-        controls.touch_at(
-            3,
-            TouchPhase::Moved,
-            [center[0] + radius, center[1] - radius],
-            at(now, 6),
-        );
+        controls.touch_at(2, TouchPhase::Started, jump, at(now, 3));
 
         let frame = controls.frame();
         assert!(frame.movement.forward);
         assert!(!frame.movement.right);
-        assert!((frame.look[0] - 4.5).abs() < 1e-4);
-        assert_eq!(frame.look[1], 0.0);
+        assert!((frame.look[0] - 6.0).abs() < 1e-4);
+        assert!((frame.look[1] + 3.0).abs() < 1e-4);
+        assert!(frame.jump);
+        assert!(!frame.place_block);
+        assert!(!frame.attack);
+        assert!(!frame.break_block);
+        assert!(!frame.sneak);
 
-        // Releasing the ignored fingers leaves the held gesture untouched.
-        controls.touch_at(2, TouchPhase::Ended, [W * 0.9, H * 0.9], at(now, 7));
+        // Releasing the look and jump fingers leaves the held direction.
         controls.touch_at(
-            3,
+            1,
             TouchPhase::Ended,
-            [center[0] + radius, center[1] - radius],
-            at(now, 8),
+            [look_start[0] + 40.0, look_start[1] - 20.0],
+            at(now, 40),
         );
+        controls.touch_at(2, TouchPhase::Ended, jump, at(now, 50));
         let frame = controls.frame();
         assert!(frame.movement.forward);
         assert_eq!(frame.look, [0.0, 0.0]);
-        assert!(!frame.break_block);
         assert!(!frame.jump);
+        assert!(!frame.break_block);
+
+        controls.touch_at(0, TouchPhase::Ended, up, at(now, 60));
+        assert_eq!(controls.frame().movement, Input::default());
+    }
+
+    #[test]
+    fn no_cross_zone_actions() {
+        let mut controls = new_controls();
+        let now = Instant::now();
+
+        // A look drag never moves, jumps, places, attacks or sneaks.
+        let look = [W * 0.80, H * 0.30];
+        controls.touch_at(1, TouchPhase::Started, look, now);
+        controls.touch_at(1, TouchPhase::Moved, [look[0] + 20.0, look[1]], at(now, 10));
+        let frame = controls.frame();
+        assert_eq!(frame.movement, Input::default());
+        assert!(!frame.jump);
+        assert!(!frame.place_block);
+        assert!(!frame.attack);
+        assert!(!frame.sneak);
+        // Dragged past the tap slop: releasing does not break.
+        controls.touch_at(1, TouchPhase::Ended, [look[0] + 20.0, look[1]], at(now, 20));
+        assert!(!controls.frame().break_block);
+
+        // A held direction never looks or presses anything.
+        let up = hud_center(&controls, 0);
+        controls.touch_at(2, TouchPhase::Started, up, at(now, 100));
+        controls.touch_at(2, TouchPhase::Moved, [up[0] + 30.0, up[1]], at(now, 120));
+        let frame = controls.frame();
+        assert!(frame.movement.forward);
+        assert_eq!(frame.look, [0.0, 0.0]);
+        assert!(!frame.place_block);
+        assert!(!frame.attack);
+        assert!(!frame.jump);
+        controls.touch_at(2, TouchPhase::Ended, [up[0] + 30.0, up[1]], at(now, 160));
+        assert!(!controls.frame().break_block);
+
+        // Dead space inside the pad footprint is inert, even when dragged
+        // into the look zone.
+        let origin = controls.pad_origin();
+        let dead = [
+            origin[0] + controls.pad_cell() * 0.5,
+            origin[1] + controls.pad_cell() * 0.5,
+        ];
+        controls.touch_at(3, TouchPhase::Started, dead, at(now, 200));
+        controls.touch_at(3, TouchPhase::Moved, look, at(now, 220));
+        let frame = controls.frame();
+        assert_eq!(frame.movement, Input::default());
+        assert_eq!(frame.look, [0.0, 0.0]);
+        controls.touch_at(3, TouchPhase::Ended, look, at(now, 240));
+        assert!(!controls.frame().break_block);
+
+        // A jump press never becomes a look drag or a block action.
+        let jump = hud_center(&controls, 5);
+        controls.touch_at(4, TouchPhase::Started, jump, at(now, 300));
+        controls.touch_at(
+            4,
+            TouchPhase::Moved,
+            [jump[0] - 40.0, jump[1] - 40.0],
+            at(now, 310),
+        );
+        let frame = controls.frame();
+        assert!(frame.jump);
+        assert_eq!(frame.look, [0.0, 0.0]);
+        assert!(!frame.place_block);
+        assert!(!frame.attack);
+        assert!(!frame.sneak);
     }
 
     #[test]
     fn cancel_releases_without_actions() {
-        let mut controls = controls();
+        let mut controls = new_controls();
         let now = Instant::now();
-        let center = controls.stick_center();
-        let radius = controls.stick_radius();
+        let up = hud_center(&controls, 0);
 
-        controls.touch_at(
-            8,
-            TouchPhase::Started,
-            [center[0], center[1] - radius * 0.6],
-            now,
-        );
+        controls.touch_at(8, TouchPhase::Started, up, now);
         assert!(controls.frame().movement.forward);
-        controls.touch_at(
-            8,
-            TouchPhase::Cancelled,
-            [center[0], center[1] - radius * 0.6],
-            at(now, 50),
-        );
+        controls.touch_at(8, TouchPhase::Cancelled, up, at(now, 50));
         let frame = controls.frame();
         assert_eq!(frame.movement, Input::default());
         assert!(!frame.jump);
@@ -945,19 +1144,25 @@ mod tests {
         let point = [W * 0.72, H * 0.5];
         controls.touch_at(9, TouchPhase::Started, point, at(now, 100));
         controls.touch_at(9, TouchPhase::Cancelled, point, at(now, 140));
-        let frame = controls.frame();
-        assert!(!frame.break_block);
-        assert!(!frame.jump);
+        assert!(!controls.frame().break_block);
+
+        // A cancelled jump press still acts on press, but releasing it never
+        // fires a second action.
+        let jump = hud_center(&controls, 5);
+        controls.touch_at(10, TouchPhase::Started, jump, at(now, 200));
+        assert!(controls.frame().jump);
+        controls.touch_at(10, TouchPhase::Cancelled, jump, at(now, 240));
+        assert!(!controls.frame().jump);
     }
 
     #[test]
-    fn hud_rects_are_normalized_and_deterministic() {
-        let mut controls = controls();
-        let first = controls.hud_rects();
-        assert_eq!(first, controls.hud_rects());
-        assert_eq!(first.len(), 5);
+    fn hud_rects_order_and_bounds() {
+        let controls = new_controls();
+        let rects = controls.hud_rects();
+        assert_eq!(rects.len(), 9);
+        assert_eq!(rects, controls.hud_rects());
 
-        for (rect, color) in &first {
+        for (rect, color) in &rects {
             for value in rect.iter().chain(color.iter()) {
                 assert!(value.is_finite(), "{value}");
                 assert!((0.0..=1.0).contains(value), "{value}");
@@ -969,35 +1174,143 @@ mod tests {
             assert!(rect[1] + rect[3] <= 1.0 + 1e-4, "{rect:?}");
         }
 
-        // Joystick bottom-left, attack and place buttons bottom-right.
-        assert!(first[0].0[0] < 0.5 && first[0].0[1] > 0.5);
-        assert!(first[2].0[0] > 0.5 && first[2].0[1] > 0.5);
-        assert!(first[3].0[0] > 0.5 && first[3].0[0] < first[2].0[0]);
-        assert_eq!(first[3].0[1], first[2].0[1], "buttons share a row");
-        assert_eq!(
-            [first[3].0[2], first[3].0[3]],
-            [first[2].0[2], first[2].0[3]],
-            "buttons share a size"
-        );
+        let px: Vec<[f32; 4]> = rects.iter().map(|(rect, _)| pixel(*rect)).collect();
+        let min_side = W.min(H);
 
-        // Deflecting the stick moves the knob but not the base.
-        let center = controls.stick_center();
-        let radius = controls.stick_radius();
-        controls.touch_at(
-            0,
-            TouchPhase::Started,
-            [center[0] + radius * 0.9, center[1]],
-            Instant::now(),
+        // The first five entries are the D-pad cross, up/left/centre/right/down.
+        let cell = min_side * PAD_CELL;
+        for index in 0..5 {
+            assert!(
+                near(px[index][2], cell),
+                "cell {index} side {:?}",
+                px[index]
+            );
+            assert!(near(px[index][2], px[index][3]));
+        }
+        assert!(near(px[0][0], px[2][0]), "up above the centre");
+        assert!(near(px[0][1] + px[0][3], px[2][1]));
+        assert!(near(px[2][1] + px[2][3], px[4][1]), "down below the centre");
+        assert!(near(px[1][0] + px[1][2], px[2][0]), "left of the centre");
+        assert!(near(px[2][0] + px[2][2], px[3][0]), "right of the centre");
+        assert!(near(px[1][1], px[2][1]));
+        assert!(near(px[3][1], px[2][1]));
+        assert!(px[0][1] > H * 0.5 && px[0][0] < W * 0.5, "bottom-left pad");
+
+        // A big jump button in the bottom-right corner.
+        assert!(near(px[5][2], min_side * JUMP_SIZE));
+        assert!(near(px[5][3], min_side * JUMP_SIZE));
+        assert!(px[5][0] > W * 0.5 && px[5][1] > H * 0.5);
+        assert!(near(px[5][0] + px[5][2], W - min_side * ACTION_MARGIN));
+        assert!(near(px[5][1] + px[5][3], H - min_side * ACTION_MARGIN));
+
+        // Place and attack share a row above the jump button, inside the look
+        // zone.
+        assert!(px[6][1] + px[6][3] < px[5][1], "place above jump");
+        assert_eq!(px[6][1], px[7][1], "buttons share a row");
+        assert_eq!([px[6][2], px[6][3]], [px[7][2], px[7][3]]);
+        assert!(px[7][0] + px[7][2] < px[6][0], "attack left of place");
+        assert!(px[6][0] > W * PAD_ZONE && px[7][0] > W * PAD_ZONE);
+
+        // The look hint covers the top of the right half.
+        assert_eq!(
+            rects[8].0,
+            [PAD_ZONE, 0.0, 1.0 - PAD_ZONE, BREAK_HINT_HEIGHT]
         );
-        let moved = controls.hud_rects();
-        assert_eq!(moved[0], first[0]);
-        assert_ne!(moved[1], first[1]);
-        assert!(moved[1].0[0] > first[1].0[0]);
+    }
+
+    #[test]
+    fn hud_rects_match_hit_testing() {
+        let now = Instant::now();
+        let directions: [(usize, fn(&Input) -> bool); 4] = [
+            (0, |movement| movement.forward),
+            (1, |movement| movement.left),
+            (3, |movement| movement.right),
+            (4, |movement| movement.back),
+        ];
+        for (index, held) in directions {
+            let mut controls = new_controls();
+            let point = hud_center(&controls, index);
+            controls.touch_at(1, TouchPhase::Started, point, now);
+            let frame = controls.frame();
+            assert!(held(&frame.movement), "HUD index {index}");
+            assert!(!frame.sneak);
+            assert_eq!(frame.look, [0.0, 0.0]);
+        }
+
+        // Centre: sneak toggle.
+        let mut controls = new_controls();
+        let point = hud_center(&controls, 2);
+        controls.touch_at(2, TouchPhase::Started, point, now);
+        assert!(controls.frame().sneak);
+        assert_eq!(controls.frame().movement, Input::default());
+        controls.touch_at(2, TouchPhase::Ended, point, at(now, 40));
+        assert!(controls.frame().sneak);
+
+        // Jump.
+        let mut controls = new_controls();
+        let point = hud_center(&controls, 5);
+        controls.touch_at(3, TouchPhase::Started, point, now);
+        assert!(controls.frame().jump);
+
+        // Place.
+        let mut controls = new_controls();
+        let point = hud_center(&controls, 6);
+        controls.touch_at(4, TouchPhase::Started, point, now);
+        assert!(controls.frame().place_block);
+
+        // Attack.
+        let mut controls = new_controls();
+        let point = hud_center(&controls, 7);
+        controls.touch_at(5, TouchPhase::Started, point, now);
+        assert!(controls.frame().attack);
+
+        // The hint is part of the look zone: a short tap breaks.
+        let mut controls = new_controls();
+        let point = hud_center(&controls, 8);
+        controls.touch_at(6, TouchPhase::Started, point, now);
+        assert_eq!(controls.frame().look, [0.0, 0.0]);
+        controls.touch_at(6, TouchPhase::Ended, point, at(now, 60));
+        assert!(controls.frame().break_block);
+    }
+
+    /// Whether two pixel rectangles share any area.
+    fn overlaps(a: [f32; 4], b: [f32; 4]) -> bool {
+        a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3]
+    }
+
+    #[test]
+    fn lower_controls_do_not_overlap() {
+        let controls = new_controls();
+        let rects: Vec<[f32; 4]> = controls
+            .hud_rects()
+            .iter()
+            .take(8)
+            .map(|(rect, _)| pixel(*rect))
+            .collect();
+
+        for (index, rect) in rects.iter().enumerate() {
+            assert!(rect[0] >= 0.0, "control {index}");
+            assert!(rect[1] >= 0.0, "control {index}");
+            assert!(rect[0] + rect[2] <= W + 1e-3, "control {index}");
+            assert!(rect[1] + rect[3] <= H + 1e-3, "control {index}");
+            for (other_index, other) in rects.iter().enumerate().skip(index + 1) {
+                assert!(
+                    !overlaps(*rect, *other),
+                    "controls {index} and {other_index} overlap"
+                );
+            }
+            for slot in 0..HOTBAR_SLOTS {
+                assert!(
+                    !overlaps(*rect, controls.hotbar_slot_rect(slot)),
+                    "control {index} overlaps hotbar slot {slot}"
+                );
+            }
+        }
     }
 
     #[test]
     fn resize_rebuilds_the_layout() {
-        let mut controls = controls();
+        let mut controls = new_controls();
         let portrait = controls.hud_rects();
         controls.resize(1920.0, 1080.0);
         let landscape = controls.hud_rects();
@@ -1007,14 +1320,16 @@ mod tests {
                 assert!((0.0..=1.0).contains(value), "{value}");
             }
         }
-        assert!(landscape[2].0[0] > 0.5 && landscape[2].0[1] > 0.5);
+        // The jump button stays in the bottom-right corner after rotation.
+        assert!(landscape[5].0[0] > 0.5 && landscape[5].0[1] > 0.5);
+        assert!(landscape[0].0[0] < 0.5);
+        assert!(landscape[0].0[1] + landscape[0].0[3] > 0.5);
     }
 
     #[test]
-    fn public_touch_path_routes_to_the_controls() {
-        let mut controls = controls();
-        let rect = controls.place_rect();
-        let point = [rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0];
+    fn public_touch_path_routes_to_the_new_controls() {
+        let mut controls = new_controls();
+        let point = hud_center(&controls, 6);
         // The public entry point stamps the event with the wall clock; the
         // place press is immediate, so this needs no timing window.
         controls.touch(42, TouchPhase::Started, point[0], point[1]);
@@ -1031,11 +1346,11 @@ mod tests {
 
     #[test]
     fn hotbar_tap_selects_without_any_other_action() {
-        let mut controls = controls();
+        let mut controls = new_controls();
         let now = Instant::now();
         let point = slot_center(&controls, 0);
-        // Slot 0 sits inside the joystick zone; the hotbar must win there.
-        assert!(point[0] < W * STICK_ZONE);
+        // Slot 0 sits inside the pad zone; the hotbar must win there.
+        assert!(point[0] < W * PAD_ZONE);
 
         controls.touch_at(11, TouchPhase::Started, point, now);
         let frame = controls.frame();
@@ -1045,6 +1360,7 @@ mod tests {
         assert!(!frame.jump);
         assert!(!frame.break_block);
         assert!(!frame.place_block);
+        assert!(!frame.sneak);
         assert_eq!(frame.look, [0.0, 0.0]);
 
         // Releasing is inert: no jump, no break.
@@ -1057,7 +1373,7 @@ mod tests {
 
         // The rightmost slot lives in the look zone and behaves the same.
         let point = slot_center(&controls, 8);
-        assert!(point[0] > W * STICK_ZONE);
+        assert!(point[0] > W * PAD_ZONE);
         controls.touch_at(12, TouchPhase::Started, point, at(now, 200));
         assert_eq!(controls.frame().select, Some(8));
         controls.touch_at(12, TouchPhase::Ended, point, at(now, 260));
@@ -1066,10 +1382,10 @@ mod tests {
 
     #[test]
     fn hotbar_drag_never_looks_or_breaks() {
-        let mut controls = controls();
+        let mut controls = new_controls();
         let now = Instant::now();
         let start = slot_center(&controls, 4);
-        assert!(start[0] > W * STICK_ZONE);
+        assert!(start[0] > W * PAD_ZONE);
 
         controls.touch_at(21, TouchPhase::Started, start, now);
         let dragged = [start[0] + 40.0, start[1] - 30.0];
@@ -1090,18 +1406,12 @@ mod tests {
     }
 
     #[test]
-    fn hotbar_works_alongside_a_held_joystick() {
-        let mut controls = controls();
+    fn hotbar_works_alongside_a_held_direction() {
+        let mut controls = new_controls();
         let now = Instant::now();
-        let center = controls.stick_center();
-        let radius = controls.stick_radius();
+        let up = hud_center(&controls, 0);
 
-        controls.touch_at(
-            30,
-            TouchPhase::Started,
-            [center[0], center[1] - radius * 0.8],
-            now,
-        );
+        controls.touch_at(30, TouchPhase::Started, up, now);
         assert!(controls.frame().movement.forward);
 
         let point = slot_center(&controls, 3);
@@ -1109,7 +1419,7 @@ mod tests {
         controls.touch_at(31, TouchPhase::Ended, point, at(now, 40));
         let frame = controls.frame();
         assert_eq!(frame.select, Some(3));
-        // The joystick keeps driving and the tap never jumps.
+        // The direction keeps driving and the tap never jumps.
         assert!(frame.movement.forward);
         assert!(!frame.jump);
         assert!(!frame.break_block);
@@ -1117,8 +1427,8 @@ mod tests {
     }
 
     #[test]
-    fn hotbar_rects_are_centred_above_the_lower_controls() {
-        let controls = controls();
+    fn hotbar_rects_are_centred_above_the_lower_new_controls() {
+        let controls = new_controls();
         let rects = controls.hotbar_rects();
         assert_eq!(rects.iter().filter(|(_, selected)| *selected).count(), 1);
         assert!(rects[0].1, "slot 0 is the default selection");
@@ -1145,17 +1455,19 @@ mod tests {
         );
         assert!(first[1] + first[3] < 0.9, "above the bottom of the screen");
 
-        // In pixels the bar clears the joystick base and the place button.
+        // In pixels the bar clears the D-pad and the right-hand buttons.
         let rect = controls.hotbar_slot_rect(4);
-        let center = controls.stick_center();
-        let radius = controls.stick_radius();
-        assert!(rect[1] + rect[3] < center[1] - radius);
-        assert!(rect[1] + rect[3] < controls.place_rect()[1]);
+        let pad_top = pixel(controls.hud_rects()[0].0)[1];
+        let place_top = pixel(controls.hud_rects()[6].0)[1];
+        let jump_top = pixel(controls.hud_rects()[5].0)[1];
+        assert!(rect[1] + rect[3] < pad_top);
+        assert!(rect[1] + rect[3] < place_top);
+        assert!(rect[1] + rect[3] < jump_top);
     }
 
     #[test]
     fn hotbar_selection_highlight_follows_taps_and_syncs() {
-        let mut controls = controls();
+        let mut controls = new_controls();
         let now = Instant::now();
         assert!(controls.hotbar_rects()[0].1);
 

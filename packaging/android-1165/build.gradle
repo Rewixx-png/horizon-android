@@ -15,8 +15,8 @@ android {
         applicationId 'com.rewixx.horizon1165'
         minSdk 28
         targetSdk 35
-        versionCode 12
-        versionName '0.1.11-dev'
+        versionCode 13
+        versionName '0.1.12-dev'
         ndk { abiFilters providers.gradleProperty('abi').getOrElse('arm64-v8a') }
     }
     signingConfigs {

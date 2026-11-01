@@ -28,6 +28,7 @@ pub mod survival;
 pub mod touch;
 mod types;
 pub mod world;
+pub mod worldgen;
 
 pub use loot::LootTables;
 pub use types::{

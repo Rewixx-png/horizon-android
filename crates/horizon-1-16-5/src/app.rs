@@ -42,6 +42,8 @@ const DEFAULT_RADIUS: i32 = 4;
 /// unnecessary for the development slice.
 #[cfg(target_os = "android")]
 const ANDROID_RADIUS: i32 = 2;
+/// Chunk radius of the generated offline world.
+const STANDALONE_RADIUS: i32 = 6;
 /// A thin, light crosshair over the centre of the screen.
 const CROSSHAIR_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.75];
 /// Half the crosshair arm length and its line thickness in pixels.
@@ -180,9 +182,9 @@ where
     }
 
     let mut missing = Vec::new();
-    if world.is_none() && server.is_none() {
-        missing.push("--world or --server");
-    }
+    // The block tables and the client jar are the game's data; everything
+    // else falls back to a flat offline world when neither `--world` nor
+    // `--server` is given.
     if tables.is_none() {
         missing.push("--tables");
     }
@@ -209,7 +211,7 @@ where
         return Err("--radius must be at least 1".into());
     }
 
-    let world = world.unwrap_or_else(|| std::env::temp_dir().join("horizon-1165-network-world"));
+    let world = world.unwrap_or_else(|| std::env::temp_dir().join("horizon-1165-standalone-world"));
     Ok(PlayOptions {
         world,
         tables: tables.unwrap(),
@@ -286,13 +288,20 @@ impl Loaded {
     ) -> Result<Self, String> {
         let table = BlockTable::load(tables)?;
         let world_root = world;
-        // A chunk from the network needs no directory on disk; an empty world
-        // starts out with no loaded chunks and fills in as packets arrive.
-        let mut world = if world_root.is_dir() && world_root.join("region").is_dir() {
-            World::open(&world_root, table)?
+        // Three ways to get a world: from disk, from the network (empty here,
+        // packets fill it) and, by default, a flat offline world so the game
+        // is playable with no arguments at all.
+        let (mut world, standalone) = if world_root.is_dir() && world_root.join("region").is_dir() {
+            (World::open(&world_root, table)?, false)
+        } else if server_address.is_some() {
+            (World::empty(table), false)
         } else {
-            World::empty(table)
+            (World::empty(table), true)
         };
+        if standalone {
+            let chunks = crate::worldgen::fill_flat(&mut world, STANDALONE_RADIUS)?;
+            eprintln!("standalone: generated {chunks} flat chunks");
+        }
         // The server jar sits beside the world in the bundled layout; loot is
         // optional, the block-table fallback still drops most blocks.
         let server_jar = client_jar

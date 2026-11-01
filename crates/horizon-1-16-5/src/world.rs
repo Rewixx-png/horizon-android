@@ -536,6 +536,15 @@ impl ChunkColumn {
         Ok(())
     }
 
+    /// A mutable section at index 0..16, created filled with `air` when the
+    /// column did not have one yet.
+    pub fn section_mut(&mut self, index: usize) -> Option<&mut [u32; SECTION_BLOCKS]> {
+        if index >= SECTIONS {
+            return None;
+        }
+        Some(self.sections[index].get_or_insert_with(|| Box::new([0; SECTION_BLOCKS])))
+    }
+
     /// Clears the sections the packet's mask says are empty, so a full chunk
     /// never keeps stale blocks from a chunk it replaces.
     pub fn replace_sections_absent_from(&mut self, bitmask: u32) -> Result<(), String> {

@@ -77,10 +77,11 @@ fn android_main(app: AndroidApp) {
 /// written only after a complete extraction, so a crash halfway through is
 /// retried on the next launch.
 fn extracted_tree_is_ready(root: &Path) -> bool {
+    // The world directory is optional: without it the game generates a flat
+    // offline world, which is the default standalone mode.
     root.join(".ready").is_file()
         && root.join("tables.json").is_file()
         && root.join("client.jar").is_file()
-        && root.join("world/level.dat").is_file()
 }
 
 /// Streams `assets/1165.zip` out of the APK and unpacks it into `root`.

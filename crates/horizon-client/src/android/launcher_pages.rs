@@ -212,6 +212,28 @@ pub(super) fn page_header(ui: &mut Ui, title: &str, caption: &str, x: f32, y: f3
     y + title_size * 1.45 + 2.0 + 14.0 * 1.45 + 14.0
 }
 
+/// A fraction eased between frames: 0 is the frame the value changed, 1 settled.
+/// `phase` is 0..1 of the way through `MILLIS`, so every bar moves at one pace.
+pub(super) fn eased(phase: f32) -> f32 {
+    // ease-out-cubic: quick to start, settling at the end.
+    let t = 1.0 - phase.clamp(0.0, 1.0);
+    1.0 - t * t * t
+}
+
+/// 0..1 that breathes once a second, for a dot that says "working".
+pub(super) fn pulse(now: std::time::Instant, period_ms: u64) -> f32 {
+    let ms = now.elapsed().as_millis() as u64 % period_ms;
+    let t = ms as f32 / period_ms as f32;
+    // sine, so it never jumps back to 0 hard.
+    (t * std::f32::consts::TAU).sin() * 0.5 + 0.5
+}
+
+/// `color::ACCENT` at `alpha` 0..1, for the breathing dot.
+pub(super) fn accent_at(alpha: f32) -> u32 {
+    let a = (alpha.clamp(0.0, 1.0) * 255.0) as u8;
+    (a as u32) << 24 | (color::ACCENT & 0x00ff_ffff)
+}
+
 pub(super) fn progress_bar(ui: &mut Ui, x: f32, y: f32, w: f32, fraction: f32) {
     ui.rounded(x, y, w, 4.0, 2.0, color::RAISED);
     let fraction = fraction.clamp(0.0, 1.0);
@@ -452,9 +474,18 @@ impl Launcher {
                 let dot_color = if error.is_some() {
                     color::DANGER
                 } else {
-                    color::ACCENT
+                    // Breathes while it works: the card only shows while something runs.
+                    accent_at(0.45 + 0.55 * pulse(std::time::Instant::now(), 1400))
                 };
-                ui.rounded(margin + 14.0, top + 16.0, 6.0, 6.0, 3.0, dot_color);
+                let dot = 6.0 + 2.0 * pulse(std::time::Instant::now(), 1400);
+                ui.rounded(
+                    margin + 14.0 - (dot - 6.0) / 2.0,
+                    top + 16.0 - (dot - 6.0) / 2.0,
+                    dot,
+                    dot,
+                    dot / 2.0,
+                    dot_color,
+                );
                 let title = if error.is_some() {
                     translate(language, "Update failed").to_owned()
                 } else if tight {
@@ -1212,6 +1243,55 @@ impl Launcher {
                     );
                 }
             }
+        } else if page == Page::Journal {
+            // What the device recorded: imports (and why one was refused), errors and
+            // exits. Scrolls as one column, newest last, so a failed .hmod can be read
+            // on the phone itself.
+            let title = translate(language, "Journal");
+            let caption = translate(language, "Imports, errors and exits on this device");
+            let header_h = page_header_height(content_w);
+            let bottom = content_bottom;
+            let viewport_top = nav_bottom + 8.0;
+            let line_h = 18.0;
+            let lines = crate::diagnostics::recent_lines(&self.home, 200);
+            let mut top = page_header(&mut ui, title, &caption, margin, page_top, content_w);
+            if lines.is_empty() {
+                ui.text(
+                    Face::Regular,
+                    14.0,
+                    margin,
+                    top + 6.0,
+                    color::MUTED,
+                    translate(language, "Nothing recorded yet."),
+                );
+            } else {
+                let total = lines.len() as f32 * line_h;
+                let maximum = (total - (bottom - viewport_top)).max(0.0);
+                self.catalog.scroll = self.catalog.scroll.clamp(0.0, maximum);
+                self.list_view = Some([viewport_top, bottom, maximum]);
+                let start = if maximum > 0.0 {
+                    (bottom - viewport_top - self.catalog.scroll) / line_h
+                } else {
+                    0.0
+                };
+                let first = lines.len().saturating_sub(start as usize + 1);
+                for (i, line) in lines.into_iter().enumerate().skip(first) {
+                    let y = viewport_top + (i as f32 - first as f32) * line_h;
+                    if y < viewport_top - line_h || y > bottom {
+                        continue;
+                    }
+                    let text = ui.fit_text(Face::Regular, 12.0, &line, content_w);
+                    let failing = line.contains("import") && line.contains("failed");
+                    ui.text(
+                        Face::Regular,
+                        12.0,
+                        margin,
+                        y + top - viewport_top + 4.0,
+                        if failing { color::DANGER } else { color::MUTED },
+                        &text,
+                    );
+                }
+            }
         } else {
             let c = &self.catalog.config;
             let language = c.language;
@@ -1316,6 +1396,11 @@ impl Launcher {
                     }),
                 ),
                 Entry::Section("Support"),
+                Entry::Row(
+                    "Journal",
+                    Action::Logs,
+                    Kind::Action(translate(language, "Recent errors and imports").to_owned()),
+                ),
                 Entry::Row(
                     "Diagnostic report",
                     Action::ExportDiagnostics,
@@ -1877,15 +1962,15 @@ impl Launcher {
             }
             Some(Action::Dismiss) => self.chooser = None,
             Some(Action::Logs) => {
-                self.catalog.status = crate::diagnostics::summary(&self.home);
-                if let Ok(error) = std::fs::read_to_string(self.home.join("android-error.txt")) {
-                    let summary = std::mem::take(&mut self.catalog.status);
-                    self.catalog.status = tr!(
-                        language,
-                        "Last handled error: {error}. {summary}",
-                        { error = crate::diagnostics::redact(&error), summary = summary }
-                    );
-                }
+                // The journal: what failed and what was imported, newest last, so a
+                // refused mod can be read on the phone without exporting anything.
+                let lines = crate::diagnostics::recent_lines(&self.home, 40);
+                let summary = crate::diagnostics::summary(&self.home);
+                self.catalog.status = if lines.is_empty() {
+                    summary
+                } else {
+                    format!("{summary}\n\n{}", lines.join("\n"))
+                };
             }
             Some(Action::ExportDiagnostics) if self.diagnostic_export.is_none() => {
                 let home = self.home.clone();

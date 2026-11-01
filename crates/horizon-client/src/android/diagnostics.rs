@@ -59,6 +59,23 @@ pub fn reason_name(reason: i32) -> &'static str {
         _ => "unknown",
     }
 }
+/// The newest `lines` lines of the log under `home`, oldest first, for the
+/// Settings journal: the same file the diagnostics export ships.
+pub fn recent_lines(home: &Path, lines: usize) -> Vec<String> {
+    let Ok(bytes) = tail(&home.join("diagnostic.log"), 64 * 1024) else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let mut out: Vec<String> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(redact)
+        .collect();
+    let keep = out.len().saturating_sub(lines);
+    out.drain(..keep);
+    out
+}
+
 pub fn tail(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
     let mut file = File::open(path)?;
     let size = file.metadata()?.len();

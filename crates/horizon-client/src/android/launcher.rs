@@ -586,12 +586,16 @@ impl ApplicationHandler for Launcher {
             changed = true;
         }
 
-        if busy || changed {
+        // A moving indicator (a breathing dot, a progress bar) needs frames even
+        // when nothing changed: while work is under way the launcher redraws at
+        // ~20 fps, which is smooth for a pulse and cheap on a phone.
+        let animating = busy || self.update.available().is_some();
+        if animating || changed {
             if let Some(window) = &self.window {
                 window.request_redraw();
             }
             events.set_control_flow(ControlFlow::WaitUntil(
-                Instant::now() + Duration::from_millis(100),
+                Instant::now() + Duration::from_millis(if animating { 50 } else { 100 }),
             ));
         } else if self.catalog.editing.is_some() {
             if let Some(window) = &self.window {

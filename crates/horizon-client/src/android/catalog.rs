@@ -151,15 +151,18 @@ pub enum Page {
     Shaders,
     Installed,
     Settings,
+    /// The device journal: recent errors, imports and their reasons.
+    Journal,
 }
 impl Page {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Play,
         Self::Mods,
         Self::Packs,
         Self::Shaders,
         Self::Installed,
         Self::Settings,
+        Self::Journal,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -169,6 +172,7 @@ impl Page {
             Self::Shaders => "Shaders",
             Self::Installed => "Installed",
             Self::Settings => "Settings",
+            Self::Journal => "Journal",
         }
     }
     pub fn is_catalog(self) -> bool {

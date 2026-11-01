@@ -231,11 +231,22 @@ fn stage(request: Request, mut input: std::fs::File, name: String) -> Result<()>
             .write(true)
             .create_new(true)
             .open(&staged)?;
+        // A document provider can state its size: with one, the line reads as a
+        // percentage that moves; without, as the bytes copied so far.
+        let total = input.metadata().map(|m| m.len()).unwrap_or(0);
         content_files::copy_bounded(&mut input, &mut output, |bytes| {
-            notice(
-                format!("Importing {}: {} KiB", request.kind.label(), bytes / 1024),
-                false,
-            );
+            let line = if total > 0 {
+                format!(
+                    "Importing {}: {}% ({} of {} MiB)",
+                    request.kind.label(),
+                    (bytes * 100 / total).min(100),
+                    bytes >> 20,
+                    total >> 20
+                )
+            } else {
+                format!("Importing {}: {} KiB", request.kind.label(), bytes / 1024)
+            };
+            notice(line, false);
             !CANCEL.load(Ordering::Relaxed)
         })?;
         output.sync_all()?;

@@ -333,6 +333,16 @@ impl TextureAtlas {
         self.sprites.get(&normalized(texture.to_owned()))
     }
 
+    /// One RGBA texel of the atlas, or `None` outside its rectangle.
+    pub fn texel(&self, x: u32, y: u32) -> Option<[u8; 4]> {
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        let index = ((y * self.width + x) * 4) as usize;
+        let texel = self.pixels.get(index..index + 4)?;
+        Some([texel[0], texel[1], texel[2], texel[3]])
+    }
+
     /// The sprite in normalized UV coordinates, or `None` for a name that
     /// was not requested at build time.
     pub fn uv(&self, texture: &str) -> Option<[f32; 4]> {

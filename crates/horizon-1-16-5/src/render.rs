@@ -189,11 +189,17 @@ pub fn hud_rect(x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) -> [HudVertex; 
 /// [`SurfaceRenderer::render_with_hud`] draws them with the atlas-sampling
 /// pipeline after the flat HUD, so the hotbar icons show the real block and
 /// item sprites instead of averaged colour bands.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HudSprite {
     /// Normalized `0..=1` screen rectangle with a top-left origin:
-    /// `x, y, width, height`.
+    /// `x, y, width, height`. GUI sprites carry pixels instead, see
+    /// [`gui_vertices`].
     pub rect: [f32; 4],
+    /// The GUI atlas sprite to draw; empty means the sprite carries `uv`.
+    pub name: String,
+    /// The pass that draws it: `true` for the pixel-space GUI pass, `false`
+    /// for the normalized HUD pass over the world atlas.
+    pub pixels: bool,
     /// The atlas rectangle to sample as `u0, v0, u1, v1`. Sprite-local
     /// coordinates are `[0.0, 0.0, 1.0, 1.0]`; a packed sheet uses the
     /// sprite's own normalized atlas rectangle instead.
@@ -203,10 +209,29 @@ pub struct HudSprite {
 }
 
 impl HudSprite {
+    /// A sprite over `rect` drawn from the GUI atlas sprite `name`.
+    pub fn named(
+        rect: [f32; 4],
+        name: impl Into<String>,
+        uv: [f32; 4],
+        pixels: bool,
+        color: [f32; 4],
+    ) -> Self {
+        Self {
+            rect,
+            name: name.into(),
+            uv,
+            pixels,
+            color,
+        }
+    }
+
     /// A sprite over `rect` sampling `uv`, drawn untinted.
     pub fn new(rect: [f32; 4], uv: [f32; 4]) -> Self {
         Self {
             rect,
+            name: String::new(),
+            pixels: false,
             uv,
             color: [1.0, 1.0, 1.0, 1.0],
         }
@@ -1053,6 +1078,184 @@ fn create_hud_sprite_pipeline(
     })
 }
 
+/// Flattens the GUI sprites whose rects are already in GUI pixels from the
+/// frame's top-left; their UVs address the GUI atlas.
+pub fn gui_vertices(sprites: &[HudSprite]) -> Vec<SpriteVertex> {
+    let mut vertices = Vec::with_capacity(sprites.len() * 6);
+    for sprite in sprites {
+        vertices.extend_from_slice(&gui_sprite(sprite.rect, sprite.uv, sprite.color));
+    }
+    vertices
+}
+
+/// Splits the frame's HUD sprites into the two passes: normalized rects
+/// sample the world atlas, pixel rects the GUI atlas. GUI content travels as
+/// pixels, so a rect whose width is above 1.0 can only be GUI geometry.
+pub fn split_gui(sprites: &[HudSprite]) -> (Vec<HudSprite>, Vec<HudSprite>) {
+    let mut hud = Vec::new();
+    let mut gui = Vec::new();
+    for sprite in sprites {
+        if sprite.pixels {
+            gui.push(sprite.clone());
+        } else {
+            hud.push(sprite.clone());
+        }
+    }
+    (hud, gui)
+}
+
+/// One GUI quad in pixels, in the same clockwise order as [`hud_sprite`].
+pub fn gui_sprite(rect: [f32; 4], uv: [f32; 4], color: [f32; 4]) -> [SpriteVertex; 6] {
+    let [x, y, w, h] = rect;
+    let [u0, v0, u1, v1] = uv;
+    let corner = |x: f32, y: f32, u: f32, v: f32| SpriteVertex {
+        position: [x, y],
+        uv: [u, v],
+        color,
+    };
+    [
+        corner(x, y, u0, v0),
+        corner(x + w, y, u1, v0),
+        corner(x + w, y + h, u1, v1),
+        corner(x, y, u0, v0),
+        corner(x + w, y + h, u1, v1),
+        corner(x, y + h, u0, v1),
+    ]
+}
+
+/// Builds the GUI pipeline: the same vertex format as the HUD sprites, but
+/// positions arrive in GUI pixels from the top-left, so a viewport-sized
+/// matrix maps them onto the frame. That keeps text and slots at integer
+/// pixel positions regardless of the scale factor.
+fn create_gui_pipeline(
+    device: &wgpu::Device,
+    label: &str,
+    format: wgpu::TextureFormat,
+) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("horizon-1-16-5 gui shader"),
+        source: wgpu::ShaderSource::Wgsl(GUI_SHADER.into()),
+    });
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("horizon-1-16-5 gui bind group layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("horizon-1-16-5 gui pipeline layout"),
+        bind_group_layouts: &[Some(&bind_group_layout)],
+        ..Default::default()
+    });
+    let attributes = wgpu::vertex_attr_array![
+        0 => Float32x2,
+        1 => Float32x2,
+        2 => Float32x4,
+    ];
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[Some(wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<SpriteVertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &attributes,
+            })],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    (pipeline, bind_group_layout)
+}
+
+/// GUI positions are pixels from the frame's top-left corner:
+/// `clip.xy = pos / viewport * 2 - 1`, with the `y` axis flipped.
+const GUI_SHADER: &str = r#"
+struct Uniforms {
+    viewport: vec2<f32>,
+};
+
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+@group(0) @binding(1) var atlas: texture_2d<f32>;
+@group(0) @binding(2) var atlas_sampler: sampler;
+
+struct VertexInput {
+    @location(0) position: vec2<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) color: vec4<f32>,
+};
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+};
+
+@vertex
+fn vs_main(input: VertexInput) -> VertexOutput {
+    var output: VertexOutput;
+    let normalized = input.position / uniforms.viewport;
+    output.position = vec4<f32>(normalized.x * 2.0 - 1.0, 1.0 - normalized.y * 2.0, 0.0, 1.0);
+    output.uv = input.uv;
+    output.color = input.color;
+    return output;
+}
+
+@fragment
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    return textureSample(atlas, atlas_sampler, input.uv) * input.color;
+}
+"#;
+
 /// Decodes a packed sRGB colour (`0xRRGGBB`) into linear RGB, as the atlas
 /// samples are linear after the sRGB texture decode.
 fn srgb_to_linear(color: u32) -> [f32; 3] {
@@ -1357,6 +1560,9 @@ pub struct SurfaceRenderer {
     translucent_pipeline: wgpu::RenderPipeline,
     hud_pipeline: wgpu::RenderPipeline,
     hud_sprite_pipeline: wgpu::RenderPipeline,
+    /// GUI pixels from the frame's top-left, for text and slot geometry.
+    gui_pipeline: wgpu::RenderPipeline,
+    gui_layout: wgpu::BindGroupLayout,
     format: wgpu::TextureFormat,
     size: [u32; 2],
     depth: wgpu::TextureView,
@@ -1422,6 +1628,8 @@ impl SurfaceRenderer {
             "horizon-1-16-5 surface hud sprite pipeline",
             format,
         );
+        let (gui_pipeline, gui_layout) =
+            create_gui_pipeline(&device, "horizon-1-16-5 surface gui pipeline", format);
         let depth = create_depth(&device, size[0], size[1]);
         let renderer = Self {
             surface,
@@ -1431,6 +1639,8 @@ impl SurfaceRenderer {
             translucent_pipeline,
             hud_pipeline,
             hud_sprite_pipeline,
+            gui_pipeline,
+            gui_layout,
             format,
             size,
             depth,
@@ -1528,7 +1738,7 @@ impl SurfaceRenderer {
         sprites: &[HudSprite],
         light: &[f32],
         gui: Option<(&crate::gui::GuiSprites, &[HudSprite])>,
-        hand: &[SpriteVertex],
+        _hand: &[SpriteVertex],
     ) -> Result<(), RenderError> {
         let prepared = prepare_mesh(mesh, atlas, light)?;
         // The swapchain is not authoritative: Android can deliver the first
@@ -1765,8 +1975,14 @@ impl SurfaceRenderer {
             pass.set_vertex_buffer(0, hud_buffer.slice(..));
             pass.draw(0..hud.len() as u32, 0..1);
         }
-        if !sprites.is_empty() {
-            let vertices = sprite_vertices(sprites);
+        // HUD pass: the caller's sprite list (hotbar icons, vitals) plus the
+        // normalized-rect sprites the GUI helper produced; all sample the
+        // world atlas.
+        let (gui_hud, gui_list) = gui.map(|(_, list)| split_gui(list)).unwrap_or_default();
+        let mut hud_sprites: Vec<HudSprite> = sprites.to_vec();
+        hud_sprites.extend(gui_hud);
+        if !hud_sprites.is_empty() {
+            let vertices = sprite_vertices(&hud_sprites);
             let sprite_buffer = self
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1812,7 +2028,7 @@ impl SurfaceRenderer {
             pass.set_vertex_buffer(0, sprite_buffer.slice(..));
             pass.draw(0..vertices.len() as u32, 0..1);
         }
-        if let Some((gui, gui_sprites)) = gui.filter(|(_, sprites)| !sprites.is_empty()) {
+        if let Some((gui, _)) = gui.filter(|_| !gui_list.is_empty()) {
             let texture = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("horizon-1-16-5 gui atlas"),
                 size: wgpu::Extent3d {
@@ -1841,18 +2057,8 @@ impl SurfaceRenderer {
                     depth_or_array_layers: 1,
                 },
             );
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-                label: Some("horizon-1-16-5 gui sampler"),
-                address_mode_u: wgpu::AddressMode::ClampToEdge,
-                address_mode_v: wgpu::AddressMode::ClampToEdge,
-                address_mode_w: wgpu::AddressMode::ClampToEdge,
-                mag_filter: wgpu::FilterMode::Nearest,
-                min_filter: wgpu::FilterMode::Nearest,
-                mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-                ..Default::default()
-            });
-            let vertices = sprite_vertex_list(gui_sprites, hand);
+            let gui_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let vertices = gui_vertices(&gui_list);
             let buffer = self
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1860,16 +2066,28 @@ impl SurfaceRenderer {
                     contents: bytemuck::cast_slice(&vertices),
                     usage: wgpu::BufferUsages::VERTEX,
                 });
+            let extent = [self.size[0] as f32, self.size[1] as f32];
+            let uniforms = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("horizon-1-16-5 gui uniform"),
+                    contents: bytemuck::cast_slice(&extent),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("horizon-1-16-5 gui bind group"),
-                layout: &self.hud_sprite_pipeline.get_bind_group_layout(0),
+                layout: &self.gui_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
+                        resource: uniforms.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&gui_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
                         resource: wgpu::BindingResource::Sampler(&sampler),
                     },
                 ],
@@ -1890,7 +2108,7 @@ impl SurfaceRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.hud_sprite_pipeline);
+            pass.set_pipeline(&self.gui_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.set_vertex_buffer(0, buffer.slice(..));
             pass.draw(0..vertices.len() as u32, 0..1);
@@ -2706,11 +2924,13 @@ mod tests {
 
         let first = HudSprite::new([0.0, 0.0, 0.5, 0.5], [0.0, 0.0, 0.5, 0.5]);
         let second = HudSprite {
+            name: String::new(),
+            pixels: false,
             rect: [0.5, 0.5, 0.5, 0.5],
             uv: [0.5, 0.5, 1.0, 1.0],
             color: [1.0, 0.5, 0.25, 0.75],
         };
-        let vertices = sprite_vertices(&[first, second]);
+        let vertices = sprite_vertices(&[first.clone(), second.clone()]);
         assert_eq!(vertices.len(), 12);
         assert_eq!(vertices[..6], hud_sprite(first.rect, first.uv, first.color));
         assert_eq!(

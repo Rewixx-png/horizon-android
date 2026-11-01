@@ -45,6 +45,8 @@ pub struct IntegratedServer {
     pub tick_count: u64,
     /// Set when a block changed and the visible mesh must be rebuilt.
     pub dirty: bool,
+    /// The most recent break, drained by the render thread for particles.
+    last_break: Option<(BlockState, [i32; 3])>,
     /// Highest `y` reached since the player left the ground; landing uses it
     /// to compute fall distance.
     fall_start_y: Option<f64>,
@@ -76,6 +78,7 @@ impl IntegratedServer {
             survival: Survival::creative(),
             tick_count: 0,
             dirty: false,
+            last_break: None,
             fall_start_y: None,
         }
     }
@@ -180,6 +183,12 @@ impl IntegratedServer {
     /// Creative mode removes any block. Survival mode only breaks blocks that
     /// yield a drop for the held item (stone needs a pickaxe in 1.16.5, dirt
     /// always drops) and puts those drops in the survival inventory.
+    /// The last block this server broke, with its position, for the renderer's
+    /// break particles. `None` until the first break.
+    pub fn take_break(&mut self) -> Option<(BlockState, [i32; 3])> {
+        self.last_break.take()
+    }
+
     fn break_target(&mut self) {
         let Some(hit) =
             interact::raycast(&self.world, self.player.eye(), self.player.look(), REACH)
@@ -206,12 +215,14 @@ impl IntegratedServer {
             return;
         }
 
+        let broken = state.clone();
         let air = BlockState::new("minecraft:air");
         if self
             .world
             .set_state(hit.position[0], hit.position[1], hit.position[2], &air)
             .is_ok()
         {
+            self.last_break = Some((broken, hit.position));
             for drop in drops {
                 let _ = self.survival.inventory.add(drop);
             }

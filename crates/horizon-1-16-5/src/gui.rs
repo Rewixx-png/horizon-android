@@ -34,8 +34,10 @@ pub struct GuiSprite {
 }
 
 /// The vanilla GUI atlas plus a name → sprite table.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct GuiSprites {
+    /// Advance per ASCII code point once the font is loaded.
+    advances: [u8; 256],
     width: u32,
     height: u32,
     rgba: Vec<u8>,
@@ -56,7 +58,9 @@ struct Piece<'a> {
     name: &'a str,
 }
 
-/// The vanilla pieces: hotbar, selection frame and crosshair.
+/// The vanilla pieces: hotbar, selection frame and crosshair. They live in
+/// the GUI atlas with the glyphs; the renderer draws that atlas after the
+/// world one, so they double as the crosshair over the scene.
 const VANILLA: &[Piece<'_>] = &[
     Piece {
         sheet: WIDGETS,
@@ -81,6 +85,41 @@ const VANILLA: &[Piece<'_>] = &[
         width: 15,
         height: 15,
         name: "crosshair",
+    },
+    // Survival vitals: 9x9 heart cells on the top row of `icons.png`, the
+    // food cells three rows down. Cell 1 is the empty heart, cell 4 the full
+    // one; hunger mirrors it with cell 0 empty, cell 3 full.
+    Piece {
+        sheet: ICONS,
+        x: 9,
+        y: 0,
+        width: 9,
+        height: 9,
+        name: "heart_empty",
+    },
+    Piece {
+        sheet: ICONS,
+        x: 36,
+        y: 0,
+        width: 9,
+        height: 9,
+        name: "heart_full",
+    },
+    Piece {
+        sheet: ICONS,
+        x: 0,
+        y: 27,
+        width: 9,
+        height: 9,
+        name: "food_empty",
+    },
+    Piece {
+        sheet: ICONS,
+        x: 27,
+        y: 27,
+        width: 9,
+        height: 9,
+        name: "food_full",
     },
 ];
 
@@ -109,6 +148,18 @@ const BEDROCK: &[(&str, &str)] = &[
     ("ui/attack.png", "touch_attack"),
     ("ui/attack_pressed.png", "touch_attack_pressed"),
 ];
+
+impl Default for GuiSprites {
+    fn default() -> Self {
+        Self {
+            advances: [crate::font::DEFAULT_ADVANCE; 256],
+            width: 0,
+            height: 0,
+            rgba: Vec::new(),
+            sprites: BTreeMap::new(),
+        }
+    }
+}
 
 impl GuiSprites {
     /// Loads the vanilla sheets from `source` and, when the pack has them,
@@ -174,12 +225,29 @@ impl GuiSprites {
         }
         // Pack vanilla first so the hotbar and crosshair sit at the origin of
         // the atlas, then the optional touch sprites.
+        let vanilla_rows = vanilla_images
+            .iter()
+            .map(|(_, image)| image.height)
+            .max()
+            .unwrap_or(0);
+        let vanilla_count = vanilla_images.len();
         let mut images = vanilla_images;
         images.extend(touch_images);
         sprites.extend(touch_sprites);
 
         let gap = 1;
         let (width, placed) = pack(&images, gap);
+        let placed: Vec<(u32, u32)> = placed
+            .iter()
+            .enumerate()
+            .map(|(index, &(x, y))| {
+                if index < vanilla_count {
+                    (x, y)
+                } else {
+                    (x, y + vanilla_rows + gap)
+                }
+            })
+            .collect();
         let rows: u32 = images
             .iter()
             .zip(&placed)
@@ -195,6 +263,7 @@ impl GuiSprites {
             paste(&mut rgba, width, image, *x, *y);
         }
         Ok(Self {
+            advances: [crate::font::DEFAULT_ADVANCE; 256],
             width,
             height,
             rgba,
@@ -249,6 +318,60 @@ impl GuiSprites {
             added += 1;
         }
         Ok(added)
+    }
+
+    /// Adds the default font's glyph sheet to the atlas, if the pack has one.
+    ///
+    /// Returns whether any glyph was added; a pack without `ascii.png` keeps
+    /// the drawn HUD and simply has no action-bar text.
+    pub fn add_font(&mut self, ascii_png: &[u8]) -> Result<(), String> {
+        let font = crate::font::build(ascii_png)?;
+
+        let mut added = 0;
+        for (name, image) in font.sheet {
+            self.append_region(&name, &image);
+            added += 1;
+        }
+
+        self.advances = font.advances;
+        debug_assert!(added > 0, "the ascii sheet always carries glyphs");
+        Ok(())
+    }
+
+    /// The default font's advance for `byte`, in GUI pixels.
+    pub fn advance(&self, byte: u8) -> u32 {
+        u32::from(self.advances[byte as usize])
+    }
+
+    /// The pixels `text` covers, starting at `(x, y)` from the top-left.
+    pub fn text_rect(&self, text: &str, baseline: f32, scale: f32) -> [f32; 4] {
+        let width = self.text_width(text) as f32 * scale;
+        [
+            -width,
+            -(baseline * 2.0 - 1.0),
+            width * 2.0,
+            -(8.0 * scale * 2.0),
+        ]
+    }
+
+    /// The width of `text` in GUI pixels.
+    pub fn text_width(&self, text: &str) -> u32 {
+        text.bytes().map(|byte| self.advance(byte)).sum()
+    }
+
+    /// Registers an already-cut 8x8 glyph image as sprite `name`.
+    fn append_region(&mut self, name: &str, image: &TextureImage) -> (u32, u32) {
+        let (x, y) = self.append(image);
+        self.sprites.insert(
+            name.to_owned(),
+            GuiSprite {
+                x,
+                y,
+                width: image.width,
+                height: image.height,
+            },
+        );
+        (x, y)
     }
 
     /// Places one more image at the right of the atlas, growing its column

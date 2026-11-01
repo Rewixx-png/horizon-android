@@ -63,20 +63,9 @@ const JOYSTICK_DISCS: usize = 5;
 /// Wedges in one joystick disc: 24 keeps the rim smooth at phone widths for a
 /// few dozen vertices per circle.
 const DISC_SEGMENTS: usize = 24;
-/// Health points drawn as one heart-like cell each, ten to a row.
-const HEALTH_CELLS: usize = 20;
+/// One heart cell, as a fraction of a hotbar slot's height (9 of 20 pixels).
+const HEART_CELL_WIDTH: f32 = 0.45;
 const HEALTH_CELLS_PER_ROW: usize = 10;
-/// Red fill for a point of health and gray for the missing remainder.
-const HEALTH_FULL_COLOR: [f32; 4] = [0.85, 0.11, 0.11, 0.95];
-const HEALTH_EMPTY_COLOR: [f32; 4] = [0.22, 0.22, 0.22, 0.75];
-/// Food points drawn as ten cells to a row, gold when present.
-const FOOD_CELLS: usize = 20;
-const FOOD_FULL_COLOR: [f32; 4] = [0.86, 0.52, 0.14, 0.95];
-const FOOD_EMPTY_COLOR: [f32; 4] = [0.22, 0.22, 0.22, 0.75];
-/// Height of one health/food cell as a fraction of a hotbar slot.
-const VITAL_CELL_HEIGHT: f32 = 0.34;
-/// Vertical gap between the hotbar and the vital rows, in slot fractions.
-const VITAL_GAP: f32 = 0.07;
 /// Full-screen tint shown while the survival player is dead.
 const DEATH_TINT_COLOR: [f32; 4] = [0.55, 0.03, 0.03, 0.45];
 /// Translucent backdrop of the inventory and crafting panel.
@@ -390,6 +379,21 @@ impl Loaded {
         {
             eprintln!("baked bedrock controls: {error}");
         }
+        // The action-bar text needs vanilla's own glyph sheet.
+        if let Some(gui) = gui.as_mut() {
+            match crate::atlas::TextureSource::read(
+                &mut assets,
+                "minecraft/textures/font/ascii.png",
+            ) {
+                Ok(Some(ascii)) => {
+                    if let Err(error) = gui.add_font(&ascii) {
+                        eprintln!("font: ascii.png: {error}");
+                    }
+                }
+                Ok(None) => eprintln!("font: ascii.png is missing from the pack"),
+                Err(error) => eprintln!("font: ascii.png: {error}"),
+            }
+        }
         let block_table = Arc::new(server.world.table.clone());
         let net = match server_address {
             Some(address) => {
@@ -455,6 +459,16 @@ struct PlayState {
     sent_position: Option<[f64; 3]>,
     /// View-bob phase, advanced while walking on the ground.
     bob_phase: f32,
+    /// Break particles, updated every frame on the render thread.
+    particles: Vec<crate::particles::Particle>,
+    /// Break counter feeding the particle jitter, so two breaks differ.
+    breaks: u32,
+    /// The last selected hotbar slot, to detect a selection change.
+    last_selected: usize,
+    /// When the selected block's name started showing, and how long it stays.
+    name_since: Option<std::time::Instant>,
+    /// The block name shown above the hotbar, and its width in GUI pixels.
+    name_text: Option<(String, f32)>,
     assets: VanillaAssets,
     atlas: TextureAtlas,
     mesh: Mesh,
@@ -787,6 +801,22 @@ impl PlayApp {
         state.place_block = false;
         state.attack = false;
         state.server.tick(&input);
+        // One break spawns its burst right after the tick that removed it.
+        while let Some((block, position)) = state.server.take_break() {
+            let texture = crate::inventory::icon_texture_for_item(&block.name)
+                .unwrap_or_else(|| "minecraft:block/stone".to_owned());
+            let color = crate::particles::dominant_color(&state.atlas, &texture);
+            state.breaks = state.breaks.wrapping_add(1);
+            crate::particles::spawn_break(
+                &mut state.particles,
+                &block,
+                color,
+                position[0],
+                position[1],
+                position[2],
+                state.breaks,
+            );
+        }
         if let Some(net) = state.net.as_ref() {
             let position = state.server.player.position;
             let moved = state.sent_position.is_none_or(|last| {
@@ -855,9 +885,6 @@ impl PlayApp {
             size.width,
             size.height,
         );
-        if survival.mode == GameMode::Survival {
-            survival_hud(&mut state.hud, &state.touch, survival);
-        }
         // The inventory panel is flat geometry drawn over the hotbar, but
         // sprite icons are drawn after every flat vertex; drop the hotbar
         // icons so they cannot show through the open panel. The panel's own
@@ -876,7 +903,23 @@ impl PlayApp {
             size.height,
             state.pointer,
         );
-        fill_gui(
+        // A slot change right now shows the new block's name above the strip.
+        let mut shown = state.name_text.take();
+        let selected = inventory.selected();
+        if selected != state.last_selected {
+            state.last_selected = selected;
+            let block = inventory
+                .slots()
+                .get(selected)
+                .and_then(|slot| slot.as_ref())
+                .map(|stack| block_display_name(&stack.item))
+                .unwrap_or_default();
+            let width = state.gui.as_ref().map_or(0, |gui| gui.text_width(&block));
+            shown = Some((block, width as f32));
+            state.name_since = Some(Instant::now());
+        }
+        state.name_text = shown;
+        let geometry = fill_gui(
             &mut state.hud,
             &mut state.gui_sprites,
             state.gui.as_ref(),
@@ -886,6 +929,41 @@ impl PlayApp {
             size.height,
             (inventory.selected(), state.screen.open),
         );
+        hotbar_icons(
+            &mut state.sprites,
+            geometry,
+            inventory,
+            &state.atlas,
+            (size.width, size.height),
+        );
+        if survival.mode == GameMode::Survival {
+            survival_hud(
+                &mut state.hud,
+                &mut state.gui_sprites,
+                state.gui.as_ref(),
+                &state.touch,
+                survival,
+                geometry.map(|(rect, _)| rect).unwrap_or([0.0; 4]),
+                (size.width, size.height),
+            );
+        }
+        if let (Some(geometry), Some(gui), Some((text, _)), Some(since)) = (
+            geometry,
+            state.gui.as_ref(),
+            state.name_text.as_ref(),
+            state.name_since,
+        ) {
+            action_bar(
+                &mut state.gui_sprites,
+                gui,
+                geometry,
+                text,
+                since,
+                Instant::now(),
+                size.width as f32,
+                size.height as f32,
+            );
+        }
         state
             .renderer
             .render_with_hud_gui(
@@ -1046,6 +1124,11 @@ impl ApplicationHandler for PlayApp {
             gui: pending.gui,
             sent_position: None,
             bob_phase: 0.0,
+            particles: Vec::with_capacity(crate::particles::CAPACITY),
+            breaks: 0,
+            last_selected: 0,
+            name_since: None,
+            name_text: None,
             assets: pending.assets,
             atlas: pending.atlas,
             mesh: pending.mesh,
@@ -1371,9 +1454,10 @@ fn gui_scale(screen_height: f32) -> f32 {
 /// and the HUD keeps its flat swatch for it.
 fn hud_icon_textures() -> Vec<String> {
     let inventory = Inventory::creative();
-    (0..crate::touch::HOTBAR_SLOTS)
+    let textures: Vec<String> = (0..crate::touch::HOTBAR_SLOTS)
         .filter_map(|slot| inventory.icon_texture(slot))
-        .collect()
+        .collect();
+    textures
 }
 
 /// Combines a keyboard/mouse hotbar pick for this tick with a touch pick.
@@ -1530,15 +1614,13 @@ fn fill_gui(
     width: u32,
     height: u32,
     state: (usize, bool),
-) {
+) -> Option<([f32; 4], f32)> {
     gui_sprites.clear();
     let (selected, panel_open) = state;
     let _ = hud;
-    let Some(gui) = gui else {
-        return;
-    };
+    let gui = gui?;
     if panel_open {
-        return;
+        return None;
     }
     // The vanilla sheet is 182x22 pixels (nine 20x20 slots plus a 1-pixel
     // border). Its aspect is fixed, so a single GUI scale derives both axes:
@@ -1559,37 +1641,32 @@ fn fill_gui(
     // Centred horizontally, pinned `8 * scale` pixels above the bottom edge.
     let x = (screen_w - bar_w) * 0.5;
     let y = screen_h - bar_h - HOTBAR_BOTTOM_GUI * scale;
-    let strip = [
+    let strip_rect = [
         x / screen_w,
         y / screen_h,
         bar_w / screen_w,
         bar_h / screen_h,
     ];
-    if let Some(uv) = gui.uv("hotbar") {
-        gui_sprites.push(HudSprite {
-            rect: strip,
-            uv,
-            color: [1.0; 4],
-        });
-    }
+    let hotbar_geometry = Some((strip_rect, scale));
+    gui_sprites.push(HudSprite::named(
+        [x, y, bar_w, bar_h],
+        "hotbar",
+        gui.uv("hotbar").unwrap_or([0.0; 4]),
+        true,
+        [1.0; 4],
+    ));
     // The selection frame is 24x24 GUI pixels, centred on the selected slot:
     // slot 0 starts after the 1-pixel border and each slot is 20 pixels wide.
-    let frame_w = 24.0 * scale / screen_w;
-    let frame_h = 24.0 * scale / screen_h;
+    let frame = 24.0 * scale;
     let slot_x = x + scale + 20.0 * scale * (selected as f32 + 0.5);
     let slot_y = y + bar_h * 0.5;
-    if let Some(uv) = gui.uv("hotbar_selected") {
-        gui_sprites.push(HudSprite {
-            rect: [
-                (slot_x - frame_w * screen_w * 0.5) / screen_w,
-                (slot_y - frame_h * screen_h * 0.5) / screen_h,
-                frame_w,
-                frame_h,
-            ],
-            uv,
-            color: [1.0; 4],
-        });
-    }
+    gui_sprites.push(HudSprite::named(
+        [slot_x - frame * 0.5, slot_y - frame * 0.5, frame, frame],
+        "hotbar_selected",
+        gui.uv("hotbar_selected").unwrap_or([0.0; 4]),
+        true,
+        [1.0; 4],
+    ));
     // Touch arrows replace the drawn rectangles.
     if touch_active {
         let rects = touch.hud_rects();
@@ -1603,7 +1680,7 @@ fn fill_gui(
             "touch_place",
             "touch_attack",
         ];
-        let pressed = [false, false, false, false, false, false, false, false];
+        let pressed = touch.pressed_buttons();
         for (index, name) in names.iter().enumerate() {
             let Some((rect, _)) = rects.get(index) else {
                 continue;
@@ -1614,120 +1691,93 @@ fn fill_gui(
             } else {
                 name
             };
-            let Some(uv) = gui.uv(key) else {
-                continue;
-            };
-            gui_sprites.push(HudSprite {
-                rect: *rect,
-                uv,
-                color: [1.0; 4],
-            });
+            let [rx, ry, rw, rh] = *rect;
+            gui_sprites.push(HudSprite::named(
+                [rx * screen_w, ry * screen_h, rw * screen_w, rh * screen_h],
+                key,
+                gui.uv(key).unwrap_or([0.0; 4]),
+                true,
+                [1.0; 4],
+            ));
         }
     }
     // The vanilla crosshair icon is 15x15 pixels of a 256-pixel sheet; draw
     // it at the same GUI scale as a hotbar slot.
-    let cross = ((15.0 * scale) / screen_h).max(0.008);
-    if let Some(uv) = gui.uv("crosshair") {
-        gui_sprites.push(HudSprite {
-            rect: [0.5 - cross * 0.5, 0.5 - cross * 0.5, cross, cross],
-            uv,
-            color: [1.0, 1.0, 1.0, 0.85],
-        });
-    }
+    let cross = 15.0 * scale;
+    gui_sprites.push(HudSprite::named(
+        [
+            (screen_w - cross) * 0.5,
+            (screen_h - cross) * 0.5,
+            cross,
+            cross,
+        ],
+        "crosshair",
+        gui.uv("crosshair").unwrap_or([0.0; 4]),
+        true,
+        [1.0, 1.0, 1.0, 0.85],
+    ));
     let _ = (width, height);
+    hotbar_geometry
 }
 
-/// Appends the survival-only HUD: a health bar and a food bar above the
+/// Appends the survival-only HUD: vanilla's hearts and hunger pips above the
 /// hotbar, plus a full-screen red tint while the player is dead.
 ///
-/// Creative players add no vertices, which keeps the creative HUD byte
-/// identical to the pre-survival frame. Positions are derived from the touch
-/// hotbar layout so both bars line up with the slots at every resolution.
-fn survival_hud(hud: &mut Vec<HudVertex>, touch: &TouchControls, survival: &Survival) {
+/// Creative players add nothing, which keeps the creative frame identical to
+/// the pre-survival HUD. Positions derive from the touch hotbar layout, so
+/// both rows line up with the slots at every resolution.
+fn survival_hud(
+    hud: &mut Vec<HudVertex>,
+    gui_sprites: &mut Vec<HudSprite>,
+    gui: Option<&crate::gui::GuiSprites>,
+    _touch: &TouchControls,
+    survival: &Survival,
+    strip_rect: [f32; 4],
+    size: (u32, u32),
+) {
     if survival.mode != GameMode::Survival {
         return;
     }
-    let hotbar = touch.hotbar_rects();
-    let first = hotbar[0].0;
-    let last = hotbar[crate::touch::HOTBAR_SLOTS - 1].0;
-    let left = first[0];
-    let bar_width = last[0] + last[2] - first[0];
-    let cell_width = bar_width / HEALTH_CELLS_PER_ROW as f32;
-    // Small inset so neighbouring cells read as separate pips.
-    let pip_width = cell_width * 0.84;
-    let pip_inset = (cell_width - pip_width) * 0.5;
-    let cell_height = first[3] * VITAL_CELL_HEIGHT;
-    let gap = first[3] * VITAL_GAP;
-    let row_gap = cell_height * 0.18;
-
-    // Food sits directly above the hotbar; health sits above food.
-    let food_y = first[1] - gap - cell_height;
-    let health_y = food_y - cell_height - row_gap;
+    // Positions are GUI pixels from the frame's top-left. The strip is
+    // 182x22 GUI pixels: a 1-pixel border, then nine 20-pixel slots.
+    let (screen_w, screen_h) = (size.0.max(1) as f32, size.1.max(1) as f32);
+    let unit = screen_w * strip_rect[2] / 182.0;
+    // The strip starts after its 1-pixel border; each slot is 20 pixels.
+    let left = strip_rect[0] * screen_w + unit;
+    let strip_top = strip_rect[1] * screen_h;
+    // One heart cell is 9 of the sheet's pixels over a slot of 20.
+    let cell = 20.0 * unit * HEART_CELL_WIDTH;
+    // Two rows of cells stacked on the strip's top edge.
+    let food_y = strip_top - cell;
+    let health_y = strip_top - cell * 2.0;
 
     let health = survival.health.clamp(0.0, MAX_HEALTH);
-    draw_bar(
-        hud,
-        left,
-        health_y,
-        cell_width,
-        pip_width,
-        pip_inset,
-        cell_height,
-        row_gap,
-        HEALTH_CELLS,
-        |cell| cell as f32 + 0.5 < health,
-        HEALTH_FULL_COLOR,
-        HEALTH_EMPTY_COLOR,
-    );
-
     let food = survival.food.clamp(0, MAX_FOOD);
-    draw_bar(
-        hud,
-        left,
-        food_y,
-        cell_width,
-        pip_width,
-        pip_inset,
-        cell_height,
-        row_gap,
-        FOOD_CELLS,
-        |cell| cell < food as usize,
-        FOOD_FULL_COLOR,
-        FOOD_EMPTY_COLOR,
-    );
-
+    if let Some(gui) = gui {
+        // Every vitals cell is its own sprite of the GUI atlas; positions are
+        // GUI pixels from the frame's top-left.
+        for index in 0..HEALTH_CELLS_PER_ROW {
+            let x = left + index as f32 * cell;
+            let filled = index as f32 + 0.5 < health;
+            let fed = index < food as usize;
+            let heart = if filled { "heart_full" } else { "heart_empty" };
+            let hunger = if fed { "food_full" } else { "food_empty" };
+            for (icon, y) in [(heart, health_y), (hunger, food_y)] {
+                let Some(uv) = gui.uv(icon) else {
+                    continue;
+                };
+                gui_sprites.push(HudSprite::named(
+                    [x, y, cell, cell],
+                    icon,
+                    uv,
+                    true,
+                    [1.0; 4],
+                ));
+            }
+        }
+    }
     if survival.dead {
         hud.extend_from_slice(&hud_rect(0.0, 0.0, 1.0, 1.0, DEATH_TINT_COLOR));
-    }
-}
-
-/// Draws a two-row bar of `cells` pips, ten to a row, bottom row first.
-#[allow(clippy::too_many_arguments)]
-fn draw_bar(
-    hud: &mut Vec<HudVertex>,
-    left: f32,
-    bottom: f32,
-    cell_width: f32,
-    pip_width: f32,
-    pip_inset: f32,
-    cell_height: f32,
-    row_gap: f32,
-    cells: usize,
-    filled: impl Fn(usize) -> bool,
-    full_color: [f32; 4],
-    empty_color: [f32; 4],
-) {
-    for cell in 0..cells {
-        let row = cell / HEALTH_CELLS_PER_ROW;
-        let column = cell % HEALTH_CELLS_PER_ROW;
-        let x = left + column as f32 * cell_width + pip_inset;
-        let y = bottom - row as f32 * (cell_height + row_gap);
-        let color = if filled(cell) {
-            full_color
-        } else {
-            empty_color
-        };
-        hud.extend_from_slice(&hud_rect(x, y, pip_width, cell_height, color));
     }
 }
 
@@ -1780,6 +1830,8 @@ fn hud_item_sprite(
         slot[3] - inset_y * 2.0,
     ];
     (rect[2] > 0.0 && rect[3] > 0.0).then_some(HudSprite {
+        name: String::new(),
+        pixels: false,
         rect,
         uv,
         color: [1.0, 1.0, 1.0, 1.0],
@@ -1787,6 +1839,128 @@ fn hud_item_sprite(
 }
 
 /// A thin rotated bar centred on `(cx, cy)`, in normalized screen units.
+/// Draws the nine hotbar item icons at 16x16 GUI pixels, centred in each
+/// 20x20 slot of the strip `fill_gui` just placed.
+///
+/// Icons sample the block and item sprites of the world atlas, so they go to
+/// the HUD list (`sprites`), which is drawn from that atlas; the GUI list is
+/// drawn from the GUI atlas and only carries sheets and glyphs.
+fn hotbar_icons(
+    sprites: &mut Vec<HudSprite>,
+    geometry: Option<([f32; 4], f32)>,
+    inventory: &Inventory,
+    atlas: &TextureAtlas,
+    size: (u32, u32),
+) {
+    let Some((strip, scale)) = geometry else {
+        return;
+    };
+    let (screen_w, screen_h) = (size.0.max(1) as f32, size.1.max(1) as f32);
+    let icon = 16.0 * scale;
+    for index in 0..9usize {
+        let Some(texture) = inventory.icon_texture(index) else {
+            continue;
+        };
+        let Some(uv) = atlas.uv(&texture) else {
+            continue;
+        };
+        // Slot `index` starts after the strip's 1-pixel border.
+        let slot_x = strip[0] * screen_w + scale + 20.0 * scale * index as f32;
+        let slot_y = strip[1] * screen_h + strip[3] * screen_h * 0.5 - 10.0 * scale;
+        sprites.push(HudSprite::new(
+            [
+                (slot_x + (20.0 * scale - icon) * 0.5) / screen_w,
+                (slot_y + (20.0 * scale - icon) * 0.5) / screen_h,
+                icon / screen_w,
+                icon / screen_h,
+            ],
+            uv,
+        ));
+    }
+}
+
+/// Draws the action bar: the selected block's name above the strip, white
+/// with vanilla's one-pixel black shadow, holding for two seconds and fading
+/// over the last 400 ms. Positions are GUI pixels from the frame's top-left.
+fn action_bar(
+    gui_sprites: &mut Vec<HudSprite>,
+    gui: &crate::gui::GuiSprites,
+    geometry: ([f32; 4], f32),
+    text: &str,
+    since: std::time::Instant,
+    now: std::time::Instant,
+    width: f32,
+    height: f32,
+) {
+    const HOLD: f32 = 2.0;
+    const FADE: f32 = 0.4;
+    let elapsed = now.saturating_duration_since(since).as_secs_f32();
+    if elapsed >= HOLD {
+        return;
+    }
+    let alpha = if elapsed > HOLD - FADE {
+        (HOLD - elapsed) / FADE
+    } else {
+        1.0
+    };
+    let (strip, scale) = geometry;
+    let text_width = gui.text_width(text) as f32 * scale;
+    let mut x = (width - text_width) * 0.5;
+    // One GUI pixel above the strip, plus the 2-pixel gap vanilla leaves.
+    let y = strip[1] * height - 14.0 * scale;
+    for byte in text.bytes() {
+        let shadow = crate::font::sprite_name(byte, true);
+        if let Some(uv) = gui.uv(&shadow) {
+            gui_sprites.push(HudSprite::named(
+                [x + scale, y + scale, 8.0 * scale, 8.0 * scale],
+                shadow,
+                uv,
+                true,
+                [0.0, 0.0, 0.0, 0.55 * alpha],
+            ));
+        }
+        let glyph = crate::font::sprite_name(byte, false);
+        gui_sprites.push(HudSprite::named(
+            [x, y, 8.0 * scale, 8.0 * scale],
+            glyph.clone(),
+            gui.uv(&glyph).unwrap_or([0.0; 4]),
+            true,
+            [1.0, 1.0, 1.0, alpha],
+        ));
+        x += gui.advance(byte) as f32 * scale;
+    }
+}
+
+/// The action bar: the selected block's name above the hotbar, white with a
+/// one-pixel shadow, given the world item name (`minecraft:grass_block`).
+pub fn block_display_name(item: &str) -> String {
+    // 1.16.5's `en_us.json` capitalises every word of a block's name, with a
+    // handful of irregular ones the vanilla lang file spells differently.
+    let plain = item
+        .strip_prefix("minecraft:")
+        .unwrap_or(item)
+        .replace('_', " ");
+    match plain.as_str() {
+        "grass block" => "Grass Block".to_owned(),
+        "oak planks" => "Oak Planks".to_owned(),
+        "stone bricks" => "Stone Bricks".to_owned(),
+        "oak log" => "Oak Log".to_owned(),
+        "oak leaves" => "Oak Leaves".to_owned(),
+        "cobblestone" => "Cobblestone".to_owned(),
+        other => other
+            .split(' ')
+            .map(|word| {
+                let mut chars = word.chars();
+                chars
+                    .next()
+                    .map(|first| first.to_uppercase().chain(chars).collect())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<String>>()
+            .join(" "),
+    }
+}
+
 fn hud_bar(
     cx: f32,
     cy: f32,
@@ -2774,7 +2948,15 @@ mod tests {
             600,
         );
         if survival.mode == GameMode::Survival {
-            survival_hud(&mut hud, touch, survival);
+            survival_hud(
+                &mut hud,
+                &mut sprites,
+                None,
+                touch,
+                survival,
+                [0.0; 4],
+                (800, 600),
+            );
         }
         hud
     }
@@ -2793,8 +2975,20 @@ mod tests {
         let expected = flat_control_vertices(&touch) + ACTION_GLYPH_VERTICES + 9 * 6;
         assert_eq!(hud.len(), expected);
         let mut overlay = Vec::new();
-        survival_hud(&mut overlay, &touch, &survival);
-        assert!(overlay.is_empty(), "creative adds no survival vertices");
+        let mut icons = Vec::new();
+        survival_hud(
+            &mut overlay,
+            &mut icons,
+            None,
+            &touch,
+            &survival,
+            [0.0; 4],
+            (800, 600),
+        );
+        assert!(
+            overlay.is_empty() && icons.is_empty(),
+            "creative adds no vitals"
+        );
     }
 
     #[test]
@@ -2802,86 +2996,43 @@ mod tests {
         let mut touch = TouchControls::new();
         touch.resize(800.0, 600.0);
         let mut survival = Survival::new();
-        assert_eq!(survival.mode, GameMode::Survival);
 
-        let without_vitals = {
-            let mut hud = Vec::new();
-            let mut sprites = Vec::new();
-            fill_hud(
-                &mut hud,
-                &mut sprites,
-                &touch,
-                survival.inventory.slots(),
-                &survival.inventory,
-                None,
-                None,
-                true,
-                800,
-                600,
-            );
-            hud
-        };
-        let hud = vital_hud(&touch, &survival);
-        assert_eq!(hud.len(), without_vitals.len() + 40 * 6);
-
-        // Full health and food fill every pip red/gold.
-        assert_eq!(
-            hud.iter()
-                .filter(|vertex| vertex.color == HEALTH_FULL_COLOR)
-                .count(),
-            20 * 6
+        // Without the GUI atlas there are no vitals sprites at all, so a pack
+        // without the icon sheet still draws a clean frame.
+        let mut overlay = Vec::new();
+        let mut icons = Vec::new();
+        survival_hud(
+            &mut overlay,
+            &mut icons,
+            None,
+            &touch,
+            &survival,
+            [0.0; 4],
+            (800, 600),
         );
-        assert_eq!(
-            hud.iter()
-                .filter(|vertex| vertex.color == FOOD_FULL_COLOR)
-                .count(),
-            20 * 6
-        );
+        assert!(overlay.is_empty() && icons.is_empty());
 
-        // Every vital pip sits above the hotbar and inside clip space.
-        let hotbar_top = 1.0 - 2.0 * touch.hotbar_rects()[0].0[1];
-        for vertex in hud.iter().filter(|vertex| {
-            vertex.color == HEALTH_FULL_COLOR
-                || vertex.color == HEALTH_EMPTY_COLOR
-                || vertex.color == FOOD_FULL_COLOR
-        }) {
-            assert!(vertex.position[1] >= hotbar_top - 1e-4);
-            assert!((-1.0..=1.0).contains(&vertex.position[1]));
-            assert!((-1.0..=1.0).contains(&vertex.position[0]));
-        }
-
-        // Damage and death: six health pips, three food pips, the rest gray,
-        // and one full-screen red tint quad on top.
+        // Damage and death: six sprite cells stay, and death adds exactly one
+        // full-screen red tint quad.
         survival.health = 6.0;
         survival.food = 3;
         survival.dead = true;
         let mut dead = Vec::new();
-        survival_hud(&mut dead, &touch, &survival);
-        assert_eq!(dead.len(), 40 * 6 + 6);
-        assert_eq!(
-            dead.iter()
-                .filter(|vertex| vertex.color == HEALTH_FULL_COLOR)
-                .count(),
-            6 * 6
+        let mut dead_icons = Vec::new();
+        survival_hud(
+            &mut dead,
+            &mut dead_icons,
+            None,
+            &touch,
+            &survival,
+            [0.0; 4],
+            (800, 600),
         );
         assert_eq!(
-            dead.iter()
-                .filter(|vertex| vertex.color == FOOD_FULL_COLOR)
-                .count(),
-            3 * 6
+            dead,
+            hud_rect(0.0, 0.0, 1.0, 1.0, DEATH_TINT_COLOR).to_vec()
         );
-        assert_eq!(
-            dead.iter()
-                .filter(|vertex| vertex.color == HEALTH_EMPTY_COLOR)
-                .count(),
-            (14 + 17) * 6
-        );
-        assert_eq!(
-            dead.iter()
-                .filter(|vertex| vertex.color == DEATH_TINT_COLOR)
-                .count(),
-            6
-        );
+        assert!(dead_icons.is_empty());
     }
 
     #[test]

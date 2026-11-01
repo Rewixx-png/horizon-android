@@ -222,6 +222,29 @@ impl TouchControls {
         self.selected
     }
 
+    /// Which of the eight visible buttons read as pressed right now, in the
+    /// order [`Self::hud_rects`] returns them: up, left, sneak, right, down,
+    /// jump, place, attack.
+    pub fn pressed_buttons(&self) -> [bool; 8] {
+        let pad = self
+            .fingers
+            .values()
+            .fold(0u8, |mask, finger| match finger.role {
+                Role::Pad(directions) => mask | directions,
+                _ => mask,
+            });
+        [
+            pad & DIR_UP != 0,
+            pad & DIR_LEFT != 0,
+            self.sneak,
+            pad & DIR_RIGHT != 0,
+            pad & DIR_DOWN != 0,
+            self.jump,
+            self.place_block,
+            self.attack,
+        ]
+    }
+
     /// Highlights `slot` without queueing a selection. Out-of-range slots are
     /// ignored. The app uses this to mirror the inventory's selection (which
     /// keyboard digits and the mouse wheel also change) into the touch HUD.

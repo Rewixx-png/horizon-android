@@ -16,6 +16,9 @@ use std::{
 const CATALOG: &str = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 const LOCK: &str = include_str!("../../../research-lock.json");
 static INSTALLATION: Mutex<()> = Mutex::new(());
+/// The verified-file index of the installation under way: read once, written back when
+/// it ends, shared by the download threads.
+static KNOWN: Mutex<Option<std::collections::HashMap<String, (u64, u128)>>> = Mutex::new(None);
 static DOWNLOAD_CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Android supplies Context.getCacheDir(), keeping temporary downloads out of files/.
@@ -150,6 +153,57 @@ fn json(url: &str) -> Result<Value> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// Files already checked, so a second launch does not re-hash 5,000 sound files:
+/// `sha1 -> (size, mtime_ns)` for the objects under the download cache. A file
+/// whose size or mtime changed is hashed again, so a damaged download is still
+/// caught. The index lives beside the objects it describes and is removed with
+/// them.
+fn verified_index_path(cache: &Path) -> PathBuf {
+    cache.join("verified-v1.json")
+}
+
+fn load_verified(cache: &Path) -> std::collections::HashMap<String, (u64, u128)> {
+    let Ok(bytes) = fs::read(verified_index_path(cache)) else {
+        return Default::default();
+    };
+    let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(&bytes) else {
+        return Default::default();
+    };
+    map.into_iter()
+        .filter_map(|(sha1, v)| {
+            let size = v.get("size")?.as_u64()?;
+            let mtime = v.get("mtime")?.as_u64()?;
+            Some((sha1, (size, mtime as u128)))
+        })
+        .collect()
+}
+
+fn save_verified(cache: &Path, known: &std::collections::HashMap<String, (u64, u128)>) {
+    let map: serde_json::Map<String, Value> = known
+        .iter()
+        .map(|(sha1, (size, mtime))| {
+            let v = serde_json::json!({ "size": size, "mtime": *mtime as u64 });
+            (sha1.clone(), v)
+        })
+        .collect();
+    let _ = fs::write(
+        verified_index_path(cache),
+        serde_json::to_vec(&Value::Object(map)).unwrap_or_default(),
+    );
+}
+
+/// A file's size and modification time in nanoseconds, for the verified index.
+fn stamp(path: &Path) -> Option<(u64, u128)> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    let mtime = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((metadata.len(), mtime))
+}
+
 fn hash(path: &Path) -> Result<String> {
     let mut file = fs::File::open(path)?;
     let mut digest = Sha1::new();
@@ -191,7 +245,24 @@ impl Download {
         }
         Ok(file)
     }
+    /// Whether the shared index already recorded this file at this size and mtime.
+    fn known_unchanged(&self, size: u64, mtime: u128) -> bool {
+        KNOWN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|known| known.get(&self.sha1).copied())
+            == Some((size, mtime))
+    }
     fn get(&self) -> Result<()> {
+        // A file the index already saw, unchanged since, is not hashed again: the
+        // size and modification time stand in for reading it twice.
+        if let Some((size, mtime)) = stamp(&self.path)
+            && size == self.size
+            && self.known_unchanged(size, mtime)
+        {
+            return Ok(());
+        }
         if self.path.is_file()
             && fs::metadata(&self.path)?.len() == self.size
             && hash(&self.path)? == self.sha1
@@ -215,6 +286,15 @@ impl Download {
                     return Err("Mojang file checksum or size mismatch".into());
                 }
                 fs::rename(&partial, &self.path)?;
+                if let Some((size, mtime)) = stamp(&self.path) {
+                    if let Some(known) = KNOWN
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_mut()
+                    {
+                        known.insert(self.sha1.clone(), (size, mtime));
+                    }
+                }
                 Ok(())
             })();
             if result.is_ok() {
@@ -277,6 +357,11 @@ pub struct InstallProgress {
     pub stage: InstallStage,
     pub done: u64,
     pub total: u64,
+    /// Bytes a second over the last few seconds, measured by the installer: what the
+    /// screen shows instead of guessing from the average since the start.
+    pub bytes_per_second: u64,
+    /// Seconds the download should still take at that pace; 0 while unknown.
+    pub seconds_left: u64,
 }
 
 pub fn install(home: &Path, progress: impl Fn(u64, u64) + Sync) -> Result<()> {
@@ -305,7 +390,42 @@ fn validate_manifest(bytes: &[u8], checksum: &str, version: &str, pins: &Value) 
 
 pub fn install_with_progress(home: &Path, progress: impl Fn(InstallProgress) + Sync) -> Result<()> {
     let _guard = INSTALLATION.lock().unwrap_or_else(|e| e.into_inner());
-    let report = |stage, done, total| progress(InstallProgress { stage, done, total });
+    // A moving average over the last seconds, so the pace reads as the network's
+    // rather than as the whole run's.
+    let sample: Mutex<Option<(std::time::Instant, u64)>> = Mutex::new(None);
+    let pace: Mutex<(u64, u64)> = Mutex::new((0, 0));
+    let report = |stage: InstallStage, done: u64, total: u64| {
+        let (mut rate, mut left) = *pace.lock().unwrap_or_else(|e| e.into_inner());
+        if stage == InstallStage::Download && done > 0 {
+            let mut sample = sample.lock().unwrap_or_else(|e| e.into_inner());
+            let now = std::time::Instant::now();
+            match *sample {
+                Some((at, bytes)) if now.duration_since(at).as_secs_f64() >= 1.0 => {
+                    let seconds = now.duration_since(at).as_secs_f64();
+                    let gained = done.saturating_sub(bytes);
+                    let instant = (gained as f64 / seconds) as u64;
+                    // 70/30, so a stall or a burst moves the number without jerking it.
+                    rate = if rate == 0 { instant } else { (rate * 7 + instant * 3) / 10 };
+                    left = if rate > 0 {
+                        total.saturating_sub(done) / rate
+                    } else {
+                        0
+                    };
+                    *sample = Some((now, done));
+                    *pace.lock().unwrap_or_else(|e| e.into_inner()) = (rate, left);
+                }
+                None => *sample = Some((now, done)),
+                _ => {}
+            }
+        }
+        progress(InstallProgress {
+            stage,
+            done,
+            total,
+            bytes_per_second: rate,
+            seconds_left: left,
+        });
+    };
     report(InstallStage::Metadata, 0, 0);
     let version = horizon_core::VANILLA_VERSION;
     let cache = download_cache(home);
@@ -378,11 +498,20 @@ pub fn install_with_progress(home: &Path, progress: impl Fn(InstallProgress) + S
         total / 1048576
     );
     report(InstallStage::Download, 0, total);
+    // Files checked by an earlier run are trusted on size and mtime, so a second
+    // launch pays for the handful that changed instead of all of them.
+    *KNOWN.lock().unwrap_or_else(|e| e.into_inner()) = Some(load_verified(&cache));
     let next = AtomicUsize::new(0);
     let done = AtomicU64::new(0);
     let error = Mutex::new(None);
+    // Assets are thousands of small files: throughput here is dominated by round
+    // trips, not bandwidth, so more connections help until the phone's network
+    // stack or Mojang's CDN saturates. 16 is enough for a phone and keeps the
+    // memory of 16 sockets' buffers small.
+    let workers = 16;
+    log::info!("Minecraft {version}: fetching with {workers} connections");
     std::thread::scope(|scope| {
-        for _ in 0..8 {
+        for _ in 0..workers {
             scope.spawn(|| {
                 loop {
                     if error.lock().unwrap().is_some() {
@@ -405,6 +534,9 @@ pub fn install_with_progress(home: &Path, progress: impl Fn(InstallProgress) + S
     });
     if let Some(error) = error.into_inner().unwrap() {
         return Err(error.into());
+    }
+    if let Some(known) = KNOWN.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        save_verified(&cache, &known);
     }
     let versions = home.join(".local/horizon-client");
     fs::create_dir_all(&versions)?;
@@ -493,6 +625,30 @@ pub fn install_with_progress(home: &Path, progress: impl Fn(InstallProgress) + S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The verified index trusts a file on size and mtime, and distrusts it again
+    /// when either moves: a damaged download is still hashed.
+    #[test]
+    fn the_verified_index_follows_size_and_mtime() {
+        let dir = std::env::temp_dir().join(format!("verify-index-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("abc");
+        fs::write(&file, b"hello").unwrap();
+        let sha1 = hash(&file).unwrap();
+        let (size, mtime) = stamp(&file).unwrap();
+        let mut known = std::collections::HashMap::new();
+        known.insert(sha1.clone(), (size, mtime));
+        save_verified(&dir, &known);
+        let loaded = load_verified(&dir);
+        assert_eq!(loaded.get(&sha1), Some(&(size, mtime)));
+        // A rewritten file has another size, so it is no longer trusted.
+        fs::write(&file, b"hello again").unwrap();
+        let (size2, mtime2) = stamp(&file).unwrap();
+        assert_ne!((size, mtime), (size2, mtime2));
+        assert_ne!(loaded.get(&sha1).copied(), Some((size2, mtime2)));
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     struct CacheHome(PathBuf);
     impl CacheHome {

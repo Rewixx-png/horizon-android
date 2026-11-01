@@ -720,14 +720,37 @@ impl Launcher {
                 let overall = (current as f32 + fraction.clamp(0.0, 1.0)) / 6.0;
                 progress_bar(&mut ui, margin, bar_y, content_w, overall);
                 let detail = match progress.stage {
-                    InstallStage::Download => tr!(
-                        language,
-                        "{done} / {total} MiB  - verified downloads",
-                        {
-                            done = format!("{:.1}", progress.done as f64 / 1048576.0),
-                            total = format!("{:.1}", progress.total as f64 / 1048576.0)
+                    InstallStage::Download => {
+                        // The pace and what is left of it, so a slow network reads as the
+                        // network rather than as a stuck installer.
+                        let speed = progress.bytes_per_second as f64 / 1048576.0;
+                        let left = progress.seconds_left;
+                        if speed >= 0.1 {
+                            tr!(
+                                language,
+                                "{done} / {total} MiB  -  {speed} MiB/s  -  {left} left",
+                                {
+                                    done = format!("{:.1}", progress.done as f64 / 1048576.0),
+                                    total = format!("{:.1}", progress.total as f64 / 1048576.0),
+                                    speed = format!("{speed:.1}"),
+                                    left = if left >= 60 {
+                                        tr!(language, "{n} min", { n = left / 60 })
+                                    } else {
+                                        tr!(language, "{n} s", { n = left })
+                                    }
+                                }
+                            )
+                        } else {
+                            tr!(
+                                language,
+                                "{done} / {total} MiB  - verified downloads",
+                                {
+                                    done = format!("{:.1}", progress.done as f64 / 1048576.0),
+                                    total = format!("{:.1}", progress.total as f64 / 1048576.0)
+                                }
+                            )
                         }
-                    ),
+                    }
                     InstallStage::Controls => tr!(
                         language,
                         "{done} / {total} control files verified",

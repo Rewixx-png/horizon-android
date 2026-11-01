@@ -539,7 +539,18 @@ impl ApplicationHandler for Launcher {
             crate::display::set_scale(crate::display::RenderScale::default());
             self.fail(error);
         }
-        if let Some(result) = self.worker.as_ref().and_then(|w| w.try_recv().ok()) {
+        // The install worker's own thread may end before its message arrives (an
+        // unwind, a killed thread) or after it, so a closed channel is an outcome
+        // too: leaving `worker` set here kept "Getting your game ready" on screen
+        // until the launcher was restarted.
+        let finished = self.worker.as_ref().and_then(|w| match w.try_recv() {
+            Ok(result) => Some(result),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Some(Err("The installer stopped without finishing. Run it again.".to_string()))
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+        });
+        if let Some(result) = finished {
             self.worker = None;
             changed = true;
             if let Err(error) = result {

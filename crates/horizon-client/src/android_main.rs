@@ -66,9 +66,9 @@ mod backend {
     // One place: the version the APK's manifest carries (`packaging/android/build.gradle`).
     // The launcher's About row and every diagnostic read it from here.
     pub const VERSION: &str = if crate::PUBLIC_BUILD {
-        "0.7.7-ui.8"
+        "0.7.7-ui.9"
     } else {
-        "0.7.7-ui.8-dev"
+        "0.7.7-ui.9-dev"
     };
     static HOME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     pub fn initialize(home: std::path::PathBuf) {

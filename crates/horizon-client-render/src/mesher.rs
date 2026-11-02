@@ -478,7 +478,9 @@ impl MeshTables {
                 .ok_or("missing registry state")?;
             let props = &state.properties;
             let prop = |k: &str| -> u8 { props.get(k).and_then(|v| v.parse().ok()).unwrap_or(0) };
-            let name = s.name.strip_prefix("minecraft:").unwrap_or(&s.name);
+            // A content mod's blocks keep their namespace; the vanilla table below is keyed
+            // by the bare name, so strip whatever namespace there is, not only `minecraft:`.
+            let name = s.name.split_once(':').map_or(&*s.name, |(_, rest)| rest);
             // BlockColors.createDefault: tint sources by block.
             let (tints, tint_count) = match name {
                 "large_fern" | "tall_grass" => {
@@ -497,6 +499,14 @@ impl MeshTables {
                 "oak_leaves" | "jungle_leaves" | "acacia_leaves" | "dark_oak_leaves" | "vine"
                 | "mangrove_leaves" => ([Tint::Foliage; 2], 1),
                 "leaf_litter" => ([Tint::DryFoliage; 2], 1),
+                // Vanilla leaves whose model has tintindex but whose colour is the texture's
+                // own: no tint, or they would come out foliage-green.
+                "cherry_leaves" | "pale_oak_leaves" => ([Tint::None; 2], 0),
+                // A content mod's leaves use the vanilla leaf models, whose faces carry
+                // tintindex 0; without a tint source they draw the bare texture, which
+                // reads as a grey checkerboard. Anything else named `*_leaves` is foliage;
+                // spruce and birch above keep their own fixed colours.
+                _ if name.ends_with("_leaves") => ([Tint::Foliage; 2], 1),
                 "water_cauldron" => ([Tint::Water; 2], 1),
                 // Their in-world colour is the particle-only source's -1.
                 "water" | "bubble_column" => ([Tint::None; 2], 1),

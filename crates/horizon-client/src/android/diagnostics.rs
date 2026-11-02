@@ -238,6 +238,14 @@ pub fn flush() {
     }
     let _ = rx.recv_timeout(Duration::from_millis(500));
 }
+/// The phase the previous session ended in (`in_world`, `suspended`, ...), if recorded.
+pub fn last_phase(home: &Path) -> Option<String> {
+    fs::read(home.join("performance/previous-session.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        .and_then(|v| v["phase"].as_str().map(str::to_owned))
+}
+
 pub fn previous_unclean(home: &Path) -> bool {
     fs::read(home.join("performance/previous-session.json"))
         .ok()

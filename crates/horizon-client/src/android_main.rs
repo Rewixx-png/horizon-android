@@ -66,9 +66,9 @@ mod backend {
     // One place: the version the APK's manifest carries (`packaging/android/build.gradle`).
     // The launcher's About row and every diagnostic read it from here.
     pub const VERSION: &str = if crate::PUBLIC_BUILD {
-        "0.7.7-ui.5"
+        "0.7.7-ui.6"
     } else {
-        "0.7.7-ui.5-dev"
+        "0.7.7-ui.6-dev"
     };
     static HOME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     pub fn initialize(home: std::path::PathBuf) {
@@ -197,7 +197,7 @@ fn init_logging() {
         .with_max_level(if trace_gles {
             log::LevelFilter::Trace
         } else {
-            log::LevelFilter::Info
+            log::LevelFilter::Warn
         })
         .with_tag("Horizon");
     if trace_gles {
@@ -229,7 +229,7 @@ fn init_logging() {
         log::set_max_level(if trace_gles {
             log::LevelFilter::Trace
         } else {
-            log::LevelFilter::Info
+            log::LevelFilter::Warn
         });
     }
 }

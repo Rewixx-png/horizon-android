@@ -62,15 +62,26 @@ pub fn reason_name(reason: i32) -> &'static str {
 /// The newest `lines` lines of the log under `home`, oldest first, for the
 /// Settings journal: the same file the diagnostics export ships.
 pub fn recent_lines(home: &Path, lines: usize) -> Vec<String> {
-    let Ok(bytes) = tail(&home.join("diagnostic.log"), 64 * 1024) else {
-        return Vec::new();
+    // The log lives under `performance/`, beside the session file; reading it from the
+    // home root found nothing, which is why the Journal stayed empty.
+    let dir = home.join("performance");
+    // This session's log, then the one it replaced: a crash loses the newest file, and the
+    // reason for it is in the previous one.
+    let read = |name: &str| -> Vec<String> {
+        tail(&dir.join(name), 64 * 1024)
+            .map(|bytes| {
+                String::from_utf8_lossy(&bytes)
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .map(redact)
+                    .collect()
+            })
+            .unwrap_or_default()
     };
-    let text = String::from_utf8_lossy(&bytes);
-    let mut out: Vec<String> = text
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(redact)
-        .collect();
+    let mut out = read("diagnostic.log");
+    if out.is_empty() {
+        out = read("previous-diagnostic.log");
+    }
     let keep = out.len().saturating_sub(lines);
     out.drain(..keep);
     out
@@ -156,6 +167,8 @@ pub fn initialize(home: &Path, device: Value) -> io::Result<()> {
 }
 /// Called by the logger; never waits for disk or for a full queue.
 pub fn log_line(level: log::Level, target: &str, message: &str) {
+    // Everything a player may need, warnings included (a mod that did not start logs as
+    // `warn`), and not the per-frame noise of debug and trace.
     if level > log::Level::Info {
         return;
     }

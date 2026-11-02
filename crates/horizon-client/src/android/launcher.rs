@@ -78,11 +78,8 @@ impl Launcher {
         });
         let mut catalog = Catalog::new(&home);
         if crate::diagnostics::previous_unclean(&home) {
-            catalog.status = crate::launcher_i18n::tr(
-                catalog.config.language,
-                crate::diagnostics::SUMMARY_UNCLEAN,
-            )
-            .to_owned();
+            catalog.status =
+                translate(catalog.config.language, crate::diagnostics::SUMMARY_UNCLEAN).to_owned();
         }
         crate::configure_input_mode(catalog.config.input_host);
         crate::device_runtime::configure(catalog.config.device);

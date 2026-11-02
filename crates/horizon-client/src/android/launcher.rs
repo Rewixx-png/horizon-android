@@ -78,15 +78,11 @@ impl Launcher {
         });
         let mut catalog = Catalog::new(&home);
         if crate::diagnostics::previous_unclean(&home) {
-            // `summary` fills in the phase; translating the template here must not leave
-            // `{phase}` on screen, so the finished sentence is translated as a whole when
-            // the table has it, and otherwise built from the summary itself.
+            // Translate the template first — `translate` takes `&'static str` and matches
+            // the table by the text *with* `{phase}` in it — then fill the phase in.
             let phase = crate::diagnostics::last_phase(&home).unwrap_or_else(|| "unknown".into());
-            let sentence = crate::diagnostics::SUMMARY_UNCLEAN.replace("{phase}", &phase);
-            catalog.status = match translate(catalog.config.language, sentence.as_str()) {
-                text if text == sentence => sentence,
-                translated => translated.to_owned(),
-            };
+            catalog.status = translate(catalog.config.language, crate::diagnostics::SUMMARY_UNCLEAN)
+                .replace("{phase}", &phase);
         }
         crate::configure_input_mode(catalog.config.input_host);
         crate::device_runtime::configure(catalog.config.device);
